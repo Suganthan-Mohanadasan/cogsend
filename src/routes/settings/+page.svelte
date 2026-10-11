@@ -95,8 +95,8 @@
 	let tickConfirm: 'rotate' | 'revoke' | null = $state(null);
 	let tickTestBusy = $state(false);
 	let tickTestMessage = $state<string | null>(null);
-	// The update check: a courtesy, so a failure is silent and only a real
-	// "newer release exists" answer renders anything.
+	// The update check: a courtesy, so a failure is one quiet line saying why,
+	// since installing by tag below still works without it.
 	type ReleaseCheck = {
 		current: string;
 		latest: { tag: string; version: string; url: string } | null;
@@ -1656,6 +1656,12 @@
 					>
 					{#if release?.checkedAt}
 						<span class="text-stone-400"> · checked {tickDate(release.checkedAt)}</span>
+					{/if}
+					{#if release?.error && !release.latest}
+						<span class="block text-stone-500" data-testid="release-check-error"
+							>Could not reach GitHub to check ({release.error}). Try again later, or install a
+							release by its tag below.</span
+						>
 					{/if}
 				{/if}
 			</p>

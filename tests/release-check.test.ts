@@ -3,8 +3,10 @@ import {
 	RELEASES_URL,
 	highestVersionTag,
 	isNewer,
+	newestOf,
 	newestRelease,
 	parseRelease,
+	parseReleaseFeed,
 	parseVersion,
 	releaseCheckResult
 } from '#lib/domain/release-check.js';
@@ -138,5 +140,56 @@ describe('the newest release, pre-releases included', () => {
 		expect(newestRelease([...list, { tag_name: 'v1.16.0' }])?.tag).toBe('v1.16.0');
 		expect(newestRelease([])).toBeNull();
 		expect(newestRelease({ tag_name: 'v1.0.0' })).toBeNull();
+	});
+});
+
+describe('the releases feed', () => {
+	const entry = (href: string, extra = '') =>
+		`<entry><id>x</id><updated>2026-10-11T07:47:55Z</updated><link rel="alternate" type="text/html" href="${href}"/><title>t</title><content type="html">${extra}</content></entry>`;
+
+	it("reads each entry's tag from its release link", () => {
+		const releases = parseReleaseFeed(
+			`<feed>${entry('https://github.com/cogsend/cogsend/releases/tag/v1.16.0-rc.1')}${entry(
+				'https://github.com/cogsend/cogsend/releases/tag/v1.15.1'
+			)}</feed>`
+		);
+		expect(releases).toEqual([
+			{
+				tag: 'v1.16.0-rc.1',
+				version: '1.16.0-rc.1',
+				url: 'https://github.com/cogsend/cogsend/releases/tag/v1.16.0-rc.1',
+				publishedAt: '2026-10-11T07:47:55Z'
+			},
+			expect.objectContaining({ tag: 'v1.15.1', version: '1.15.1' })
+		]);
+	});
+
+	it('is not fooled by release notes, other links, or a broken document', () => {
+		// Notes are escaped HTML, so an "<entry>" in them is text, not an entry.
+		const notes =
+			'&lt;entry&gt;&lt;link href=&quot;https://github.com/x/y/releases/tag/v9.9.9&quot;/&gt;';
+		expect(
+			parseReleaseFeed(entry('https://github.com/cogsend/cogsend/releases/tag/v1.0.0', notes)).map(
+				(r) => r.tag
+			)
+		).toEqual(['v1.0.0']);
+		expect(parseReleaseFeed(entry('https://evil.example/releases/tag/v9.9.9'))).toEqual([]);
+		expect(parseReleaseFeed('<entry><title>no link</title></entry>')).toEqual([]);
+		expect(parseReleaseFeed(entry('https://github.com/a/b/releases/tag/%E0%A4%A'))).toEqual([]);
+		expect(parseReleaseFeed('{"not":"xml"}')).toEqual([]);
+		expect(
+			parseReleaseFeed(entry('https://github.com/a/b/releases/tag/v2.0.0%2Bbuild'))[0].tag
+		).toBe('v2.0.0+build');
+	});
+
+	it('picks the highest version, pre-releases only when asked', () => {
+		const releases = parseReleaseFeed(
+			['v1.15.0', 'v1.16.0-rc.2', 'v1.15.1', 'not-a-version', 'v1.16.0-rc.10']
+				.map((tag) => entry(`https://github.com/cogsend/cogsend/releases/tag/${tag}`))
+				.join('')
+		);
+		expect(newestOf(releases, false)?.tag).toBe('v1.15.1');
+		expect(newestOf(releases, true)?.tag).toBe('v1.16.0-rc.10');
+		expect(newestOf([], true)).toBeNull();
 	});
 });

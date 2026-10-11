@@ -14,6 +14,10 @@ export const RELEASE_API_URL = `https://api.github.com/repos/${RELEASE_REPO}/rel
 export const RELEASES_API_URL = `https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=30`;
 export const RELEASES_URL = `https://github.com/${RELEASE_REPO}/releases`;
 export const TAGS_API_URL = `https://api.github.com/repos/${RELEASE_REPO}/tags?per_page=100`;
+/** The same releases as an Atom feed, newest first. A web page rather than
+ *  the API, so it is not under the API's 60 requests an hour per address,
+ *  which the addresses Workers share with everyone else's often use up. */
+export const RELEASES_FEED_URL = `https://github.com/${RELEASE_REPO}/releases.atom`;
 /** Where a release's files live: `${RELEASE_DOWNLOAD_BASE}/<tag>/<file>`. */
 export const RELEASE_DOWNLOAD_BASE = `https://github.com/${RELEASE_REPO}/releases/download`;
 
@@ -124,6 +128,50 @@ export function newestRelease(json: unknown): ReleaseInfo | null {
 		if ((entry as Record<string, unknown>)?.draft === true) continue;
 		const release = parseRelease(entry);
 		if (!release || compareVersions(release.version, release.version) === null) continue;
+		if (!best || (compareVersions(release.version, best.version) ?? 0) > 0) best = release;
+	}
+	return best;
+}
+
+/**
+ * The releases in GitHub's Atom feed. Release notes inside it are escaped
+ * HTML, so an entry's own tags are the only `<entry>` and `<link>` it holds.
+ */
+export function parseReleaseFeed(xml: string): ReleaseInfo[] {
+	const releases: ReleaseInfo[] = [];
+	for (const [, entry] of String(xml ?? '').matchAll(/<entry>([\s\S]*?)<\/entry>/g)) {
+		const url = /<link\b[^>]*\bhref="(https:\/\/github\.com\/[^"]+\/releases\/tag\/[^"]+)"/.exec(
+			entry
+		)?.[1];
+		if (!url) continue;
+		let tag: string;
+		try {
+			tag = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1)).trim();
+		} catch {
+			continue;
+		}
+		if (!tag) continue;
+		releases.push({
+			tag,
+			version: tag.replace(/^v/, ''),
+			url,
+			publishedAt: /<updated>([^<]+)<\/updated>/.exec(entry)?.[1] ?? null
+		});
+	}
+	return releases;
+}
+
+/**
+ * The highest release version in `releases`. Without `prereleases`, a version
+ * with a pre-release suffix (`1.16.0-rc.1`) is left out: the feed does not
+ * mark pre-releases, and the suffix is how this project tells them apart (the
+ * release workflow sends exactly those to the deploy repository's `next`).
+ */
+export function newestOf(releases: ReleaseInfo[], prereleases: boolean): ReleaseInfo | null {
+	let best: ReleaseInfo | null = null;
+	for (const release of releases) {
+		if (compareVersions(release.version, release.version) === null) continue;
+		if (!prereleases && release.version.includes('-')) continue;
 		if (!best || (compareVersions(release.version, best.version) ?? 0) > 0) best = release;
 	}
 	return best;

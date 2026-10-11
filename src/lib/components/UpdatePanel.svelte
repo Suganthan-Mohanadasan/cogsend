@@ -481,7 +481,7 @@
 						>Roll back to {status.previous.version}</button
 					>
 				{/if}
-				{#if !latestTag && !status?.previous}
+				{#if !latestTag}
 					<button
 						type="button"
 						onclick={() => (open = true)}
