@@ -106,6 +106,7 @@
 	} from '#lib/domain/published-lock.js';
 	import { selectionDrift, summarizePost, type TargetSnapshot } from '#lib/domain/post-state.js';
 	import { setPostsNotice } from '#lib/components/posts-notice.js';
+	import { composeSession } from '#lib/components/compose-session.svelte.js';
 	import {
 		attachXQuote,
 		keepXQuoteOnX,
@@ -761,7 +762,13 @@
 			});
 	}
 
+	// Bumped whenever the editor moves to another post (cleared, or switched).
+	// A save still in flight for the previous one finishes for that post only:
+	// it must not hand its id, saved state or variant bookkeeping to this one.
+	let editorGeneration = 0;
+
 	function resetEditorForNewDraft() {
+		editorGeneration++;
 		draftId = null;
 		baseBody = '';
 		overrides = {};
@@ -861,6 +868,7 @@
 				// rewritten to it), so this response must not hijack the session.
 				return;
 			}
+			if (draftId !== d.id) editorGeneration++;
 			draftId = d.id;
 			const locked = isFullyPublished(d.targets || []);
 			publishedLock = locked;
@@ -997,8 +1005,10 @@
 		},
 		navigate = true
 	): Promise<string> {
-		if (draftId) {
-			const res = await fetch(`/api/drafts/${draftId}`, {
+		const generation = editorGeneration;
+		const current = draftId;
+		if (current) {
+			const res = await fetch(`/api/drafts/${current}`, {
 				method: 'PATCH',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -1008,7 +1018,7 @@
 			});
 			const data = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(data.error || 'Failed to save draft');
-			return draftId;
+			return current;
 		}
 		const res = await fetch('/api/drafts', {
 			method: 'POST',
@@ -1020,6 +1030,9 @@
 		});
 		const data = await res.json();
 		if (!res.ok) throw new Error(data.error || 'Failed to create draft');
+		// The editor moved on while this post was being created: it is saved,
+		// but the editor now holds another one.
+		if (generation !== editorGeneration) return data.draft.id as string;
 		draftId = data.draft.id;
 		// Mark content as loaded BEFORE touching the URL so the id-watcher
 		// effect sees id === loadedDraftContentFor and skips a spurious
@@ -1042,7 +1055,9 @@
 			mastoCW,
 			mastoPoll,
 			selectedConnectionIds: [...selected]
-		}
+		},
+		// Which variants this post has stored, taken when its save began.
+		stored: Set<PlatformId> = storedVariants
 	) {
 		const toSave = customizedBodiesForSave(snap.baseBody, snap.overrides, PLATFORM_ORDER);
 		// Write a variant only when this save actually needs one, and clear a
@@ -1067,7 +1082,7 @@
 				// the response is lost, a later save must still be allowed to
 				// DELETE the row instead of leaving a stale variant that would
 				// override the main body at publish time.
-				storedVariants.add(platform);
+				stored.add(platform);
 				return {
 					platform,
 					action: 'put' as const,
@@ -1082,7 +1097,7 @@
 					})
 				};
 			}
-			if (!storedVariants.has(platform)) return null;
+			if (!stored.has(platform)) return null;
 			return {
 				platform,
 				action: 'delete' as const,
@@ -1099,18 +1114,23 @@
 				const data = await res.json().catch(() => ({}));
 				throw new Error(data.error || `Failed to save ${pending[i].platform} variant`);
 			}
-			if (pending[i].action === 'delete') storedVariants.delete(pending[i].platform);
+			if (pending[i].action === 'delete') stored.delete(pending[i].platform);
 		}
 	}
 
 	let savePromise: Promise<string | null> | null = null;
+	let saveGeneration = -1;
 
 	async function persistAll(
 		allowEmpty = false,
 		opts: { navigate?: boolean } = {}
 	): Promise<string | null> {
-		if (savePromise) return savePromise;
+		if (savePromise && saveGeneration === editorGeneration) return savePromise;
+		// A save for the post before a reset does not save this one: let it
+		// land, then save this post in its own right.
+		while (savePromise) await savePromise;
 		savePromise = doPersist(allowEmpty, opts);
+		saveGeneration = editorGeneration;
 		try {
 			return await savePromise;
 		} finally {
@@ -1136,6 +1156,8 @@
 			return draftId;
 		}
 		saving = true;
+		const generation = editorGeneration;
+		const stored = storedVariants;
 		const before = takeSnapshot();
 		const snap: SaveSnapshot = {
 			baseBody,
@@ -1147,7 +1169,8 @@
 		};
 		try {
 			const id = await ensureDraft(snap, opts.navigate ?? true);
-			await saveVariants(id, snap);
+			await saveVariants(id, snap, stored);
+			if (generation !== editorGeneration) return id;
 			loadedDraftContentFor = id;
 			saveFailed = false;
 			if (takeSnapshot() === before) {
@@ -1156,6 +1179,12 @@
 			}
 			return id;
 		} catch (e) {
+			if (generation !== editorGeneration) {
+				// The post this was saving is no longer open; its state is not
+				// this editor's to change, but the loss is still worth saying.
+				showToast(humanizeError(e instanceof Error ? e.message : 'Save failed'), 'error');
+				return null;
+			}
 			if (e instanceof Error && e.message === PUBLISHED_EDIT_ERROR) {
 				// Published from elsewhere (another tab, the scheduler) while
 				// open here: say so with the lock banner, not a failed save.
@@ -1684,6 +1713,67 @@
 		return () => document.removeEventListener('visibilitychange', onVisible);
 	});
 
+	let startingNew = $state(false);
+
+	/**
+	 * Put the open post away and start a blank one (the header's Write on this
+	 * page). The post is saved first and the editor cleared only after, so
+	 * nothing typed is lost; a save that fails keeps the post open.
+	 */
+	async function startNewPost() {
+		if (startingNew) return;
+		if (publishing || discarding || unscheduling || uploadingSegment !== null || loadingDraftId) {
+			showToast('Please wait…', 'warn');
+			return;
+		}
+		startingNew = true;
+		try {
+			let note: { message: string; tone: 'success' | 'warn'; href: string } | null = null;
+			if (publishedLock || loadFailedId) {
+				// Nothing here can be saved: it went out everywhere, or never loaded.
+			} else if (sendingNow) {
+				if (dirty) {
+					note = {
+						message: "Your last change wasn't saved — the post was being sent",
+						tone: 'warn',
+						href: '/posts'
+					};
+				}
+			} else if (draftId || baseBody.trim()) {
+				await mediaSync;
+				await flushAltPending();
+				const id = await persistClean();
+				if (!id || dirty || Object.keys(altPending).length) {
+					// The save said why (a toast, or the sending and lock banners);
+					// a post still changing under the save stays open too.
+					if (id) showToast("Couldn't save this post — it's still open", 'error');
+					return;
+				}
+				note = hasSchedule
+					? { message: 'Saved — still scheduled', tone: 'success', href: '/posts?tab=scheduled' }
+					: postState.published.length || postState.failed.length
+						? { message: 'Post saved', tone: 'success', href: '/posts' }
+						: { message: 'Saved to drafts', tone: 'success', href: '/posts?tab=drafts' };
+			}
+			clearComposer();
+			if (note) showToast(note.message, note.tone, { label: 'View', href: note.href });
+			await tick();
+			document.querySelector<HTMLTextAreaElement>('[data-testid="segment-input-0"]')?.focus();
+		} finally {
+			startingNew = false;
+		}
+	}
+
+	$effect(() => {
+		composeSession.active = true;
+		composeSession.startNew = () => void startNewPost();
+		return () => {
+			composeSession.active = false;
+			composeSession.hasContent = false;
+			composeSession.startNew = null;
+		};
+	});
+
 	let duplicating = $state(false);
 
 	/** A published post is read-only; its copy is a new draft to edit and send. */
@@ -1987,6 +2077,7 @@
 		}
 		if (advisories.length) showToast(advisories[0], 'warn');
 		uploadingSegment = segmentIndex;
+		const generation = editorGeneration;
 		try {
 			const id = await persistAll(true);
 			if (!id) throw new Error('Could not create draft for upload');
@@ -2003,6 +2094,9 @@
 						? data.media
 						: [data.media]
 					: [];
+			// Left for another post mid-upload: the images belong to the one
+			// they were sent with, which keeps them.
+			if (generation !== editorGeneration) return;
 			media = [
 				...media,
 				...items.map((it) => ({ ...it, segmentIndex: it.segmentIndex ?? segmentIndex }))
@@ -2080,6 +2174,11 @@
 	// Single-post trash = discard whole draft. Hidden when there is nothing
 	// to discard (fresh /compose with empty text and no media).
 	const canDiscard = $derived(draftId !== null || baseBody.trim() !== '' || media.length > 0);
+
+	// The same test decides whether the header's Write has anything to put away.
+	$effect(() => {
+		composeSession.hasContent = canDiscard;
+	});
 
 	// Deleting a scheduled or partly published post is more than discarding a
 	// draft: it will not go out, and what already went out stays on the platform.

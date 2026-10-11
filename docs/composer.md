@@ -13,6 +13,8 @@ asking.
 
 The top right of the composer says where the draft stands: **Saving…**, **Saved**, or **Not saved** with a **Retry** button. A failed save is retried on its own until it goes through. Switching to another tab or app saves at once, so a phone that closes the browser in the background does not cost you the last thing you typed.
 
+To start another post mid-thought, press **Write** at the top right. It saves the post you are on and opens a blank one; a draft lands in **Posts → Drafts**, and a scheduled post keeps its time. On an empty composer **Write** is hidden, since there is nothing to put away.
+
 ## A thread is a list of cards
 
 Each card is one post, with its own character counter and its own images. The

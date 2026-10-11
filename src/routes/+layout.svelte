@@ -16,6 +16,7 @@
 	import favicon from '#lib/assets/favicon.svg';
 	import faviconDark from '#lib/assets/favicon-dark.svg';
 	import logoGlyph from '#lib/assets/logo-glyph.svg';
+	import { composeSession } from '#lib/components/compose-session.svelte.js';
 	import { initialsOf } from '#lib/components/initials.js';
 	import { menuNav } from '#lib/components/menu-nav.js';
 	import {
@@ -42,6 +43,23 @@
 	// drops the image; the next URL is tried again.
 	let failedAvatarSrc = $state<string | null>(null);
 	const isLoginRoute = $derived(page.url.pathname.startsWith('/login'));
+
+	// Write starts a new post. On the compose page it only shows while a post
+	// is open there, and before the editor has mounted the URL is the guess.
+	const showWrite = $derived(
+		page.url.pathname !== '/compose' ||
+			(composeSession.active ? composeSession.hasContent : page.url.searchParams.has('id'))
+	);
+
+	// On the compose page a new post is the editor's job: it saves the open
+	// one first. A modified click still opens a fresh tab the browser's way.
+	function startNewPost(event: MouseEvent) {
+		if (page.url.pathname !== '/compose' || !composeSession.startNew) return;
+		if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+			return;
+		event.preventDefault();
+		composeSession.startNew();
+	}
 
 	// Insights counts days in the account's zone, and nothing else knows it: the
 	// browser does. Recorded in the background whenever the two disagree, so a
@@ -187,7 +205,10 @@
 								.url.pathname === '/compose'
 								? 'bg-stone-900 text-white shadow-md'
 								: 'text-stone-600 hover:bg-stone-50 hover:text-stone-900'}"
-							onclick={() => (showWorkspaceDropdown = false)}
+							onclick={(event) => {
+								showWorkspaceDropdown = false;
+								startNewPost(event);
+							}}
 							role="menuitem"
 						>
 							<PenLine
@@ -243,10 +264,12 @@
 
 			<!-- RIGHT: Write Action & Profile (Pointer events re-enabled) -->
 			<div class="pointer-events-auto flex items-center gap-3">
-				<!-- Contextual Write Button (Hidden when on Compose page) -->
-				{#if page.url.pathname !== '/compose'}
+				<!-- Write: hidden only on an empty composer, where it would do nothing -->
+				{#if showWrite}
 					<a
 						href="/compose"
+						data-testid="write-new-post"
+						onclick={startNewPost}
 						class="flex h-11 w-11 items-center justify-center gap-2 rounded-full bg-stone-900 text-[13px] font-bold text-white shadow-[0_4px_16px_-4px_rgb(28_25_23/0.3)] transition-all hover:bg-stone-800 hover:shadow-[0_4px_20px_-4px_rgb(28_25_23/0.4)] sm:h-auto sm:w-auto sm:px-5 sm:py-2.5"
 					>
 						<PenLine class="h-4 w-4" />
