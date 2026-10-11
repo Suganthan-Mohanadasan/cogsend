@@ -58,7 +58,7 @@
 	});
 
 	// Asked once per signed-in page load (and again after signing in, which does
-	// not reload the layout). The server caches GitHub's answer for six hours, so
+	// not reload the layout). The server caches GitHub's answer for an hour, so
 	// this is a D1 read, and it never holds up the page.
 	let releaseAskedFor: string | null = null;
 	onMount(readUpdateSeen);

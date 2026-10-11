@@ -97,6 +97,16 @@ describe('release check', () => {
 		const forced = gitHub({ feed: () => feedOf('v9.9.9') });
 		await checkForRelease(db, { fetchImpl: forced.fetchImpl, current: '1.0.0', refresh: true });
 		expect(forced.urls).toHaveLength(1);
+
+		// A release published since is noticed within the hour, without a click.
+		const stale = gitHub({ feed: () => feedOf('v9.9.10', 'v9.9.9') });
+		const nextHour = await checkForRelease(db, {
+			fetchImpl: stale.fetchImpl,
+			current: '1.0.0',
+			now: new Date(Date.now() + 61 * 60_000)
+		});
+		expect(stale.urls).toHaveLength(1);
+		expect(nextHour.latest?.tag).toBe('v9.9.10');
 	});
 
 	it('reports why when GitHub fails, and does not cache it for long', async () => {
@@ -115,8 +125,8 @@ describe('release check', () => {
 		await checkForRelease(db, { fetchImpl: retry.fetchImpl, current: '1.0.0' });
 		expect(retry.urls).toEqual([]);
 
-		// ...but not for six hours like a real answer.
-		const later = new Date(Date.now() + 60 * 60_000);
+		// ...but not for the hour a real answer keeps.
+		const later = new Date(Date.now() + 45 * 60_000);
 		const afterTtl = gitHub({ feed: () => feedOf('v9.9.9') });
 		const refreshed = await checkForRelease(db, {
 			fetchImpl: afterTtl.fetchImpl,

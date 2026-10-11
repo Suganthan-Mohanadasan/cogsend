@@ -5,7 +5,7 @@
  * allows 60 requests per hour *per address*, which strangers' traffic often
  * uses up. So the releases' Atom feed, a web page outside that limit, is asked
  * first, and the API only when the feed cannot answer. The answer is cached in
- * `app_settings`: six hours for a real answer, thirty minutes for a failure, so
+ * `app_settings`: an hour for a real answer, thirty minutes for a failure, so
  * a GitHub outage does not pin "unknown" for the rest of the day.
  *
  * Nothing here is allowed to break a page: every failure path returns a result
@@ -31,7 +31,7 @@ import type { AppDb } from './db/client';
 const CACHE_KEY = 'release_check';
 /** '1' when Settings → Instance offers pre-releases too. */
 export const OFFER_PRERELEASES_SETTING = 'offer_prereleases';
-const OK_TTL_MS = 6 * 60 * 60_000;
+const OK_TTL_MS = 60 * 60_000;
 const FAIL_TTL_MS = 30 * 60_000;
 const TIMEOUT_MS = 8_000;
 
