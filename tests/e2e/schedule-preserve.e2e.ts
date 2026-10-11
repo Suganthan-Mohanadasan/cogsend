@@ -1,7 +1,6 @@
-import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
-import { clickUntilVisible, E2E_ACCOUNT, E2E_D1_FLAGS } from './e2e-env';
+import { clickUntilVisible, E2E_ACCOUNT, d1 } from './e2e-env';
 
 /**
  * Editing a scheduled post (Posts → Edit Post) must reopen the schedule popover
@@ -26,12 +25,6 @@ const STORED_TIME = '10:30';
 /** Before NOW, so the browser treats it as past. Still future to the real
  *  server clock, so nothing in the local worker tries to publish it. */
 const PAST_ISO = '2030-06-01T09:00:00.000Z';
-
-function d1(sql: string) {
-	execSync(`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`, {
-		stdio: 'pipe'
-	});
-}
 
 /** Rows seeded by the current test, removed after it so later specs (smoke's
  *  empty Accounts page) see the shared e2e database as they left it. */

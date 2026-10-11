@@ -1,7 +1,6 @@
-import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
-import { clickUntilVisible, E2E_D1_FLAGS, waitForLiveComposer } from './e2e-env';
+import { clickUntilVisible, waitForLiveComposer, d1 } from './e2e-env';
 
 /**
  * A post that is already scheduled, opened in the composer: it says where and
@@ -10,12 +9,6 @@ import { clickUntilVisible, E2E_D1_FLAGS, waitForLiveComposer } from './e2e-env'
  * publish are answered here so no provider is contacted; the draft read and
  * the bulk cancel are the real routes, which never contact one either.
  */
-
-function d1(sql: string) {
-	execSync(`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`, {
-		stdio: 'pipe'
-	});
-}
 
 const PREFIX = 'scheduled-post';
 const connIds: string[] = [];

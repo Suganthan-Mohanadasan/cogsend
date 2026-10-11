@@ -1,19 +1,12 @@
-import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
-import { E2E_D1_FLAGS, fillUntilKept, waitForLiveComposer } from './e2e-env';
+import { fillUntilKept, waitForLiveComposer, d1 } from './e2e-env';
 
 /**
  * The header's Write on the compose page: hidden on an empty composer, and
  * otherwise it saves the open post before clearing for a new one, so an idea
  * can be parked mid-sentence without losing it.
  */
-
-function d1(sql: string) {
-	execSync(`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`, {
-		stdio: 'pipe'
-	});
-}
 
 const PREFIX = 'new-post';
 const connIds: string[] = [];

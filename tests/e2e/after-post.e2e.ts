@@ -1,7 +1,6 @@
-import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
-import { clickUntilVisible, E2E_D1_FLAGS, fillUntilKept, waitForLiveComposer } from './e2e-env';
+import { clickUntilVisible, fillUntilKept, waitForLiveComposer, d1 } from './e2e-env';
 
 /**
  * What the composer does once a post is on its way: a new post clears the
@@ -10,12 +9,6 @@ import { clickUntilVisible, E2E_D1_FLAGS, fillUntilKept, waitForLiveComposer } f
  * publish are answered here, so no provider is contacted; what is under test
  * is the composer's reaction to the answer.
  */
-
-function d1(sql: string) {
-	execSync(`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`, {
-		stdio: 'pipe'
-	});
-}
 
 const PREFIX = 'after-post';
 const connIds: string[] = [];

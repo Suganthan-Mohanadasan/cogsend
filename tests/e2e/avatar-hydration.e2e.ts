@@ -1,7 +1,6 @@
-import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import { E2E_ACCOUNT, E2E_D1_FLAGS } from './e2e-env';
+import { E2E_ACCOUNT, d1 } from './e2e-env';
 
 /**
  * A cached avatar loads before the app's JavaScript does on a real network.
@@ -9,12 +8,6 @@ import { E2E_ACCOUNT, E2E_D1_FLAGS } from './e2e-env';
  * admit; blocked, the image stays at opacity 0 over the initials until a hard
  * reload. Holding the bundles back reproduces that order on a local server.
  */
-function d1(sql: string) {
-	execSync(`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`, {
-		stdio: 'pipe'
-	});
-}
-
 test('a cached account avatar shows when the app hydrates late', async ({ page }) => {
 	const violations: string[] = [];
 	page.on('console', (msg) => {

@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { expect, type Locator, type Page } from '@playwright/test';
 
@@ -52,6 +53,31 @@ export const E2E_AUTH_STATE = '.wrangler/e2e-auth.json';
 
 /** Extra flags for every `wrangler d1 …` call inside a spec. */
 export const E2E_D1_FLAGS = `--persist-to ${E2E_PERSIST_TO}`;
+
+/**
+ * Run SQL against the suite's local D1, for seeding and cleaning up.
+ *
+ * The running server shares the database file, so a write it is making as a
+ * test ends (an autosave of what the test typed) can hold the lock while a
+ * cleanup runs. SQLite answers `database is locked` instead of waiting, and a
+ * cleanup that gives up leaves rows the next spec trips over; so a locked
+ * database is retried for a few seconds, and anything else fails at once.
+ */
+export function d1(sql: string) {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			execSync(
+				`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`,
+				{ stdio: 'pipe' }
+			);
+			return;
+		} catch (err) {
+			const output = `${err instanceof Error ? err.message : ''}${(err as { stderr?: Buffer }).stderr ?? ''}`;
+			if (attempt >= 5 || !/SQLITE_BUSY|database is locked/i.test(output)) throw err;
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500 * (attempt + 1));
+		}
+	}
+}
 
 /**
  * Click a control and wait for what it opens, retrying the click.

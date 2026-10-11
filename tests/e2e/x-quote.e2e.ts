@@ -1,13 +1,6 @@
-import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import {
-	clickUntilVisible,
-	E2E_ACCOUNT,
-	E2E_AUTH_STATE,
-	E2E_D1_FLAGS,
-	waitForLiveComposer
-} from './e2e-env';
+import { clickUntilVisible, E2E_ACCOUNT, E2E_AUTH_STATE, waitForLiveComposer, d1 } from './e2e-env';
 
 /**
  * X shows a post whose text ends with a link to another X post as a quote, and
@@ -26,12 +19,6 @@ let publishedDraftId = '';
 let userId = '';
 const extraDraftIds: string[] = [];
 const extraConnectionIds: string[] = [];
-
-function d1(sql: string) {
-	execSync(`node scripts/wrangler.mjs d1 execute DB --local ${E2E_D1_FLAGS} --command "${sql}"`, {
-		stdio: 'pipe'
-	});
-}
 
 async function signIn(page: Page) {
 	await page.goto('/compose');
