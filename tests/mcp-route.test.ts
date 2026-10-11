@@ -4,11 +4,11 @@ import {
 	CLIENT_CAPABILITIES_META_KEY,
 	PROTOCOL_VERSION_META_KEY
 } from '@modelcontextprotocol/server';
-import { createTestAdmin, createTestDb, createTestMedia, TEST_ENV } from '$lib/server/db/test';
-import { newId } from '$lib/server/db/client';
-import { connections, draftMedia, drafts, publishTargets } from '$lib/server/db/schema';
-import { memoryMediaStore, thumbCacheKey } from '$lib/server/media';
-import * as publish from '$lib/server/publish';
+import { createTestAdmin, createTestDb, createTestMedia, TEST_ENV } from '#lib/server/db/test.js';
+import { newId } from '#lib/server/db/client.js';
+import { connections, draftMedia, drafts, publishTargets } from '#lib/server/db/schema.js';
+import { memoryMediaStore, thumbCacheKey } from '#lib/server/media.js';
+import * as publish from '#lib/server/publish.js';
 import { DELETE, GET, POST } from '../src/routes/api/mcp/+server';
 
 const toolNames = [
@@ -109,7 +109,7 @@ afterEach(() => {
 function requestEvent(
 	request: Request,
 	overrides: Record<string, unknown> = {},
-	platform?: { ctx: { waitUntil: (promise: Promise<unknown>) => void } }
+	waitUntil?: (promise: Promise<unknown>) => void
 ) {
 	const locals = {
 		user,
@@ -117,9 +117,10 @@ function requestEvent(
 		db,
 		env: TEST_ENV,
 		media: createTestMedia(),
+		...(waitUntil && { waitUntil }),
 		...overrides
 	};
-	return { request, locals, platform, url: new URL(request.url) } as never;
+	return { request, locals, url: new URL(request.url) } as never;
 }
 
 async function seedDraft(ownerId = user.id) {
@@ -161,10 +162,10 @@ async function postMcp(
 	overrides: Record<string, unknown> = {},
 	{
 		includeProtocolVersion = true,
-		platform
+		waitUntil
 	}: {
 		includeProtocolVersion?: boolean;
-		platform?: { ctx: { waitUntil: (promise: Promise<unknown>) => void } };
+		waitUntil?: (promise: Promise<unknown>) => void;
 	} = {}
 ) {
 	const headers = new Headers({
@@ -190,7 +191,7 @@ async function postMcp(
 		headers,
 		body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: wireParams })
 	});
-	const response = await POST(requestEvent(request, overrides, platform));
+	const response = await POST(requestEvent(request, overrides, waitUntil));
 	return { response, payload: (await response.json()) as McpPayload };
 }
 
@@ -494,7 +495,7 @@ describe('MCP route', () => {
 			'tools/call',
 			{ name: 'retry_delivery', arguments: { targetId } },
 			{},
-			{ platform: { ctx: { waitUntil: (promise) => background.push(promise) } } }
+			{ waitUntil: (promise) => background.push(promise) }
 		);
 		expect(payload.result!.isError).toBeFalsy();
 		expect(background).toHaveLength(1);

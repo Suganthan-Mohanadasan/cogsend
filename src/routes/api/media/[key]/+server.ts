@@ -1,8 +1,8 @@
 import { and, eq } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
-import { first } from '$lib/server/db/client';
-import { draftMedia, drafts } from '$lib/server/db/schema';
-import { fail, handleError } from '$lib/server/http';
+import { first } from '#lib/server/db/client.js';
+import { draftMedia, drafts } from '#lib/server/db/schema.js';
+import { fail, handleError } from '#lib/server/http.js';
 import {
 	assertSafeStorageKey,
 	jpegResponse,
@@ -11,10 +11,10 @@ import {
 	storedThumbnail,
 	thumbCandidate,
 	type ImageResizer
-} from '$lib/server/media';
-import { requireScope, requireUser } from '$lib/server/require';
+} from '#lib/server/media.js';
+import { requireScope, requireUser } from '#lib/server/require.js';
 
-export const GET: RequestHandler = async ({ params, locals, request, url, platform }) => {
+export const GET: RequestHandler = async ({ params, locals, request, url }) => {
 	try {
 		const user = requireUser(locals.user);
 		requireScope(locals, 'read');
@@ -34,7 +34,7 @@ export const GET: RequestHandler = async ({ params, locals, request, url, platfo
 		// smaller file; everyone else, and any encode that fails, gets the
 		// original. Skipping the attempt when the binding is absent avoids an
 		// extra storage read on every thumbnail.
-		const images = (platform?.env as { IMAGES?: ImageResizer } | undefined)?.IMAGES ?? null;
+		const images = (locals.bindings as { IMAGES?: ImageResizer }).IMAGES ?? null;
 		if (
 			images &&
 			url.searchParams.get('thumb') === '1' &&

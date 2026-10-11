@@ -14,23 +14,23 @@
 		Check,
 		Users
 	} from '@lucide/svelte';
-	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-	import { platformColorClass } from '$lib/components/platform-color';
-	import SocialIcon from '$lib/components/SocialIcon.svelte';
-	import { displayHandle, platformName, platformRank } from '$lib/domain/platforms';
-	import { draftExcerpt } from '$lib/domain/excerpt';
-	import { safeHttpUrl } from '$lib/domain/links';
-	import { parseXPostUrl } from '$lib/domain/x-quote';
-	import { humanizeError } from '$lib/domain/human-error';
-	import { sessionExpiredIfUnauthorized } from '$lib/components/session-expired';
-	import { menuNav } from '$lib/components/menu-nav';
+	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
+	import { platformColorClass } from '#lib/components/platform-color.js';
+	import SocialIcon from '#lib/components/SocialIcon.svelte';
+	import { displayHandle, platformName, platformRank } from '#lib/domain/platforms.js';
+	import { draftExcerpt } from '#lib/domain/excerpt.js';
+	import { safeHttpUrl } from '#lib/domain/links.js';
+	import { parseXPostUrl } from '#lib/domain/x-quote.js';
+	import { humanizeError } from '#lib/domain/human-error.js';
+	import { sessionExpiredIfUnauthorized } from '#lib/components/session-expired.js';
+	import { menuNav } from '#lib/components/menu-nav.js';
 	import {
 		formatDayTime,
 		formatFullLocalWithZone,
 		formatLocalDateTimeWithZone,
 		formatRelativeTime,
 		localTimezoneShort
-	} from '$lib/domain/relative-time';
+	} from '#lib/domain/relative-time.js';
 	import {
 		cancelTargetIds,
 		emptyPostsBody,
@@ -39,7 +39,7 @@
 		rescheduleTargetIds,
 		retryTargetIds,
 		type PostsTab
-	} from '$lib/domain/post-actions';
+	} from '#lib/domain/post-actions.js';
 	import {
 		DEFAULT_SCHEDULE_OFFSET,
 		isFutureScheduleValue,
@@ -47,8 +47,8 @@
 		offsetToDHM,
 		scheduleFromDHM,
 		scheduleValueToIso
-	} from '$lib/domain/schedule-helpers';
-	import { splitThreadSegments } from '$lib/domain/thread-segments';
+	} from '#lib/domain/schedule-helpers.js';
+	import { splitThreadSegments } from '#lib/domain/thread-segments.js';
 	import type { Snapshot } from './$types';
 
 	type PostMedia = {
@@ -150,7 +150,7 @@
 	const accountFilter = $derived(page.url.searchParams.get('account'));
 
 	function postsHref(changes: { tab?: PostsTab; account?: string | null }): string {
-		const url = new URL(page.url);
+		const url = new URL(page.url.href);
 		if (changes.tab === 'all') url.searchParams.delete('tab');
 		else if (changes.tab) url.searchParams.set('tab', changes.tab);
 		if (changes.account === null) url.searchParams.delete('account');
@@ -160,7 +160,7 @@
 
 	// Replacing the entry keeps Back leaving Posts rather than stepping through filters.
 	function setAccountFilter(id: string | null) {
-		void goto(postsHref({ account: id }), { replaceState: true, noScroll: true, keepFocus: true });
+		void goto(postsHref({ account: id }), { replace: true, reset: false });
 	}
 
 	let tabStrip = $state<HTMLDivElement | null>(null);
@@ -1045,8 +1045,7 @@
 						href={postsHref({ tab })}
 						data-tab={tab}
 						data-sveltekit-replacestate
-						data-sveltekit-noscroll
-						data-sveltekit-keepfocus
+						data-sveltekit-reset="false"
 						aria-current={activeTab === tab ? 'page' : undefined}
 						class="rounded-lg px-4 py-1.5 text-[13px] font-bold capitalize transition-all {activeTab ===
 						tab

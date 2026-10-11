@@ -1,5 +1,6 @@
-import type { Handle } from '@sveltejs/kit';
+import type { Handle } from '@sveltejs/kit/hooks';
 import { json } from '@sveltejs/kit';
+import { env as workerEnv, waitUntil } from 'cloudflare:workers';
 import { eq } from 'drizzle-orm';
 import {
 	anySecretMatches,
@@ -7,8 +8,8 @@ import {
 	hasAllowedMutationOrigin,
 	isInternalApiPath,
 	secretMatches
-} from '$lib/domain/bearer';
-import { isApiKeyFormat, touchApiKey, verifyApiKey } from '$lib/server/api-keys';
+} from '#lib/domain/bearer.js';
+import { isApiKeyFormat, touchApiKey, verifyApiKey } from '#lib/server/api-keys.js';
 import {
 	SESSION_COOKIE,
 	asMachineUser,
@@ -17,31 +18,32 @@ import {
 	getSessionUser,
 	isFullyVerified,
 	needsTotpEnroll
-} from '$lib/server/auth';
-import { createD1Db, first } from '$lib/server/db/client';
-import { ensureSchemaOnce } from '$lib/server/db/init-sql';
-import { users } from '$lib/server/db/schema';
-import { envFromPlatform } from '$lib/server/env';
-import type { AppEnv } from '$lib/server/env';
-import { memoryMediaStore, r2MediaStore } from '$lib/server/media';
+} from '#lib/server/auth.js';
+import { createD1Db, first } from '#lib/server/db/client.js';
+import { ensureSchemaOnce } from '#lib/server/db/init-sql.js';
+import { users } from '#lib/server/db/schema.js';
+import { envFromPlatform } from '#lib/server/env.js';
+import type { AppEnv } from '#lib/server/env.js';
+import { memoryMediaStore, r2MediaStore } from '#lib/server/media.js';
 import {
 	countingD1,
 	countingMediaStore,
 	parseSubrequestLimit,
 	SubrequestBudget
-} from '$lib/server/budget';
-import { runSchedulerTick } from '$lib/server/scheduler';
-import { securityHeadersFor } from '$lib/server/security-headers';
-import { isPinnedAppUrl } from '$lib/domain/app-url';
-import { readStoredAppUrl, rememberAppUrl } from '$lib/server/app-settings';
-import { verifyTickToken } from '$lib/server/tick-token';
-import { authorizeMcpRequest } from '$lib/server/mcp-auth';
+} from '#lib/server/budget.js';
+import { runSchedulerTick } from '#lib/server/scheduler.js';
+import { securityHeadersFor } from '#lib/server/security-headers.js';
+import { isPinnedAppUrl } from '#lib/domain/app-url.js';
+import { readStoredAppUrl, rememberAppUrl } from '#lib/server/app-settings.js';
+import { carriesCredential, isCrossSiteForgery } from '#lib/server/csrf.js';
+import { verifyTickToken } from '#lib/server/tick-token.js';
+import { authorizeMcpRequest } from '#lib/server/mcp-auth.js';
 import {
 	isRateLimitedPath,
 	rateLimitKey,
 	rateLimitProblem,
 	type RateLimiter
-} from '$lib/server/rate-limit';
+} from '#lib/server/rate-limit.js';
 
 export function isPublicPath(path: string): boolean {
 	if (path === '/login' || path === '/login/setup-2fa' || path === '/login/verify') return true;
@@ -98,14 +100,28 @@ export const handle: Handle = async ({ event, resolve }) => {
 		// Access-Control-* headers) so browsers default-deny cross-origin reads.
 		return new Response(null, { status: 204 });
 	}
+	// SvelteKit's own check is off in favour of this one (see #lib/server/csrf);
+	// like SvelteKit's, it only runs in a build.
+	if (!import.meta.env.DEV && isCrossSiteForgery(event.request, event.url.origin)) {
+		const message = `Cross-site ${event.request.method} form submissions are forbidden`;
+		return withPageSecurity(
+			path,
+			event.request.headers.get('accept') === 'application/json'
+				? json({ message }, { status: 403 })
+				: new Response(message, { status: 403 }),
+			secureRequest
+		);
+	}
 
-	const platformEnv = event.platform?.env as Env | undefined;
+	const platformEnv = workerEnv;
 	if (!platformEnv?.DB) {
 		throw new Error('D1 binding DB is missing. Run via vite (adapter-cloudflare) or wrangler.');
 	}
+	event.locals.bindings = platformEnv;
+	event.locals.waitUntil = waitUntil;
 
 	// Every D1, R2 and queue call below is counted against this request's
-	// subrequest limit; see $lib/server/budget.
+	// subrequest limit; see #lib/server/budget.
 	const budget = new SubrequestBudget(
 		parseSubrequestLimit((platformEnv as unknown as Record<string, unknown>).SUBREQUEST_LIMIT)
 	);
@@ -115,7 +131,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	const db = createD1Db(d1);
 	event.locals.db = db;
 	// A deployment only learns its URL once it exists, so APP_URL is normally
-	// derived from the request itself (see $lib/domain/app-url) — and recorded
+	// derived from the request itself (see #lib/domain/app-url) — and recorded
 	// below for the invocations that have no request: the cron tick and queue
 	// consumers. A pinned APP_URL skips the read entirely.
 	const configuredAppUrl =
@@ -191,8 +207,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	// — health probes, bots probing /login — from doing D1 work on every hit.
 	// A bearer caller needs the account row to act as; without one (before
 	// `npm run setup` created it) there is nothing to act as.
-	const hasCredential =
-		bearer !== null || (event.request.headers.get('x-api-key')?.trim() ?? '') !== '';
+	const hasCredential = carriesCredential(event.request.headers);
 	const admin = hasCredential ? await getAdminUser(db) : null;
 
 	const session = await getSessionUser(db, appEnv, raw);
@@ -248,13 +263,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 				event.locals.authMethod = 'bearer';
 				event.locals.authCredential = 'personal_api_key';
 				event.locals.apiKeyScopes = verified.scopes;
-				const touch = touchApiKey(db, verified.keyId);
-				try {
-					event.platform?.ctx?.waitUntil(touch);
-				} catch {
-					// waitUntil unavailable (tests, preview): the touch still
-					// runs; last_used_at is best-effort metadata either way.
-				}
+				// last_used_at is best-effort metadata: it is not worth delaying
+				// the response for.
+				waitUntil(touchApiKey(db, verified.keyId));
 			}
 		}
 	}
@@ -265,11 +276,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	// Cookies only: a browser visit is the authority on the human-facing URL, and
 	// it keeps API clients (which may use a different host) from rewriting it.
 	if (appEnv.appUrlSource === 'request' && event.locals.authMethod === 'session') {
-		try {
-			event.platform?.ctx?.waitUntil(rememberAppUrl(db, appEnv.APP_URL));
-		} catch {
-			// No execution context (tests): the next request derives it again.
-		}
+		waitUntil(rememberAppUrl(db, appEnv.APP_URL));
 	}
 
 	if (import.meta.env.DEV) {

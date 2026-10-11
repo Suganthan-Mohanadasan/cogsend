@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createClient, type Client } from '@libsql/client';
 import { handle } from '../src/hooks.server';
-import { ensureSchema } from '$lib/server/db/init-sql';
+import { useWorkerEnv } from './cloudflare-workers';
+import { ensureSchema } from '#lib/server/db/init-sql.js';
 import { captureConsole, loggedLines } from './console-spy';
 import {
 	RATE_LIMITED_PATHS,
@@ -9,7 +10,7 @@ import {
 	rateLimitKey,
 	rateLimitProblem,
 	type RateLimiter
-} from '$lib/server/rate-limit';
+} from '#lib/server/rate-limit.js';
 
 /** Same D1-shaped shim the tick-token hook test uses: the hook builds its own
  *  drizzle handle from the binding. */
@@ -118,6 +119,16 @@ describe('the hook', () => {
 		const url = new URL(`https://cogsend.example.com${path}`);
 		const headers: Record<string, string> = { 'content-type': 'application/json' };
 		if (options.ip) headers['cf-connecting-ip'] = options.ip;
+		useWorkerEnv({
+			DB: binding,
+			APP_URL: 'https://cogsend.example.com',
+			APP_ENCRYPTION_KEY: 'feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface',
+			AUTH_RATE_LIMITER: options.limiter,
+			// A binding, so the hook takes the R2 path: a warn per request
+			// about the dev memory fallback is noise in a rate-limit test.
+			// The one test that wants the fallback passes media: false.
+			MEDIA: options.media === false ? undefined : {}
+		});
 		const response = await handle({
 			event: {
 				url,
@@ -130,19 +141,6 @@ describe('the hook', () => {
 					serialize: () => ''
 				},
 				locals: {},
-				platform: {
-					env: {
-						DB: binding,
-						APP_URL: 'https://cogsend.example.com',
-						APP_ENCRYPTION_KEY: 'feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface',
-						AUTH_RATE_LIMITER: options.limiter,
-						// A binding, so the hook takes the R2 path: a warn per request
-						// about the dev memory fallback is noise in a rate-limit test.
-						// The one test that wants the fallback passes media: false.
-						MEDIA: options.media === false ? undefined : {}
-					},
-					ctx: { waitUntil: () => {}, passThroughOnException: () => {} }
-				},
 				fetch: async () => new Response('ok'),
 				params: {},
 				route: { id: path },

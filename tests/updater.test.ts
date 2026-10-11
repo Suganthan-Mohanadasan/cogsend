@@ -9,10 +9,10 @@ import {
 	publicKeyOf,
 	signManifest
 } from '../scripts/lib/release-bundle.mjs';
-import { SubrequestBudget } from '$lib/server/budget';
-import { createTestDb, TEST_ENV, type TestDb } from '$lib/server/db/test';
-import { cloudflareApi } from '$lib/server/updater/cloudflare-api';
-import { updaterContext } from '$lib/server/updater/context';
+import { SubrequestBudget } from '#lib/server/budget.js';
+import { createTestDb, TEST_ENV, type TestDb } from '#lib/server/db/test.js';
+import { cloudflareApi } from '#lib/server/updater/cloudflare-api.js';
+import { updaterContext } from '#lib/server/updater/context.js';
 import {
 	readJob,
 	readPrevious,
@@ -20,7 +20,7 @@ import {
 	readUnlockedToken,
 	writePrevious,
 	writeUnlockedToken
-} from '$lib/server/updater/state';
+} from '#lib/server/updater/state.js';
 import {
 	MAX_BUCKETS_PER_CALL,
 	MAX_FILES_PER_CALL_SINGLE,
@@ -35,7 +35,7 @@ import {
 	stepVersion,
 	type PackStore,
 	type UpdaterContext
-} from '$lib/server/updater/steps';
+} from '#lib/server/updater/steps.js';
 import { POST as stepPOST } from '../src/routes/api/update/[step]/+server';
 import { GET as statusGET } from '../src/routes/api/update/+server';
 
@@ -572,8 +572,13 @@ describe('in-app updater', () => {
 					headers: { 'content-type': 'application/json' },
 					body: JSON.stringify(body)
 				}),
-				locals: { db: test.db, env: TEST_ENV, budget: new SubrequestBudget(), ...locals },
-				platform: { env: {} },
+				locals: {
+					db: test.db,
+					env: TEST_ENV,
+					budget: new SubrequestBudget(),
+					bindings: {},
+					...locals
+				},
 				url: new URL('http://localhost/api/update/target')
 			} as never) as Promise<Response>;
 		const user = { id: 'u', email: 'a@b', timezone: 'UTC', totpEnabled: true, mfaVerified: true };
@@ -601,8 +606,13 @@ describe('update status', () => {
 		const user = { id: 'u', email: 'a@b', timezone: 'UTC', totpEnabled: true, mfaVerified: true };
 		const status = async (running: string | null) => {
 			const res = (await statusGET({
-				locals: { db: test.db, env: TEST_ENV, user, authMethod: 'session' },
-				platform: { env: running ? { CF_VERSION_METADATA: { id: running } } : {} }
+				locals: {
+					db: test.db,
+					env: TEST_ENV,
+					user,
+					authMethod: 'session',
+					bindings: running ? { CF_VERSION_METADATA: { id: running } } : {}
+				}
 			} as never)) as Response;
 			return (await res.json()).previous;
 		};
@@ -632,8 +642,7 @@ describe('update status for a Deploy-button install', () => {
 		const user = { id: 'u', email: 'a@b', timezone: 'UTC', totpEnabled: true, mfaVerified: true };
 		const github = async (env: Record<string, string>) => {
 			const res = (await statusGET({
-				locals: { db: test.db, env: TEST_ENV, user, authMethod: 'session' },
-				platform: { env }
+				locals: { db: test.db, env: TEST_ENV, user, authMethod: 'session', bindings: env }
 			} as never)) as Response;
 			return (await res.json()).github;
 		};
@@ -661,8 +670,7 @@ describe('updater context', () => {
 		try {
 			const ctx = updaterContext(
 				{
-					locals: { db: null, budget: new SubrequestBudget() } as never,
-					platform: { env: { MEDIA: {} } } as never,
+					locals: { db: null, budget: new SubrequestBudget(), bindings: { MEDIA: {} } } as never,
 					url: new URL('https://cogsend.example')
 				},
 				TOKEN

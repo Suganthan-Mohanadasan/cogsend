@@ -1,7 +1,7 @@
 import { isRedirect, redirect } from '@sveltejs/kit';
 import type { RequestHandler } from '@sveltejs/kit';
 import { and, eq } from 'drizzle-orm';
-import type { PlatformId } from '$lib/domain/platforms';
+import type { PlatformId } from '#lib/domain/platforms.js';
 import { SESSION_COOKIE } from './auth';
 import { encryptJson } from './crypto';
 import { first, newId, parseJson, type AppDb } from './db/client';
@@ -10,6 +10,15 @@ import type { AppEnv } from './env';
 import { splitOAuthState, verifyOAuthState } from './oauth-state';
 
 type PendingRow = typeof oauthPending.$inferSelect;
+
+/**
+ * Lets a callback's redirect send the browser to the instance's own origin.
+ * The provider can call back on another host than APP_URL (an app registered
+ * with the workers.dev address on an instance since pinned to a custom
+ * domain), and SvelteKit refuses an absolute redirect off the request's
+ * origin unless that origin is allowed by name.
+ */
+export const toAppOrigin = (appUrl: string) => ({ external: [appUrl] });
 
 export interface CallbackExchange {
 	/** Stored encrypted; decrypted by verify/publish, so the shape is the provider's. */
@@ -75,8 +84,10 @@ export function createOAuthCallback(opts: OAuthCallbackOptions): RequestHandler 
 		const code = url.searchParams.get('code');
 		const state = url.searchParams.get('state');
 		const error = url.searchParams.get('error');
-		if (error) redirect(302, `${appUrl}/accounts?error=${encodeURIComponent(error)}`);
-		if (!code || !state) redirect(302, `${appUrl}/accounts?error=missing_code`);
+		if (error)
+			redirect(302, `${appUrl}/accounts?error=${encodeURIComponent(error)}`, toAppOrigin(appUrl));
+		if (!code || !state)
+			redirect(302, `${appUrl}/accounts?error=missing_code`, toAppOrigin(appUrl));
 
 		const candidate = splitOAuthState(state);
 		const pending = candidate
@@ -98,7 +109,7 @@ export function createOAuthCallback(opts: OAuthCallbackOptions): RequestHandler 
 			wrongProvider
 		) {
 			if (pending) await locals.db.delete(oauthPending).where(eq(oauthPending.id, pending.id));
-			redirect(302, `${appUrl}/accounts?error=oauth_expired`);
+			redirect(302, `${appUrl}/accounts?error=oauth_expired`, toAppOrigin(appUrl));
 		}
 
 		try {
@@ -145,11 +156,11 @@ export function createOAuthCallback(opts: OAuthCallbackOptions): RequestHandler 
 				});
 			}
 			await locals.db.delete(oauthPending).where(eq(oauthPending.id, pending.id));
-			redirect(302, `${appUrl}/accounts?connected=${opts.platform}`);
+			redirect(302, `${appUrl}/accounts?connected=${opts.platform}`, toAppOrigin(appUrl));
 		} catch (e) {
 			if (isRedirect(e)) throw e;
 			const message = e instanceof Error ? e.message : 'oauth_failed';
-			redirect(302, `${appUrl}/accounts?error=${encodeURIComponent(message)}`);
+			redirect(302, `${appUrl}/accounts?error=${encodeURIComponent(message)}`, toAppOrigin(appUrl));
 		}
 	};
 }

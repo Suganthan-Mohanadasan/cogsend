@@ -1,7 +1,7 @@
 import { createMcpHandler, isJsonContentType, McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { RequestEvent, RequestHandler } from '@sveltejs/kit';
-import { humanizedCause } from '$lib/domain/human-error';
+import { humanizedCause } from '#lib/domain/human-error.js';
 import {
 	cancelDelivery,
 	createDraft,
@@ -19,10 +19,10 @@ import {
 	setDraftVariant,
 	updateDraft,
 	validatePost
-} from '$lib/server/api/operations';
-import { ApiOperationError } from '$lib/server/api/operation-error';
-import { requireScope, requireUser } from '$lib/server/require';
-import type { OperationContext } from '$lib/server/api/operations';
+} from '#lib/server/api/operations.js';
+import { ApiOperationError } from '#lib/server/api/operation-error.js';
+import { requireScope, requireUser } from '#lib/server/require.js';
+import type { OperationContext } from '#lib/server/api/operations.js';
 
 const id = z.string().min(1).max(128);
 const boundedLimit = z.number().int().min(1).max(100).default(50);
@@ -354,19 +354,10 @@ function registerForEvent<T extends z.ZodType>(
 			try {
 				const user = requireUser(event.locals.user);
 				requireScope(event.locals, spec.scope);
-				// Publish and retry hand their provider calls to waitUntil, as the REST
-				// routes do, so a client that disconnects mid-call cannot cut them off.
-				const waitUntil = event.platform?.ctx?.waitUntil;
-				const ctx: OperationContext = waitUntil
-					? {
-							...event.locals,
-							waitUntil: (promise) =>
-								waitUntil.call(
-									event.platform!.ctx,
-									promise.then(() => undefined)
-								)
-						}
-					: event.locals;
+				// Publish and retry hand their provider calls to locals.waitUntil, as
+				// the REST routes do, so a client that disconnects mid-call cannot cut
+				// them off.
+				const ctx: OperationContext = event.locals;
 				const result = await operation(input as z.infer<T>, ctx, user.id);
 				return {
 					content: [{ type: 'text' as const, text: concise(name, result) }],

@@ -24,11 +24,11 @@
 		PLATFORM_LIMITS,
 		isOverSelectedPlatformLimit,
 		platformLimit
-	} from '$lib/domain/editor-limits';
-	import { humanizeError } from '$lib/domain/human-error';
-	import { dialogFocus } from '$lib/components/dialog-focus';
-	import { initialsOf } from '$lib/components/initials';
-	import { platformColorClass } from '$lib/components/platform-color';
+	} from '#lib/domain/editor-limits.js';
+	import { humanizeError } from '#lib/domain/human-error.js';
+	import { dialogFocus } from '#lib/components/dialog-focus.js';
+	import { initialsOf } from '#lib/components/initials.js';
+	import { platformColorClass } from '#lib/components/platform-color.js';
 	import {
 		BLUESKY_MAX_IMAGE_BYTES,
 		LINKEDIN_MAX_IMAGES,
@@ -39,9 +39,9 @@
 		groupMediaBySegment,
 		mediaSizeProblem,
 		remapSegmentIndexAfterRemoval
-	} from '$lib/domain/media-limits';
-	import { shrinkToFit } from '$lib/components/shrink-image';
-	import { persistMediaLayout, type MediaMove } from '$lib/domain/media-sync';
+	} from '#lib/domain/media-limits.js';
+	import { shrinkToFit } from '#lib/components/shrink-image.js';
+	import { persistMediaLayout, type MediaMove } from '#lib/domain/media-sync.js';
 	import {
 		customizePlatformBody,
 		effectivePlatformBody,
@@ -54,7 +54,7 @@
 		customizedBodiesForSave,
 		type PlatformId,
 		type PlatformOverrideMap
-	} from '$lib/domain/platform-sync';
+	} from '#lib/domain/platform-sync.js';
 	import {
 		supportsThreads,
 		accountLabel,
@@ -63,9 +63,9 @@
 		platformNames,
 		platformRank,
 		PLATFORM_ORDER
-	} from '$lib/domain/platforms';
-	import { parsePollConfig, validatePollConfig, type PollConfig } from '$lib/domain/poll';
-	import type { ProfileSettings } from '$lib/domain/profile-settings';
+	} from '#lib/domain/platforms.js';
+	import { parsePollConfig, validatePollConfig, type PollConfig } from '#lib/domain/poll.js';
+	import type { ProfileSettings } from '#lib/domain/profile-settings.js';
 	import {
 		DEFAULT_SCHEDULE_OFFSET,
 		earliestFutureScheduleValue,
@@ -75,9 +75,9 @@
 		scheduleFromDHM,
 		schedulePreviewText,
 		scheduleValueToIso
-	} from '$lib/domain/schedule-helpers';
-	import { localTimezoneShort } from '$lib/domain/relative-time';
-	import { splitLongText } from '$lib/domain/text-split';
+	} from '#lib/domain/schedule-helpers.js';
+	import { localTimezoneShort } from '#lib/domain/relative-time.js';
+	import { splitLongText } from '#lib/domain/text-split.js';
 	import {
 		addSegment,
 		flattenThreadBody,
@@ -90,14 +90,14 @@
 		splitAtMarkers,
 		splitThreadSegments,
 		updateSegment
-	} from '$lib/domain/thread-segments';
+	} from '#lib/domain/thread-segments.js';
 	import {
 		countGraphemes,
 		mastodonWeightedLength,
 		xWeightedLength
-	} from '$lib/domain/validation/text';
-	import { utf8ByteLength } from '$lib/domain/bytes';
-	import { draftExcerpt } from '$lib/domain/excerpt';
+	} from '#lib/domain/validation/text.js';
+	import { utf8ByteLength } from '#lib/domain/bytes.js';
+	import { draftExcerpt } from '#lib/domain/excerpt.js';
 	import {
 		attachXQuote,
 		keepXQuoteOnX,
@@ -109,7 +109,7 @@
 		trailingXQuote,
 		type QuotableTarget,
 		type XQuote
-	} from '$lib/domain/x-quote';
+	} from '#lib/domain/x-quote.js';
 	import SocialIcon from './SocialIcon.svelte';
 	import LinkPreview from './LinkPreview.svelte';
 	import XQuoteCard from './XQuoteCard.svelte';
@@ -702,6 +702,23 @@
 		initSelection(list);
 	}
 
+	/**
+	 * Point the address bar at `url` without a navigation. SvelteKit applies a
+	 * shallow `replaceState` a few microtasks later, and until then the browser
+	 * still shows the old URL, which the draft-id effect below must not mistake
+	 * for a navigation to an empty /compose. The URL is cosmetic: the draft is
+	 * already saved, or the editor already cleared, so a refusal is ignored.
+	 */
+	let composeUrlPending = 0;
+	function setComposeUrl(url: string) {
+		composeUrlPending += 1;
+		replaceState(url, page.state)
+			.catch(() => undefined)
+			.finally(() => {
+				composeUrlPending -= 1;
+			});
+	}
+
 	function resetEditorForNewDraft() {
 		draftId = null;
 		baseBody = '';
@@ -949,11 +966,7 @@
 		if (navigate) {
 			// Shallow URL update only: goto() re-runs load and steals textarea
 			// focus on first autosave; replaceState() keeps focus and state.
-			try {
-				replaceState(`/compose?id=${data.draft.id}`, page.state);
-			} catch {
-				// URL update is cosmetic; the draft is already saved.
-			}
+			setComposeUrl(`/compose?id=${data.draft.id}`);
 		}
 		return data.draft.id as string;
 	}
@@ -1741,11 +1754,7 @@
 			for (const key of Object.keys(altPending)) delete altPending[key];
 			pendingMediaRemove = null;
 			resetEditorForNewDraft();
-			try {
-				replaceState('/compose', page.state);
-			} catch {
-				// URL update is cosmetic; the editor is already cleared.
-			}
+			setComposeUrl('/compose');
 			showToast('Draft discarded', 'success');
 			return;
 		}
@@ -1762,11 +1771,7 @@
 			pendingMediaRemove = null;
 			resetEditorForNewDraft();
 			loadedDraftContentFor = null;
-			try {
-				replaceState('/compose', page.state);
-			} catch {
-				// URL update is cosmetic; the editor is already cleared.
-			}
+			setComposeUrl('/compose');
 			showToast('Draft discarded', 'success');
 		} catch (e) {
 			showToast(humanizeError(e instanceof Error ? e.message : 'Could not discard draft'), 'error');
@@ -2313,11 +2318,12 @@
 			// `page.url` does not track shallow `replaceState` (the autosave
 			// assigns the draft id that way), so it can still read id-less
 			// while the browser is on a loaded draft. Only a real navigation
-			// to /compose — browser URL has no id — resets the editor;
+			// to /compose — browser URL has no id, and no setComposeUrl() is
+			// still applying one — resets the editor;
 			// re-running this effect for unrelated reasons (connections
 			// refresh) must not wipe the composer.
 			const browserId = new URL(location.href).searchParams.get('id');
-			if (!browserId) {
+			if (!browserId && composeUrlPending === 0) {
 				loadedDraftContentFor = null;
 				resetEditorForNewDraft();
 			}
