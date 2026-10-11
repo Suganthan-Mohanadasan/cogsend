@@ -1,7 +1,12 @@
 import { and, eq, inArray, isNull, lte, or } from 'drizzle-orm';
 import type { InferSelectModel } from 'drizzle-orm';
 import { STALE_CLAIM_MS, isFreshPublishing } from '#lib/domain/due-jobs.js';
-import { PUBLISHED_EDIT_ERROR, isFullyPublished } from '#lib/domain/published-lock.js';
+import { isTargetSending } from '#lib/domain/post-state.js';
+import {
+	PUBLISHED_EDIT_ERROR,
+	PUBLISH_IN_PROGRESS_ERROR,
+	isFullyPublished
+} from '#lib/domain/published-lock.js';
 import { newId, type AppDb } from './db/client';
 import { draftVariants, publishTargets } from './db/schema';
 
@@ -85,7 +90,7 @@ export function draftHasInFlightPublish(
 	}>,
 	now: Date = new Date()
 ): boolean {
-	return targets.some((t) => t.jobId || isFreshPublishing(t, now));
+	return targets.some((t) => isTargetSending(t, now));
 }
 
 /**
@@ -101,7 +106,7 @@ export function draftEditBlock(
 	}>,
 	now: Date = new Date()
 ): string | null {
-	if (draftHasInFlightPublish(targets, now)) return 'Publishing in progress — try again shortly';
+	if (draftHasInFlightPublish(targets, now)) return PUBLISH_IN_PROGRESS_ERROR;
 	if (isFullyPublished(targets)) return PUBLISHED_EDIT_ERROR;
 	return null;
 }

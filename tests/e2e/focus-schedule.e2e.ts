@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { E2E_ACCOUNT } from './e2e-env';
+import { clickUntilVisible, E2E_ACCOUNT } from './e2e-env';
 
 test.beforeEach(async ({ page }) => {
 	await page.goto('/compose');
@@ -34,8 +34,12 @@ test('keyboard focus ring still works on buttons', async ({ page }) => {
 });
 
 test('schedule panel prefills current date/time with D/H/M offsets', async ({ page }) => {
-	await page.getByTestId('schedule-toggle').click();
-	await expect(page.getByTestId('schedule-panel')).toBeVisible();
+	// A click before hydration is lost, and this one opens a fresh page.
+	await clickUntilVisible(
+		page,
+		page.getByTestId('schedule-toggle'),
+		page.getByTestId('schedule-panel')
+	);
 	// No Morning/Today presets anymore.
 	await expect(page.getByTestId('schedule-offsets')).toBeVisible();
 	await expect(page.getByTestId('schedule-preset-tomorrow')).toHaveCount(0);

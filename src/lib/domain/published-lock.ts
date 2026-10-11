@@ -6,6 +6,12 @@
 export const PUBLISHED_EDIT_ERROR = 'Already published — duplicate it to post again';
 
 /**
+ * Refusal for an edit while a destination is being sent. Temporary: the
+ * composer matches it to pause editing until the send settles.
+ */
+export const PUBLISH_IN_PROGRESS_ERROR = 'Publishing in progress — try again shortly';
+
+/**
  * A post whose every live destination is published. Editing it would only
  * rewrite the record of what went out, not the posts themselves. Cancelled
  * targets are not destinations; a partial post (one account failed) stays

@@ -149,7 +149,8 @@ test('a post opened from Posts goes back there once scheduled', async ({ page })
 	await expect.poll(() => sent.length, { timeout: 20000 }).toBe(1);
 	expect(sent[0].connectionIds).toEqual([connId]);
 	await expect(page).toHaveURL(/\/posts\?tab=scheduled$/, { timeout: 20000 });
-	await expect(page.getByTestId('posts-notice')).toContainText('Scheduled for');
+	// It was already scheduled, so this changed its time.
+	await expect(page.getByTestId('posts-notice')).toContainText('Rescheduled for');
 });
 
 test('a published post opens read-only and can be duplicated', async ({ page }) => {

@@ -23,6 +23,8 @@ What a card offers depends on its state:
 | Published | **Post again**, which copies it into a new draft; on X, **Quote on X**, which starts a new draft quoting it |
 | Draft     | **Edit Post**, **Duplicate**, **Remove**                                                                    |
 
+**Edit Post** on a scheduled card opens it in the composer, which shows when and where it goes out and offers **Change time** and **Unschedule** there too; see [Publish now, or schedule](composer.md#publish-now-or-schedule).
+
 A post that went to several accounts is one card, with a result per account, so a
 post that published on four and failed on one shows exactly that. Retrying a card
 retries only the accounts that failed.

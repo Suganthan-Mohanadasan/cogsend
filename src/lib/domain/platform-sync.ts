@@ -83,6 +83,21 @@ export function platformsFromConnections(connections: Array<{ platform: string }
 }
 
 /**
+ * The accounts a draft's publish targets point at, for a draft that never
+ * saved its own selection. A cancelled target was taken off the post, so it
+ * must not come back ticked.
+ */
+export function restorableTargetIds(
+	targets:
+		ReadonlyArray<{ connectionId?: string | null; status?: string | null }> | null | undefined
+): string[] {
+	return (targets ?? [])
+		.filter((t) => t.status !== 'cancelled')
+		.map((t) => t.connectionId)
+		.filter((id): id is string => Boolean(id));
+}
+
+/**
  * Decide which connection ids a deep-linked draft should select from its
  * publish targets. Returns null when the draft has no targets (caller keeps
  * its default selection); otherwise the target ids that still exist. Unknown

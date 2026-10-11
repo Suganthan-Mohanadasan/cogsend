@@ -115,7 +115,12 @@ export function schedulePreviewText(value: string, now: Date = new Date()): stri
 	if (!value || !isFutureScheduleValue(value, now)) return null;
 	const date = parseDatetimeLocal(value);
 	if (!date) return null;
-	return `${formatLocalDateTimeWithZone(date)} (${formatRelativeTime(date)})`;
+	return scheduleWhenText(date, now);
+}
+
+/** "Sep 9, 2:30 PM CET (in 2h)": a schedule's time, as the composer shows it. */
+export function scheduleWhenText(date: Date, now: Date = new Date()): string {
+	return `${formatLocalDateTimeWithZone(date)} (${formatRelativeTime(date, now)})`;
 }
 
 export function listSchedulePresets(): SchedulePreset[] {

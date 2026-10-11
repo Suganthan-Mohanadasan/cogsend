@@ -89,6 +89,8 @@ of minutes, hours or days (one hour by default), or a **Specific Date** and time
 your own timezone. Opening a scheduled post again with **Edit Post** starts on the time it is already set for, so confirming without a change keeps it. A scheduled post waits in **Posts → Scheduled** until a
 [tick](scheduling.md) publishes it. Scheduling goes to exactly the accounts ticked: untick one and schedule again, and its earlier time is cancelled.
 
+Opening a scheduled post shows, above the text, when and where it goes out. Edits save as you type, and what is saved when the time comes is what gets posted. Ticking or unticking accounts doesn't change the schedule by itself: the post says which accounts differ, and **Update schedule** applies them. **Change time** opens the schedule at its current time, and **Unschedule** turns the post back into a draft. **Publish now** sends it straight away instead of at its time, and any account you unticked is unscheduled, so it doesn't post later either. Deleting it with the bin means it won't be published. A few minutes before the time, the post says so; while it is being sent, editing pauses until the result is in. A post that went out on some accounts, failed on others or is retrying shows each account's result.
+
 Once a post is scheduled, or published to every account, the composer empties for the next one and the message links to it in **Posts**. A post you opened from **Posts** takes you back there instead. Publishing again to an account that already has the post sends nothing, and the message says so.
 
 If some accounts fail, the composer keeps the post open, says **Couldn't publish everywhere** and lists

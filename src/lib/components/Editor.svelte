@@ -50,6 +50,7 @@
 		platformsFromConnections,
 		resetPlatformToFollow,
 		resolveRestoredSelection,
+		restorableTargetIds,
 		resolveSavedSelection,
 		customizedBodiesForSave,
 		type PlatformId,
@@ -98,7 +99,12 @@
 	} from '#lib/domain/validation/text.js';
 	import { utf8ByteLength } from '#lib/domain/bytes.js';
 	import { draftExcerpt } from '#lib/domain/excerpt.js';
-	import { PUBLISHED_EDIT_ERROR, isFullyPublished } from '#lib/domain/published-lock.js';
+	import {
+		PUBLISHED_EDIT_ERROR,
+		PUBLISH_IN_PROGRESS_ERROR,
+		isFullyPublished
+	} from '#lib/domain/published-lock.js';
+	import { selectionDrift, summarizePost, type TargetSnapshot } from '#lib/domain/post-state.js';
 	import { setPostsNotice } from '#lib/components/posts-notice.js';
 	import {
 		attachXQuote,
@@ -117,6 +123,7 @@
 	import XQuoteCard from './XQuoteCard.svelte';
 	import AccountAvatar from './AccountAvatar.svelte';
 	import ConfirmDialog from './ConfirmDialog.svelte';
+	import PostStatusBanner from './PostStatusBanner.svelte';
 
 	type Connection = {
 		id: string;
@@ -162,12 +169,7 @@
 			optionsJson?: { visibility?: string; spoilerText?: string; poll?: unknown };
 		}>;
 		media?: MediaItem[];
-		targets?: Array<{
-			connectionId?: string | null;
-			scheduledFor?: unknown;
-			status?: string;
-			remotePostId?: string | null;
-		}>;
+		targets?: TargetSnapshot[];
 	};
 
 	let {
@@ -228,9 +230,7 @@
 	const seededSelection = (() => {
 		const saved = seededDraft?.selectedConnectionIds;
 		if (Array.isArray(saved)) return saved;
-		const targetIds = (seededDraft?.targets || [])
-			.map((t) => t.connectionId)
-			.filter((id): id is string => Boolean(id));
+		const targetIds = restorableTargetIds(seededDraft?.targets);
 		return targetIds.length ? targetIds : null;
 	})();
 
@@ -277,6 +277,27 @@
 	// The open post went out everywhere: the editor turns read-only and saves
 	// nothing, since the server refuses edits to it (PUBLISHED_EDIT_ERROR).
 	let publishedLock = $state(isFullyPublished(seededDraft?.targets ?? []));
+	// The open post's publish targets: where it is scheduled, published, failed
+	// or being sent right now. Refreshed while a send is near (see watchDelay).
+	let targets = $state<TargetSnapshot[]>(seededDraft?.targets ?? []);
+	// A save was refused because a destination is being sent: the targets
+	// will show it on the next refresh, but editing pauses from now.
+	let sendBlocked = $state(false);
+	// Re-renders relative times and moves the watch window; ticks only while
+	// something is still to go out.
+	let clock = $state(Date.now());
+	const postState = $derived(summarizePost(targets, new Date(clock)));
+	const drift = $derived(selectionDrift(postState, selected));
+	// Still waiting to go out somewhere: Publish and Schedule now change an
+	// existing schedule, and the wording says so.
+	const hasSchedule = $derived(postState.waiting.length > 0);
+	const sendInFlight = $derived(postState.sending.length > 0 || sendBlocked);
+	// This editor's own publish or schedule marks its targets as sending too;
+	// that one already owns the dock and its progress, so it does not pause.
+	const sendingNow = $derived(!publishing && sendInFlight);
+	// Nothing in the editor may change: the post went out everywhere, or a
+	// destination is being sent and the server refuses edits until it settles.
+	const editLocked = $derived(publishedLock || sendingNow);
 	// Opened from Posts (Edit Post, Duplicate, Quote on X): a successful
 	// schedule or publish goes back there instead of clearing the composer.
 	let returnToPosts = false;
@@ -337,7 +358,12 @@
 	let textareaRefs = $state<(HTMLTextAreaElement | null)[]>([]);
 	let altOpen = $state<Record<string, boolean>>({});
 
+	// The status banner states times in the viewer's zone, which the server
+	// cannot know, so it waits for the browser instead of correcting itself.
+	let mounted = $state(false);
+
 	onMount(() => {
+		mounted = true;
 		try {
 			skipAsk = localStorage.getItem(SKIP_ASK_KEY) === '1';
 		} catch {
@@ -684,7 +710,7 @@
 	}
 
 	function setActiveBody(nextBody: string) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		if (activeTab === 'global') {
 			baseBody = nextBody;
 		} else {
@@ -758,6 +784,8 @@
 		loadFailedId = null;
 		storedVariants = new Set();
 		publishedLock = false;
+		targets = [];
+		sendBlocked = false;
 		returnToPosts = false;
 	}
 
@@ -836,6 +864,9 @@
 			draftId = d.id;
 			const locked = isFullyPublished(d.targets || []);
 			publishedLock = locked;
+			targets = d.targets || [];
+			clock = Date.now();
+			sendBlocked = false;
 			// Text typed while a published post loaded cannot be saved, so the
 			// stored copy wins outright instead of being merged with it.
 			const merge = before !== null && !locked;
@@ -896,9 +927,7 @@
 			// Selection precedence: the draft's own saved selection wins; older
 			// rows (and drafts scheduled/published before this existed) fall
 			// back to their publish targets. null means "nothing stored".
-			const targetIds = ((d.targets || []) as Array<{ connectionId?: string }>).map(
-				(t) => t.connectionId
-			);
+			const targetIds = restorableTargetIds(d.targets);
 			const savedRaw = Array.isArray(d.selectedConnectionIds)
 				? (d.selectedConnectionIds as string[])
 				: null;
@@ -914,7 +943,7 @@
 					} else {
 						// Keep the raw ids so initSelection filters them against
 						// the live connection list once it arrives.
-						pendingSelected = savedRaw ?? targetIds.filter((id): id is string => Boolean(id));
+						pendingSelected = savedRaw ?? targetIds;
 					}
 				}
 			}
@@ -1097,6 +1126,7 @@
 		// beforeunload): never write a draft whose stored copy never loaded.
 		if (loadFailedId) return null;
 		if (publishedLock) return draftId;
+		if (sendingNow) return null;
 		const emptyNew = !draftId && !baseBody.trim();
 		if (emptyNew && !allowEmpty) return null;
 		// Nothing changed since the last successful save: skip the round trips.
@@ -1131,6 +1161,15 @@
 				// open here: say so with the lock banner, not a failed save.
 				publishedLock = true;
 				saveFailed = false;
+				return null;
+			}
+			if (e instanceof Error && e.message === PUBLISH_IN_PROGRESS_ERROR) {
+				// The scheduler is sending it right now. The edit stays dirty and
+				// the autosave tries again once the send settles, unless it went
+				// out everywhere, which the lock banner then reports.
+				sendBlocked = true;
+				saveFailed = false;
+				void refreshTargets();
 				return null;
 			}
 			saveFailed = true;
@@ -1186,8 +1225,9 @@
 	let publishRequestSeq = 0;
 
 	async function requestPublish(connectionIds: string[]) {
-		// Prevent overlapping publishes/schedules (publishing covers both).
-		if (publishing || publishedLock) return;
+		// Prevent overlapping publishes/schedules (publishing covers both), and
+		// a publish racing an unschedule of the same targets.
+		if (publishing || unscheduling || editLocked) return;
 		// Fast empty check before opening any UI: mirrors doPersist's
 		// emptyNew guard so an empty composer toasts without flashing the
 		// dialog (or the publishing spinner in skip-ask mode).
@@ -1233,7 +1273,7 @@
 			try {
 				const id = await persistForAction();
 				if (!id) {
-					if (!publishedLock) showToast('Nothing to publish', 'warn');
+					if (!publishedLock && !sendInFlight) showToast('Nothing to publish', 'warn');
 					return;
 				}
 				pendingPublish = null;
@@ -1265,7 +1305,7 @@
 			if (!id) {
 				pendingPublish = null;
 				isPostConfirmOpen = false;
-				if (!publishedLock) showToast('Nothing to publish', 'warn');
+				if (!publishedLock && !sendInFlight) showToast('Nothing to publish', 'warn');
 				return;
 			}
 			if (pendingPublish && requestId === publishRequestSeq) {
@@ -1295,7 +1335,11 @@
 	}
 
 	const destinationName = (connectionId: string): string => {
-		const c = connections.find((x) => x.id === connectionId);
+		// A disconnected account is gone from the list, but the post's own
+		// targets still carry what it was.
+		const c =
+			connections.find((x) => x.id === connectionId) ??
+			targets.find((t) => t.connectionId === connectionId)?.connection;
 		if (!c) return 'Destination';
 		if (!c.handle) return platformName(c.platform);
 		return `${platformName(c.platform)} · ${displayHandle(c.handle)}`;
@@ -1380,6 +1424,19 @@
 		const published = settled.filter((s) => s.status === 'published');
 		const inFlight = settled.filter((s) => s.status === 'publishing');
 		const retrying = settled.filter((s) => s.status === 'retrying');
+		// Publishing now replaces the schedule: accounts left unticked must not
+		// still post later. Only once the post is on its way everywhere it was
+		// sent, so a failed publish never also loses the other schedule.
+		let unscheduledNote = '';
+		let unscheduleKept = false;
+		const leftOut = postState.waiting.some((w) => !connectionIds.includes(w.connectionId));
+		if (leftOut && !failed.length && !inFlight.length) {
+			const { cancelled, kept } = await cancelWaitingExcept(draftId, connectionIds);
+			unscheduleKept = kept.length > 0;
+			unscheduledNote =
+				(cancelled.length ? ` · unscheduled on ${cancelled.map(destinationName).join(', ')}` : '') +
+				(kept.length ? ` · ${kept.map(destinationName).join(', ')} still scheduled` : '');
+		}
 		if (failed.length) {
 			showToast(
 				humanizeError(
@@ -1400,7 +1457,8 @@
 			// warning with a link instead of a red failure.
 			showToast(
 				`Retrying automatically for ${retrying.map((r) => destinationName(r.connectionId)).join(', ')}` +
-					(published.length ? ` — already published to ${published.length}` : ''),
+					(published.length ? ` — already published to ${published.length}` : '') +
+					unscheduledNote,
 				'warn',
 				{ label: 'View posts', href: '/posts' }
 			);
@@ -1413,13 +1471,15 @@
 			// Every destination has the post: this one is done.
 			const sent = published.filter((p) => !alreadyIds.has(p.connectionId)).length;
 			const already = published.length - sent;
-			const message = sent
-				? `Published to ${sent} ${sent === 1 ? 'destination' : 'destinations'}` +
-					(already ? ` · already on ${already}` : '')
-				: `Already published to ${already} ${already === 1 ? 'destination' : 'destinations'} — nothing new was sent`;
+			const message =
+				(sent
+					? `Published to ${sent} ${sent === 1 ? 'destination' : 'destinations'}` +
+						(already ? ` · already on ${already}` : '')
+					: `Already published to ${already} ${already === 1 ? 'destination' : 'destinations'} — nothing new was sent`) +
+				unscheduledNote;
 			announcePublish(`${message}.`);
 			clearPostConfirm();
-			finishPosted('published', message, sent ? 'success' : 'warn');
+			finishPosted('published', message, sent && !unscheduleKept ? 'success' : 'warn');
 			return;
 		}
 		// The popover closed when the publish started. Reopen it only when a
@@ -1430,6 +1490,7 @@
 		} else {
 			clearPostConfirm();
 		}
+		void refreshTargets();
 		try {
 			await loadConnections();
 		} catch {
@@ -1448,6 +1509,7 @@
 		// it on screen: the autosave stores it, or the lock says it was refused.
 		if (dirty) {
 			showToast(message, tone, { label: 'View', href });
+			void refreshTargets();
 			return;
 		}
 		if (returnToPosts) {
@@ -1458,6 +1520,169 @@
 		clearComposer();
 		showToast(message, tone, { label: 'View', href });
 	}
+
+	function applyTargets(list: TargetSnapshot[]) {
+		targets = list;
+		// The clock only ticks while something waits, so it can be long stale.
+		clock = Date.now();
+		sendBlocked = false;
+		publishedLock = isFullyPublished(list);
+		// The popover follows the stored time unless the user is picking one.
+		if (!scheduleTouched) loadedSchedule = earliestFutureScheduleValue(list, new Date());
+		// Alt text refused while the post was sending; the body retries through
+		// the autosave, which alt text does not go through.
+		if (!editLocked && Object.keys(altPending).length) void flushAltPending();
+	}
+
+	let targetsRead: Promise<void> | null = null;
+
+	/**
+	 * Re-read where the open post stands; its content is left alone. One read
+	 * at a time, and a caller that arrives mid-read waits and reads again, so
+	 * what it acts on is never older than its own call.
+	 */
+	async function refreshTargets() {
+		while (targetsRead) await targetsRead;
+		targetsRead = readTargets();
+		try {
+			await targetsRead;
+		} finally {
+			targetsRead = null;
+		}
+	}
+
+	async function readTargets() {
+		const id = draftId;
+		if (!id || loadingDraftId || loadFailedId) return;
+		try {
+			const res = await fetch(`/api/drafts/${encodeURIComponent(id)}`);
+			if (draftId !== id) return;
+			if (res.status === 404) {
+				// Deleted elsewhere: nothing is being sent, so do not stay paused.
+				sendBlocked = false;
+				return;
+			}
+			if (!res.ok) return;
+			const data = await res.json().catch(() => null);
+			if (draftId !== id || !Array.isArray(data?.draft?.targets)) return;
+			applyTargets(data.draft.targets);
+		} catch {
+			// Best-effort: the next watch tick or action tries again.
+		}
+	}
+
+	/**
+	 * Cancel the post's waiting accounts other than `keep`. The ids come from a
+	 * fresh read, not the editor's copy, so an account scheduled from another
+	 * tab is not missed. The server refuses any that started sending meanwhile.
+	 */
+	async function cancelWaitingExcept(
+		id: string,
+		keep: string[]
+	): Promise<{ cancelled: string[]; kept: string[] }> {
+		let list: TargetSnapshot[] = targets;
+		try {
+			const res = await fetch(`/api/drafts/${encodeURIComponent(id)}`);
+			const data = res.ok ? await res.json().catch(() => null) : null;
+			if (Array.isArray(data?.draft?.targets)) list = data.draft.targets;
+		} catch {
+			// Fall back to the editor's copy of the targets.
+		}
+		const waiting = summarizePost(list)
+			.waiting.filter((w) => !keep.includes(w.connectionId) && w.targetId)
+			.map((w) => ({ targetId: w.targetId as string, connectionId: w.connectionId }));
+		const cancelled: string[] = [];
+		const kept: string[] = [];
+		// The bulk route takes ten ids per request.
+		for (let i = 0; i < waiting.length; i += 10) {
+			const chunk = waiting.slice(i, i + 10);
+			let results: Array<{ id: string; ok: boolean }> = [];
+			try {
+				const res = await fetch('/api/targets/bulk', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ op: 'cancel', ids: chunk.map((w) => w.targetId) })
+				});
+				const data = await res.json().catch(() => ({}));
+				if (res.ok && Array.isArray(data.results)) results = data.results;
+			} catch {
+				// Reported below as still scheduled.
+			}
+			for (const w of chunk) {
+				if (results.some((r) => r.id === w.targetId && r.ok)) cancelled.push(w.connectionId);
+				else kept.push(w.connectionId);
+			}
+		}
+		return { cancelled, kept };
+	}
+
+	let unscheduling = $state(false);
+
+	/** Take the post off the schedule and keep it open as a draft. */
+	async function unschedulePost() {
+		const id = draftId;
+		if (!id || unscheduling || publishing || editLocked) return;
+		unscheduling = true;
+		scheduleOpen = false;
+		try {
+			const { cancelled, kept } = await cancelWaitingExcept(id, []);
+			await refreshTargets();
+			if (draftId !== id) return;
+			if (kept.length) {
+				showToast(`Couldn't unschedule ${kept.map(destinationName).join(', ')}`, 'warn');
+			} else if (!cancelled.length) {
+				showToast('Nothing was scheduled', 'warn');
+			} else if (postState.published.length || postState.failed.length) {
+				showToast(`Unscheduled on ${cancelled.map(destinationName).join(', ')}`, 'success');
+			} else {
+				showToast("Unscheduled — it's a draft again", 'success');
+			}
+		} finally {
+			unscheduling = false;
+		}
+	}
+
+	/** Open the schedule popover, never toggle it shut (the banner's buttons). */
+	function showSchedule() {
+		if (!scheduleOpen) openSchedule();
+	}
+
+	// Watch the post while a send is near or running, so the editor pauses
+	// before the server starts refusing edits and shows the outcome after.
+	const watchDelay = $derived.by((): number | null => {
+		if (!draftId || publishedLock) return null;
+		if (sendingNow) return 10_000;
+		if (!postState.nextAt) return null;
+		const until = postState.nextAt.getTime() - clock;
+		if (until > 2 * 60_000) return null;
+		return until > -10 * 60_000 ? 15_000 : 60_000;
+	});
+
+	$effect(() => {
+		if (!draftId || publishedLock) return;
+		if (!postState.waiting.length && !sendingNow) return;
+		const timer = setInterval(() => (clock = Date.now()), 30_000);
+		return () => clearInterval(timer);
+	});
+
+	$effect(() => {
+		const delay = watchDelay;
+		if (delay === null) return;
+		const timer = setInterval(() => {
+			if (document.visibilityState === 'visible') void refreshTargets();
+		}, delay);
+		return () => clearInterval(timer);
+	});
+
+	$effect(() => {
+		const onVisible = () => {
+			if (document.visibilityState !== 'visible') return;
+			clock = Date.now();
+			if (postState.waiting.length > 0 || sendingNow) void refreshTargets();
+		};
+		document.addEventListener('visibilitychange', onVisible);
+		return () => document.removeEventListener('visibilitychange', onVisible);
+	});
 
 	let duplicating = $state(false);
 
@@ -1588,9 +1813,16 @@
 	});
 
 	async function onSchedule() {
-		if (publishedLock) return;
+		if (editLocked || unscheduling) return;
 		if (!selected.size) {
 			showToast('Select at least one account', 'warn');
+			return;
+		}
+		// An account the post already went out on cannot be scheduled again
+		// (the server answers 409); the rest of a partly published post can.
+		const sendIds = [...selected].filter((id) => !postState.published.includes(id));
+		if (!sendIds.length) {
+			showToast(`Already published to ${[...selected].map(destinationName).join(', ')}`, 'warn');
 			return;
 		}
 		const now = new Date();
@@ -1627,12 +1859,13 @@
 			showToast('Could not load this draft — retry before scheduling', 'warn');
 			return;
 		}
+		const rescheduling = hasSchedule;
 		publishing = true;
 		busyAction = 'schedule';
 		try {
 			const id = await persistForAction();
 			if (!id) {
-				if (!publishedLock) showToast('Nothing to schedule', 'warn');
+				if (!publishedLock && !sendInFlight) showToast('Nothing to schedule', 'warn');
 				return;
 			}
 			const res = await fetch(`/api/drafts/${id}/schedule`, {
@@ -1640,14 +1873,14 @@
 				headers: { 'Content-Type': 'application/json' },
 				// The selection is the whole destination list: an account taken
 				// off it loses its earlier time instead of still posting then.
-				body: JSON.stringify({ connectionIds: [...selected], runAt, cancelOthers: true })
+				body: JSON.stringify({ connectionIds: sendIds, runAt, cancelOthers: true })
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.error || 'Schedule failed');
-			const count = selectedAccounts.length;
+			const count = sendIds.length;
 			const removed: string[] = Array.isArray(data.cancelled) ? data.cancelled : [];
 			const message =
-				`Scheduled ${schedulePreview ? `for ${schedulePreview} ` : ''}to ${count} ${count === 1 ? 'destination' : 'destinations'}` +
+				`${rescheduling ? 'Rescheduled' : 'Scheduled'} ${schedulePreview ? `for ${schedulePreview} ` : ''}to ${count} ${count === 1 ? 'destination' : 'destinations'}` +
 				(removed.length ? ` · removed from ${removed.map(destinationName).join(', ')}` : '');
 			scheduleOpen = false;
 			// The draft now carries this time; reopening should show it.
@@ -1656,6 +1889,8 @@
 			finishPosted('scheduled', message, 'success');
 		} catch (e) {
 			showToast(humanizeError(e instanceof Error ? e.message : 'Schedule failed'), 'error');
+			// A 409 means the post moved on (published, sending): show where it is.
+			void refreshTargets();
 		} finally {
 			publishing = false;
 			busyAction = null;
@@ -1664,7 +1899,7 @@
 	}
 
 	async function attachFilesToSegment(segmentIndex: number, files: File[]) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		const picked = files.filter(
 			(f) => f.type.startsWith('image/') || (videoEnabled && f.type === 'video/mp4')
 		);
@@ -1798,11 +2033,24 @@
 			}
 			delete altPending[mediaId];
 		} catch (e) {
-			showToast(e instanceof Error ? e.message : 'Failed to save alt text', 'error');
+			const message = e instanceof Error ? e.message : 'Failed to save alt text';
+			// Refused for the same reasons as a body save, and said the same way:
+			// the banners explain it. A send in flight keeps the edit pending,
+			// and applyTargets sends it once the send settles.
+			if (message === PUBLISH_IN_PROGRESS_ERROR) {
+				sendBlocked = true;
+				void refreshTargets();
+				return;
+			}
+			if (message === PUBLISHED_EDIT_ERROR) {
+				publishedLock = true;
+				return;
+			}
+			showToast(message, 'error');
 		}
 	}
 	async function updateMediaAlt(mediaId: string, altText: string) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		media = media.map((m) => (m.id === mediaId ? { ...m, altText } : m));
 		if (!draftId) return;
 		altPending[mediaId] = altText;
@@ -1833,6 +2081,39 @@
 	// to discard (fresh /compose with empty text and no media).
 	const canDiscard = $derived(draftId !== null || baseBody.trim() !== '' || media.length > 0);
 
+	// Deleting a scheduled or partly published post is more than discarding a
+	// draft: it will not go out, and what already went out stays on the platform.
+	const discardCopy = $derived.by(() => {
+		const outThere = postState.published.length
+			? ` What's already published on ${postState.published.map(destinationName).join(', ')} stays there.`
+			: '';
+		if (hasSchedule) {
+			return {
+				label: 'Delete scheduled post',
+				title: 'Delete this scheduled post?',
+				body: `It won't be published, and its images are deleted.${outThere} This cannot be undone.`,
+				confirm: 'Delete',
+				done: 'Scheduled post deleted'
+			};
+		}
+		if (postState.published.length) {
+			return {
+				label: 'Delete post',
+				title: 'Delete this post?',
+				body: `It's deleted here, with its images.${outThere} This cannot be undone.`,
+				confirm: 'Delete',
+				done: 'Post deleted'
+			};
+		}
+		return {
+			label: 'Discard draft',
+			title: 'Discard this draft?',
+			body: 'This will permanently delete the draft and its images. This cannot be undone.',
+			confirm: 'Discard',
+			done: 'Draft discarded'
+		};
+	});
+
 	function requestDiscard() {
 		if (discarding || saving || publishing || uploadingSegment !== null) {
 			showToast('Please wait…', 'warn');
@@ -1856,6 +2137,7 @@
 			showToast('Draft discarded', 'success');
 			return;
 		}
+		const done = discardCopy.done;
 		discarding = true;
 		try {
 			const res = await fetch(`/api/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
@@ -1865,7 +2147,7 @@
 			}
 			isDiscardOpen = false;
 			clearComposer();
-			showToast('Draft discarded', 'success');
+			showToast(done, 'success');
 		} catch (e) {
 			showToast(humanizeError(e instanceof Error ? e.message : 'Could not discard draft'), 'error');
 		} finally {
@@ -1874,7 +2156,7 @@
 	}
 
 	function requestRemoveMedia(mediaId: string) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		pendingMediaRemove = mediaId;
 	}
 
@@ -2085,7 +2367,7 @@
 	}
 
 	function onAddSegment() {
-		if (publishedLock) return;
+		if (editLocked) return;
 		const idx = segments.length;
 		setActiveBody(joinThreadSegments(addSegment(segments)));
 		focusedSegment = idx;
@@ -2122,7 +2404,7 @@
 	}
 
 	function onRemoveSegment(index: number) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		if (uploadingSegment === index) uploadingSegment = null;
 		else if (uploadingSegment !== null && uploadingSegment > index) uploadingSegment -= 1;
 		revealTrailing = null;
@@ -2145,7 +2427,7 @@
 	}
 
 	function applyReorder(from: number, to: number) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		if (from === to) return;
 		const next = reorderSegments(segments, from, to);
 		if (next === segments) return;
@@ -2222,7 +2504,7 @@
 	}
 
 	function handlePaste(e: ClipboardEvent, index: number) {
-		if (publishedLock) return;
+		if (editLocked) return;
 		const data = e.clipboardData;
 		if (!data) return;
 		const files: File[] = [];
@@ -2244,7 +2526,7 @@
 
 	function handleDrop(e: DragEvent, index: number) {
 		e.preventDefault();
-		if (publishedLock) return;
+		if (editLocked) return;
 		if (e.dataTransfer?.files?.length) {
 			const files = Array.from(e.dataTransfer.files).filter(
 				(f) => f.type.startsWith('image/') || f.type === 'video/mp4'
@@ -2355,6 +2637,31 @@
 		publishing && (saving || busyAction === 'schedule' || publishBusyVisible)
 	);
 
+	// A post that has been anywhere says where; the lock banner covers a post
+	// that went out everywhere.
+	const showPostStatus = $derived(
+		mounted &&
+			!publishedLock &&
+			!loadFailedId &&
+			Boolean(draftId) &&
+			(sendingNow ||
+				postState.waiting.length > 0 ||
+				postState.published.length > 0 ||
+				postState.failed.length > 0)
+	);
+	// On a scheduled post, Publish sends it now instead of at its time.
+	const publishIdleLabel = $derived(hasSchedule ? 'Publish now' : 'Publish');
+	// The confirmed publish sends something that was waiting for its time.
+	const publishReplacesSchedule = $derived(
+		postState.waiting.some((w) => (pendingPublish?.connectionIds ?? []).includes(w.connectionId))
+	);
+	// Waiting accounts the confirmed publish leaves out: they get unscheduled.
+	const unscheduledByPublish = $derived(
+		postState.waiting
+			.map((w) => w.connectionId)
+			.filter((id) => !(pendingPublish?.connectionIds ?? []).includes(id))
+	);
+
 	const publishButtonLabel = $derived(
 		publishing
 			? saving
@@ -2363,14 +2670,14 @@
 					? 'Scheduling…'
 					: publishBusyVisible
 						? publishBusyLabel
-						: 'Publish'
-			: 'Publish'
+						: publishIdleLabel
+			: publishIdleLabel
 	);
 	// Autosave is otherwise silent, and a phone has no Cmd+S to fall back on.
 	// A pending autosave already reads as "Saving…"; an empty new draft is never
 	// saved, so it shows nothing.
 	const saveIndicator = $derived.by((): 'saving' | 'saved' | 'failed' | null => {
-		if (loadFailedId || loadingDraftId || publishedLock) return null;
+		if (loadFailedId || loadingDraftId || editLocked) return null;
 		if (saveFailed) return 'failed';
 		if (saving || (dirty && (draftId || baseBody.trim()))) return 'saving';
 		return draftId ? 'saved' : null;
@@ -2381,7 +2688,8 @@
 		if (!target.closest('.accounts-popover-container')) {
 			isAccountsPopoverOpen = false;
 		}
-		if (!target.closest('.post-actions-container')) {
+		// The status banner's schedule buttons open the popover from outside it.
+		if (!target.closest('.post-actions-container, [data-schedule-opener]')) {
 			scheduleOpen = false;
 			if (isPostConfirmOpen) dismissPostConfirm();
 		}
@@ -2470,7 +2778,7 @@
 		} else if (!saving) {
 			dirty = false;
 		}
-		if (!dirty || publishing || saving || publishedLock) return;
+		if (!dirty || publishing || saving || editLocked) return;
 		// A load in flight owns the editor identity (and may merge local edits
 		// into the stored copy): saving now could strand the keystrokes in a
 		// second draft, so wait for it to settle.
@@ -2491,7 +2799,7 @@
 	});
 
 	beforeNavigate(() => {
-		if (publishedLock) return;
+		if (editLocked) return;
 		if (!dirty && Object.keys(altPending).length === 0) return;
 		void persistAll(false, { navigate: false });
 		void flushAltPending();
@@ -2515,7 +2823,7 @@
 		const onHidden = () => {
 			if (document.visibilityState !== 'hidden') return;
 			void flushAltPending();
-			if (!dirty || publishing || publishedLock || loadingDraftId || isDiscardOpen || discarding)
+			if (!dirty || publishing || editLocked || loadingDraftId || isDiscardOpen || discarding)
 				return;
 			void persistAll();
 		};
@@ -2538,7 +2846,7 @@
 				quotePickerFor = null;
 				return;
 			}
-			if (pendingPublish || publishedLock) return;
+			if (pendingPublish || editLocked) return;
 			const meta = event.metaKey || event.ctrlKey;
 			if (meta && event.key.toLowerCase() === 's') {
 				event.preventDefault();
@@ -2617,6 +2925,21 @@
 			</button>
 		</div>
 	{/if}
+	{#if showPostStatus}
+		<PostStatusBanner
+			post={postState}
+			now={new Date(clock)}
+			nameOf={destinationName}
+			{drift}
+			sending={sendingNow}
+			{dirty}
+			{unscheduling}
+			busy={publishing || unscheduling}
+			onChangeTime={showSchedule}
+			onUnschedule={() => void unschedulePost()}
+			onApplyAccounts={showSchedule}
+		/>
+	{/if}
 	<!-- Platform Tabs (Always visible) -->
 	<div class="relative mb-8 flex flex-wrap items-center gap-2 pt-2">
 		<!-- Global Tab -->
@@ -2663,7 +2986,7 @@
 						role="img"
 						aria-label={`${platformName(platform)} over character limit`}
 					></div>
-				{:else if !publishedLock}
+				{:else if !editLocked}
 					<button
 						type="button"
 						data-testid="reset-platform-tab"
@@ -2681,7 +3004,7 @@
 		{/each}
 
 		<!-- Add Override Dropdown -->
-		{#if canAddOverride && !publishedLock}
+		{#if canAddOverride && !editLocked}
 			<div class="mx-1 hidden h-4 w-px bg-stone-200 sm:block"></div>
 			<div class="override-dropdown-container relative">
 				<button
@@ -2733,7 +3056,7 @@
 		{/if}
 
 		<!-- Mastodon Options Popover Button -->
-		{#if showMastoOptions && !publishedLock}
+		{#if showMastoOptions && !editLocked}
 			<div class="mx-1 hidden h-4 w-px bg-stone-200 sm:block"></div>
 			<div class="masto-options-container relative" data-testid="masto-options">
 				<button
@@ -2877,7 +3200,7 @@
 							value={hiddenQuote(index)?.visible ?? segment}
 							data-segment-index={index}
 							data-testid="segment-input-{index}"
-							readonly={publishedLock}
+							readonly={editLocked}
 							oninput={(e) => handleSegmentInput(index, e)}
 							onpaste={(e) => handlePaste(e, index)}
 							onblur={() => {
@@ -2933,7 +3256,7 @@
 										>
 											ALT
 										</button>
-										{#if !publishedLock}
+										{#if !editLocked}
 											<button
 												type="button"
 												data-testid="remove-media-{m.id}"
@@ -2972,7 +3295,7 @@
 										type="text"
 										value={m.altText || ''}
 										data-testid="media-alt-{m.id}"
-										readonly={publishedLock}
+										readonly={editLocked}
 										oninput={(e) => updateMediaAlt(m.id, e.currentTarget.value)}
 										placeholder="Describe this image…"
 										aria-label={`Alt text for image ${index + 1}`}
@@ -2993,13 +3316,13 @@
 						{#if quote}
 							<XQuoteCard
 								url={quote.url}
-								onRemove={publishedLock ? undefined : () => removeQuote(index)}
+								onRemove={editLocked ? undefined : () => removeQuote(index)}
 								otherPlatforms={quoteLinkPlatforms}
-								onOnlyOnX={!publishedLock && canQuoteOnlyOnX(index)
+								onOnlyOnX={!editLocked && canQuoteOnlyOnX(index)
 									? () => quoteOnlyOnX(index)
 									: undefined}
 								withheldFrom={xWithheldFrom}
-								onShareWithAll={!publishedLock && sharedQuote(index)
+								onShareWithAll={!editLocked && sharedQuote(index)
 									? () => shareQuoteWithAll(index)
 									: undefined}
 							/>
@@ -3007,7 +3330,7 @@
 							<LinkPreview text={segment} hasMedia={segMedia.length > 0} />
 						{/if}
 
-						{#if strayLinks.length > 0 && !publishedLock}
+						{#if strayLinks.length > 0 && !editLocked}
 							<div
 								class="mt-3 flex flex-col gap-2 rounded-xl border border-amber-200/70 bg-amber-50/60 px-3 py-2"
 								data-testid="x-quote-stray"
@@ -3051,7 +3374,7 @@
 							<div
 								class="flex items-center gap-2 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100"
 							>
-								{#if !publishedLock}
+								{#if !editLocked}
 									{#if tabSupportsThreads}
 										{#if index === segments.length - 1}
 											<button
@@ -3081,8 +3404,8 @@
 											data-testid="discard-draft"
 											onclick={requestDiscard}
 											class="flex items-center justify-center rounded-lg p-1.5 text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
-											title="Discard draft"
-											aria-label="Discard draft"
+											title={discardCopy.label}
+											aria-label={discardCopy.label}
 										>
 											<Trash2 class="h-3.5 w-3.5" />
 										</button>
@@ -3092,7 +3415,7 @@
 
 							<!-- Right: Quote, Image & Char Count -->
 							<div class="quote-picker-container relative flex items-center gap-3">
-								{#if xQuoteActive && !quote && !publishedLock}
+								{#if xQuoteActive && !quote && !editLocked}
 									<button
 										type="button"
 										data-testid="quote-post-{index}"
@@ -3151,7 +3474,7 @@
 										</div>
 									{/if}
 								{/if}
-								{#if !publishedLock}
+								{#if !editLocked}
 									<button
 										type="button"
 										data-testid="attach-image-{index}"
@@ -3195,8 +3518,8 @@
 		</div>
 	</div>
 
-	<!-- Floating Bottom Action Dock: nothing to send once the post is published -->
-	{#if !publishedLock}
+	<!-- Floating Bottom Action Dock: nothing to send once the post is published, or while it sends -->
+	{#if !editLocked}
 		<div
 			class="pointer-events-none fixed bottom-[max(2rem,env(safe-area-inset-bottom))] left-1/2 z-30 w-full max-w-2xl -translate-x-1/2 px-4 sm:px-6"
 		>
@@ -3358,7 +3681,7 @@
 						type="button"
 						data-testid="publish-now"
 						class="flex cursor-pointer items-center gap-2 rounded-l-full px-6 py-2.5 text-[13px] font-bold transition-all hover:bg-stone-800 disabled:opacity-60"
-						disabled={publishing}
+						disabled={publishing || unscheduling}
 						aria-busy={publishButtonBusy}
 						onclick={() => void onPublish()}
 					>
@@ -3377,7 +3700,7 @@
 						title="Schedule Options"
 						aria-label="Schedule Options"
 						aria-expanded={scheduleOpen}
-						disabled={publishing}
+						disabled={publishing || unscheduling}
 						onclick={openSchedule}
 					>
 						<Calendar class="h-4 w-4 text-stone-300 transition-colors group-hover:text-white" />
@@ -3413,8 +3736,22 @@
 									<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">Confirm Post</h4>
 									<p class="text-[12px] font-medium text-stone-500">
 										Publishing to {pendingAccounts.length}
-										{pendingAccounts.length === 1 ? 'destination' : 'destinations'}.
+										{pendingAccounts.length === 1
+											? 'destination'
+											: 'destinations'}{publishReplacesSchedule
+											? ' now instead of at the scheduled time'
+											: ''}.
 									</p>
+									{#if unscheduledByPublish.length}
+										<p
+											data-testid="publish-unschedules"
+											class="mt-1 text-[12px] font-medium text-amber-700"
+										>
+											{unscheduledByPublish.map(destinationName).join(', ')}
+											{unscheduledByPublish.length === 1 ? 'is' : 'are'} unticked, so
+											{unscheduledByPublish.length === 1 ? 'it' : 'they'} will be unscheduled.
+										</p>
+									{/if}
 								{/if}
 							</div>
 
@@ -3550,7 +3887,9 @@
 						>
 							<div class="flex items-center gap-2 px-2 pt-2 pb-3">
 								<Calendar class="h-4 w-4 text-stone-900" />
-								<h4 class="text-[14px] font-extrabold text-stone-900">Schedule Post</h4>
+								<h4 class="text-[14px] font-extrabold text-stone-900">
+									{hasSchedule ? 'Reschedule' : 'Schedule Post'}
+								</h4>
 							</div>
 
 							<div class="mx-1 mb-4 flex rounded-lg bg-stone-100 p-1">
@@ -3662,10 +4001,10 @@
 								type="button"
 								data-testid="schedule-confirm"
 								class="w-full cursor-pointer rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
-								disabled={publishing}
+								disabled={publishing || unscheduling}
 								onclick={() => void onSchedule()}
 							>
-								Confirm Schedule
+								{hasSchedule ? 'Update schedule' : 'Confirm Schedule'}
 							</button>
 						</div>
 					{/if}
@@ -3738,9 +4077,9 @@
 <ConfirmDialog
 	open={isDiscardOpen}
 	idPrefix="discard-draft-dialog"
-	title="Discard this draft?"
-	body="This will permanently delete the draft and its images. This cannot be undone."
-	confirmLabel="Discard"
+	title={discardCopy.title}
+	body={discardCopy.body}
+	confirmLabel={discardCopy.confirm}
 	cancelLabel="Keep"
 	tone="danger"
 	busy={discarding || saving || publishing}
