@@ -23,6 +23,7 @@
 	import { parseXPostUrl } from '#lib/domain/x-quote.js';
 	import { humanizeError } from '#lib/domain/human-error.js';
 	import { sessionExpiredIfUnauthorized } from '#lib/components/session-expired.js';
+	import { takePostsNotice } from '#lib/components/posts-notice.js';
 	import { menuNav } from '#lib/components/menu-nav.js';
 	import {
 		formatDayTime,
@@ -194,6 +195,8 @@
 	let targets = $state<QueueTarget[]>(data.targets);
 	// svelte-ignore state_referenced_locally
 	let error = $state<string | null>(data.loadFailed ? 'Could not load posts' : null);
+	// What the composer just did with the post that sent you here.
+	let notice = $state(takePostsNotice());
 	let busy = $state<string | null>(null);
 	let pendingCancel = $state<{
 		ids: string[];
@@ -1025,6 +1028,30 @@
 					<X class="h-3.5 w-3.5" />
 				</button>
 			</span>
+		</div>
+	{/if}
+
+	{#if notice}
+		<div
+			class="mb-4 flex items-center justify-between gap-2 rounded-xl px-3 py-2 text-sm {notice.tone ===
+			'warn'
+				? 'bg-amber-50 text-amber-900'
+				: 'bg-emerald-50 text-emerald-800'}"
+			role="status"
+			data-testid="posts-notice"
+		>
+			<p class="font-medium">{notice.message}</p>
+			<button
+				type="button"
+				onclick={() => (notice = null)}
+				aria-label="Dismiss notice"
+				class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors {notice.tone ===
+				'warn'
+					? 'text-amber-700 hover:bg-amber-100'
+					: 'text-emerald-700 hover:bg-emerald-100'}"
+			>
+				<X class="h-3.5 w-3.5" />
+			</button>
 		</div>
 	{/if}
 

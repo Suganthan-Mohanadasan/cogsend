@@ -27,6 +27,8 @@ A post that went to several accounts is one card, with a result per account, so 
 post that published on four and failed on one shows exactly that. Retrying a card
 retries only the accounts that failed.
 
+A post that published to every account can't be edited, since changing it would no longer match what went out. Opening it shows it read-only, with **Duplicate to post again** to start a copy, which is what **Post again** does from its card. A post that failed on some accounts stays editable, so it can be fixed and retried.
+
 A scheduled post that fails with something retryable — a rate limit, a platform
 timeout — is not failed yet: it backs off and tries again on its own, up to five
 attempts, and only then lands in **Failed**. The dashboard shows a banner when

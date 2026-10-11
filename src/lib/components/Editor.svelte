@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { beforeNavigate, replaceState } from '$app/navigation';
+	import { afterNavigate, beforeNavigate, goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onMount, tick } from 'svelte';
 	import {
@@ -98,6 +98,8 @@
 	} from '#lib/domain/validation/text.js';
 	import { utf8ByteLength } from '#lib/domain/bytes.js';
 	import { draftExcerpt } from '#lib/domain/excerpt.js';
+	import { PUBLISHED_EDIT_ERROR, isFullyPublished } from '#lib/domain/published-lock.js';
+	import { setPostsNotice } from '#lib/components/posts-notice.js';
 	import {
 		attachXQuote,
 		keepXQuoteOnX,
@@ -146,6 +148,8 @@
 		// automatically; the target is `scheduled` with an error, not failed.
 		status: 'pending' | 'published' | 'failed' | 'publishing' | 'retrying';
 		error?: string | null;
+		// Published before this attempt: the server skipped it, nothing was sent.
+		already?: boolean;
 	};
 
 	type EditorDraft = {
@@ -158,7 +162,12 @@
 			optionsJson?: { visibility?: string; spoilerText?: string; poll?: unknown };
 		}>;
 		media?: MediaItem[];
-		targets?: Array<{ connectionId?: string | null; scheduledFor?: unknown }>;
+		targets?: Array<{
+			connectionId?: string | null;
+			scheduledFor?: unknown;
+			status?: string;
+			remotePostId?: string | null;
+		}>;
 	};
 
 	let {
@@ -265,6 +274,12 @@
 	// (body/selection autosave) so a draft response landing mid-edit cannot
 	// replace a schedule the user already picked.
 	let scheduleTouched = $state(false);
+	// The open post went out everywhere: the editor turns read-only and saves
+	// nothing, since the server refuses edits to it (PUBLISHED_EDIT_ERROR).
+	let publishedLock = $state(isFullyPublished(seededDraft?.targets ?? []));
+	// Opened from Posts (Edit Post, Duplicate, Quote on X): a successful
+	// schedule or publish goes back there instead of clearing the composer.
+	let returnToPosts = false;
 	// Snapshot on purpose: defaults apply to a fresh editor only.
 	let mastoVisibility = $state(seededVisibility);
 	let mastoCW = $state(seededCw);
@@ -669,6 +684,7 @@
 	}
 
 	function setActiveBody(nextBody: string) {
+		if (publishedLock) return;
 		if (activeTab === 'global') {
 			baseBody = nextBody;
 		} else {
@@ -741,6 +757,18 @@
 		savedSnapshot = null;
 		loadFailedId = null;
 		storedVariants = new Set();
+		publishedLock = false;
+		returnToPosts = false;
+	}
+
+	/** Back to an empty composer at /compose; the post itself is left as it is. */
+	function clearComposer() {
+		for (const key of Object.keys(altTimers)) clearTimeout(altTimers[key]);
+		for (const key of Object.keys(altPending)) delete altPending[key];
+		pendingMediaRemove = null;
+		resetEditorForNewDraft();
+		loadedDraftContentFor = null;
+		setComposeUrl('/compose');
 	}
 
 	async function loadDraft(id: string) {
@@ -806,6 +834,11 @@
 				return;
 			}
 			draftId = d.id;
+			const locked = isFullyPublished(d.targets || []);
+			publishedLock = locked;
+			// Text typed while a published post loaded cannot be saved, so the
+			// stored copy wins outright instead of being merged with it.
+			const merge = before !== null && !locked;
 			const main = d.baseBody || '';
 			const loadedOverrides = overridesFromVariants(d.variants || [], main);
 			const loadedMedia = (d.media || []).map((m: MediaItem) => ({
@@ -827,7 +860,7 @@
 			);
 
 			let mergedCleanly = true;
-			if (before) {
+			if (before && merge) {
 				const keepBody = baseBody !== before.body;
 				const keepOverrides = overrides !== before.overrides;
 				const keepMedia = media !== before.media;
@@ -870,7 +903,7 @@
 				? (d.selectedConnectionIds as string[])
 				: null;
 			// A user toggle during the load wins over the stored selection.
-			const keepSelection = before !== null && selectionTouched;
+			const keepSelection = merge && selectionTouched;
 			if (!keepSelection) {
 				const restored = savedRaw
 					? resolveSavedSelection(savedRaw, connections)
@@ -889,7 +922,7 @@
 
 			// Schedule: a first load keeps a schedule the user edited while the
 			// fetch was in flight; a draft switch applies the stored one wholesale.
-			if (before === null || !scheduleTouched) {
+			if (!merge || !scheduleTouched) {
 				loadedSchedule = earliestFutureScheduleValue(d.targets, new Date());
 				scheduleTouched = false;
 				// The popover may already be open on the default; show the stored
@@ -1063,6 +1096,7 @@
 		// Backstop for every caller (autosave, Cmd+S, publish, schedule,
 		// beforeunload): never write a draft whose stored copy never loaded.
 		if (loadFailedId) return null;
+		if (publishedLock) return draftId;
 		const emptyNew = !draftId && !baseBody.trim();
 		if (emptyNew && !allowEmpty) return null;
 		// Nothing changed since the last successful save: skip the round trips.
@@ -1092,6 +1126,13 @@
 			}
 			return id;
 		} catch (e) {
+			if (e instanceof Error && e.message === PUBLISHED_EDIT_ERROR) {
+				// Published from elsewhere (another tab, the scheduler) while
+				// open here: say so with the lock banner, not a failed save.
+				publishedLock = true;
+				saveFailed = false;
+				return null;
+			}
 			saveFailed = true;
 			showToast(humanizeError(e instanceof Error ? e.message : 'Save failed'), 'error');
 			return null;
@@ -1146,7 +1187,7 @@
 
 	async function requestPublish(connectionIds: string[]) {
 		// Prevent overlapping publishes/schedules (publishing covers both).
-		if (publishing) return;
+		if (publishing || publishedLock) return;
 		// Fast empty check before opening any UI: mirrors doPersist's
 		// emptyNew guard so an empty composer toasts without flashing the
 		// dialog (or the publishing spinner in skip-ask mode).
@@ -1192,7 +1233,7 @@
 			try {
 				const id = await persistForAction();
 				if (!id) {
-					showToast('Nothing to publish', 'warn');
+					if (!publishedLock) showToast('Nothing to publish', 'warn');
 					return;
 				}
 				pendingPublish = null;
@@ -1224,7 +1265,7 @@
 			if (!id) {
 				pendingPublish = null;
 				isPostConfirmOpen = false;
-				showToast('Nothing to publish', 'warn');
+				if (!publishedLock) showToast('Nothing to publish', 'warn');
 				return;
 			}
 			if (pendingPublish && requestId === publishRequestSeq) {
@@ -1281,6 +1322,9 @@
 		announcePublish(
 			`Publishing to ${connectionIds.length} ${connectionIds.length === 1 ? 'destination' : 'destinations'}.`
 		);
+		// Destinations the server skipped because the post was already there:
+		// published, but nothing was sent this time.
+		const alreadyIds = new Set<string>();
 		const settled = await Promise.all(
 			connectionIds.map(async (connectionId) => {
 				try {
@@ -1292,10 +1336,13 @@
 					const data = await res.json().catch(() => ({}));
 					if (!res.ok) throw new Error(data.error || 'Publish failed');
 					const row = (data.results || [])[0] as
-						{ status?: string; error?: string | null; deferred?: boolean } | undefined;
+						| { status?: string; error?: string | null; deferred?: boolean; skipped?: boolean }
+						| undefined;
 					if (!row) throw new Error('Publish failed');
 					if (row.status === 'published') {
-						setDestinationProgress(connectionId, { status: 'published', error: null });
+						const already = row.skipped === true;
+						if (already) alreadyIds.add(connectionId);
+						setDestinationProgress(connectionId, { status: 'published', error: null, already });
 						return { connectionId, status: 'published' as const, error: null };
 					}
 					if (row.status === 'publishing') {
@@ -1360,16 +1407,20 @@
 			announcePublish(
 				`Retrying automatically for ${retrying.map((r) => destinationName(r.connectionId)).join(', ')}.`
 			);
-		} else if (published.length) {
-			showToast(
-				`Successfully published to ${published.length} ${published.length === 1 ? 'destination' : 'destinations'}!`,
-				'success'
-			);
-			announcePublish(
-				`Published to ${published.length} ${published.length === 1 ? 'destination' : 'destinations'}.`
-			);
 		} else if (inFlight.length) {
 			showToast('One of these destinations is already publishing', 'warn');
+		} else if (published.length) {
+			// Every destination has the post: this one is done.
+			const sent = published.filter((p) => !alreadyIds.has(p.connectionId)).length;
+			const already = published.length - sent;
+			const message = sent
+				? `Published to ${sent} ${sent === 1 ? 'destination' : 'destinations'}` +
+					(already ? ` · already on ${already}` : '')
+				: `Already published to ${already} ${already === 1 ? 'destination' : 'destinations'} — nothing new was sent`;
+			announcePublish(`${message}.`);
+			clearPostConfirm();
+			finishPosted('published', message, sent ? 'success' : 'warn');
+			return;
 		}
 		// The popover closed when the publish started. Reopen it only when a
 		// destination failed, so the per-destination errors are visible; a
@@ -1383,6 +1434,51 @@
 			await loadConnections();
 		} catch {
 			// Connection refresh is best-effort; the toast already reported.
+		}
+	}
+
+	/**
+	 * Close out a post that is now scheduled, or published everywhere: back to
+	 * Posts when it was opened from there, otherwise an empty composer for the
+	 * next one, with a link to where the post went.
+	 */
+	function finishPosted(tab: 'scheduled' | 'published', message: string, tone: 'success' | 'warn') {
+		const href = `/posts?tab=${tab}`;
+		// Text typed while the request ran was not part of what went out. Keep
+		// it on screen: the autosave stores it, or the lock says it was refused.
+		if (dirty) {
+			showToast(message, tone, { label: 'View', href });
+			return;
+		}
+		if (returnToPosts) {
+			setPostsNotice(message, tone);
+			void goto(href);
+			return;
+		}
+		clearComposer();
+		showToast(message, tone, { label: 'View', href });
+	}
+
+	let duplicating = $state(false);
+
+	/** A published post is read-only; its copy is a new draft to edit and send. */
+	async function duplicatePublished() {
+		const id = draftId;
+		if (!id || duplicating) return;
+		duplicating = true;
+		try {
+			const res = await fetch(`/api/drafts/${encodeURIComponent(id)}/duplicate`, {
+				method: 'POST'
+			});
+			const payload = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(payload.error || 'Could not duplicate');
+			const copy = payload.draft?.id;
+			if (!copy) throw new Error('Could not duplicate');
+			await goto(`/compose?id=${copy}`);
+		} catch (e) {
+			showToast(humanizeError(e instanceof Error ? e.message : 'Could not duplicate'), 'error');
+		} finally {
+			duplicating = false;
 		}
 	}
 
@@ -1492,6 +1588,7 @@
 	});
 
 	async function onSchedule() {
+		if (publishedLock) return;
 		if (!selected.size) {
 			showToast('Select at least one account', 'warn');
 			return;
@@ -1535,25 +1632,28 @@
 		try {
 			const id = await persistForAction();
 			if (!id) {
-				showToast('Nothing to schedule', 'warn');
+				if (!publishedLock) showToast('Nothing to schedule', 'warn');
 				return;
 			}
 			const res = await fetch(`/api/drafts/${id}/schedule`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ connectionIds: [...selected], runAt })
+				// The selection is the whole destination list: an account taken
+				// off it loses its earlier time instead of still posting then.
+				body: JSON.stringify({ connectionIds: [...selected], runAt, cancelOthers: true })
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.error || 'Schedule failed');
-			showToast(
-				`Successfully scheduled for ${selectedAccounts.length} ${selectedAccounts.length === 1 ? 'destination' : 'destinations'}!`,
-				'success'
-			);
-			dirty = false;
+			const count = selectedAccounts.length;
+			const removed: string[] = Array.isArray(data.cancelled) ? data.cancelled : [];
+			const message =
+				`Scheduled ${schedulePreview ? `for ${schedulePreview} ` : ''}to ${count} ${count === 1 ? 'destination' : 'destinations'}` +
+				(removed.length ? ` · removed from ${removed.map(destinationName).join(', ')}` : '');
 			scheduleOpen = false;
 			// The draft now carries this time; reopening should show it.
 			loadedSchedule = scheduleCombined;
 			scheduleTouched = false;
+			finishPosted('scheduled', message, 'success');
 		} catch (e) {
 			showToast(humanizeError(e instanceof Error ? e.message : 'Schedule failed'), 'error');
 		} finally {
@@ -1564,6 +1664,7 @@
 	}
 
 	async function attachFilesToSegment(segmentIndex: number, files: File[]) {
+		if (publishedLock) return;
 		const picked = files.filter(
 			(f) => f.type.startsWith('image/') || (videoEnabled && f.type === 'video/mp4')
 		);
@@ -1701,6 +1802,7 @@
 		}
 	}
 	async function updateMediaAlt(mediaId: string, altText: string) {
+		if (publishedLock) return;
 		media = media.map((m) => (m.id === mediaId ? { ...m, altText } : m));
 		if (!draftId) return;
 		altPending[mediaId] = altText;
@@ -1750,11 +1852,7 @@
 		// Nothing persisted yet: just clear local state, no API call.
 		if (!id) {
 			isDiscardOpen = false;
-			for (const key of Object.keys(altTimers)) clearTimeout(altTimers[key]);
-			for (const key of Object.keys(altPending)) delete altPending[key];
-			pendingMediaRemove = null;
-			resetEditorForNewDraft();
-			setComposeUrl('/compose');
+			clearComposer();
 			showToast('Draft discarded', 'success');
 			return;
 		}
@@ -1766,12 +1864,7 @@
 				throw new Error(data.error || 'Could not discard draft');
 			}
 			isDiscardOpen = false;
-			for (const key of Object.keys(altTimers)) clearTimeout(altTimers[key]);
-			for (const key of Object.keys(altPending)) delete altPending[key];
-			pendingMediaRemove = null;
-			resetEditorForNewDraft();
-			loadedDraftContentFor = null;
-			setComposeUrl('/compose');
+			clearComposer();
 			showToast('Draft discarded', 'success');
 		} catch (e) {
 			showToast(humanizeError(e instanceof Error ? e.message : 'Could not discard draft'), 'error');
@@ -1781,6 +1874,7 @@
 	}
 
 	function requestRemoveMedia(mediaId: string) {
+		if (publishedLock) return;
 		pendingMediaRemove = mediaId;
 	}
 
@@ -1991,6 +2085,7 @@
 	}
 
 	function onAddSegment() {
+		if (publishedLock) return;
 		const idx = segments.length;
 		setActiveBody(joinThreadSegments(addSegment(segments)));
 		focusedSegment = idx;
@@ -2027,6 +2122,7 @@
 	}
 
 	function onRemoveSegment(index: number) {
+		if (publishedLock) return;
 		if (uploadingSegment === index) uploadingSegment = null;
 		else if (uploadingSegment !== null && uploadingSegment > index) uploadingSegment -= 1;
 		revealTrailing = null;
@@ -2049,6 +2145,7 @@
 	}
 
 	function applyReorder(from: number, to: number) {
+		if (publishedLock) return;
 		if (from === to) return;
 		const next = reorderSegments(segments, from, to);
 		if (next === segments) return;
@@ -2125,6 +2222,7 @@
 	}
 
 	function handlePaste(e: ClipboardEvent, index: number) {
+		if (publishedLock) return;
 		const data = e.clipboardData;
 		if (!data) return;
 		const files: File[] = [];
@@ -2146,6 +2244,7 @@
 
 	function handleDrop(e: DragEvent, index: number) {
 		e.preventDefault();
+		if (publishedLock) return;
 		if (e.dataTransfer?.files?.length) {
 			const files = Array.from(e.dataTransfer.files).filter(
 				(f) => f.type.startsWith('image/') || f.type === 'video/mp4'
@@ -2271,7 +2370,7 @@
 	// A pending autosave already reads as "Saving…"; an empty new draft is never
 	// saved, so it shows nothing.
 	const saveIndicator = $derived.by((): 'saving' | 'saved' | 'failed' | null => {
-		if (loadFailedId || loadingDraftId) return null;
+		if (loadFailedId || loadingDraftId || publishedLock) return null;
 		if (saveFailed) return 'failed';
 		if (saving || (dirty && (draftId || baseBody.trim()))) return 'saving';
 		return draftId ? 'saved' : null;
@@ -2306,7 +2405,16 @@
 			initLoadedFor = id ?? null;
 			void loadConnections();
 		}
-		if (id && id !== loadedDraftContentFor) {
+		// `page.url` keeps the id of the last real navigation after the editor
+		// clears itself (discard, a finished post), and this effect re-runs on a
+		// connections refresh: load only a draft the browser is actually on, or
+		// the cleared post comes straight back.
+		if (
+			id &&
+			id !== loadedDraftContentFor &&
+			composeUrlPending === 0 &&
+			new URL(location.href).searchParams.get('id') === id
+		) {
 			loadedDraftContentFor = id;
 			void loadDraft(id).catch(() => {
 				loadedDraftContentFor = null;
@@ -2362,7 +2470,7 @@
 		} else if (!saving) {
 			dirty = false;
 		}
-		if (!dirty || publishing || saving) return;
+		if (!dirty || publishing || saving || publishedLock) return;
 		// A load in flight owns the editor identity (and may merge local edits
 		// into the stored copy): saving now could strand the keystrokes in a
 		// second draft, so wait for it to settle.
@@ -2378,7 +2486,12 @@
 		return () => clearTimeout(timer);
 	});
 
+	afterNavigate(({ from, to }) => {
+		returnToPosts = from?.url.pathname === '/posts' && Boolean(to?.url.searchParams.get('id'));
+	});
+
 	beforeNavigate(() => {
+		if (publishedLock) return;
 		if (!dirty && Object.keys(altPending).length === 0) return;
 		void persistAll(false, { navigate: false });
 		void flushAltPending();
@@ -2402,7 +2515,8 @@
 		const onHidden = () => {
 			if (document.visibilityState !== 'hidden') return;
 			void flushAltPending();
-			if (!dirty || publishing || loadingDraftId || isDiscardOpen || discarding) return;
+			if (!dirty || publishing || publishedLock || loadingDraftId || isDiscardOpen || discarding)
+				return;
 			void persistAll();
 		};
 		document.addEventListener('visibilitychange', onHidden);
@@ -2424,7 +2538,7 @@
 				quotePickerFor = null;
 				return;
 			}
-			if (pendingPublish) return;
+			if (pendingPublish || publishedLock) return;
 			const meta = event.metaKey || event.ctrlKey;
 			if (meta && event.key.toLowerCase() === 's') {
 				event.preventDefault();
@@ -2481,6 +2595,28 @@
 			</button>
 		</div>
 	{/if}
+	{#if publishedLock}
+		<div
+			role="status"
+			data-testid="published-lock"
+			class="mb-6 flex flex-wrap items-center gap-3 rounded-xl border border-amber-200/70 bg-amber-50/60 px-4 py-3"
+		>
+			<p class="min-w-0 flex-1 text-[13px] font-medium text-amber-900">
+				This post is already published, so it can't be edited.{dirty
+					? " Your last changes weren't saved."
+					: ''}
+			</p>
+			<button
+				type="button"
+				data-testid="duplicate-published"
+				disabled={duplicating}
+				onclick={() => void duplicatePublished()}
+				class="rounded-full border border-amber-300 bg-white px-4 py-1.5 text-[12px] font-bold text-amber-900 transition-colors hover:bg-amber-100 disabled:opacity-50"
+			>
+				{duplicating ? 'Duplicating…' : 'Duplicate to post again'}
+			</button>
+		</div>
+	{/if}
 	<!-- Platform Tabs (Always visible) -->
 	<div class="relative mb-8 flex flex-wrap items-center gap-2 pt-2">
 		<!-- Global Tab -->
@@ -2527,7 +2663,7 @@
 						role="img"
 						aria-label={`${platformName(platform)} over character limit`}
 					></div>
-				{:else}
+				{:else if !publishedLock}
 					<button
 						type="button"
 						data-testid="reset-platform-tab"
@@ -2545,7 +2681,7 @@
 		{/each}
 
 		<!-- Add Override Dropdown -->
-		{#if canAddOverride}
+		{#if canAddOverride && !publishedLock}
 			<div class="mx-1 hidden h-4 w-px bg-stone-200 sm:block"></div>
 			<div class="override-dropdown-container relative">
 				<button
@@ -2597,7 +2733,7 @@
 		{/if}
 
 		<!-- Mastodon Options Popover Button -->
-		{#if showMastoOptions}
+		{#if showMastoOptions && !publishedLock}
 			<div class="mx-1 hidden h-4 w-px bg-stone-200 sm:block"></div>
 			<div class="masto-options-container relative" data-testid="masto-options">
 				<button
@@ -2741,6 +2877,7 @@
 							value={hiddenQuote(index)?.visible ?? segment}
 							data-segment-index={index}
 							data-testid="segment-input-{index}"
+							readonly={publishedLock}
 							oninput={(e) => handleSegmentInput(index, e)}
 							onpaste={(e) => handlePaste(e, index)}
 							onblur={() => {
@@ -2796,23 +2933,31 @@
 										>
 											ALT
 										</button>
-										<button
-											type="button"
-											data-testid="remove-media-{m.id}"
-											onclick={() => requestRemoveMedia(m.id)}
-											class="absolute -right-1.5 -bottom-1.5 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-focus-within/media:opacity-100 group-hover/media:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100"
-											title={`Remove ${(m.mime || '').startsWith('video/') ? 'video' : 'image'} ${index + 1}`}
-											aria-label={`Remove ${(m.mime || '').startsWith('video/') ? 'video' : 'image'} ${index + 1}`}
-										>
-											<svg width="8" height="8" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-												<path
-													d="M2 2l8 8M10 2l-8 8"
-													stroke="currentColor"
-													stroke-width="1.6"
-													stroke-linecap="round"
-												/>
-											</svg>
-										</button>
+										{#if !publishedLock}
+											<button
+												type="button"
+												data-testid="remove-media-{m.id}"
+												onclick={() => requestRemoveMedia(m.id)}
+												class="absolute -right-1.5 -bottom-1.5 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-focus-within/media:opacity-100 group-hover/media:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100"
+												title={`Remove ${(m.mime || '').startsWith('video/') ? 'video' : 'image'} ${index + 1}`}
+												aria-label={`Remove ${(m.mime || '').startsWith('video/') ? 'video' : 'image'} ${index + 1}`}
+											>
+												<svg
+													width="8"
+													height="8"
+													viewBox="0 0 12 12"
+													fill="none"
+													aria-hidden="true"
+												>
+													<path
+														d="M2 2l8 8M10 2l-8 8"
+														stroke="currentColor"
+														stroke-width="1.6"
+														stroke-linecap="round"
+													/>
+												</svg>
+											</button>
+										{/if}
 									</div>
 								{/each}
 							</div>
@@ -2827,6 +2972,7 @@
 										type="text"
 										value={m.altText || ''}
 										data-testid="media-alt-{m.id}"
+										readonly={publishedLock}
 										oninput={(e) => updateMediaAlt(m.id, e.currentTarget.value)}
 										placeholder="Describe this image…"
 										aria-label={`Alt text for image ${index + 1}`}
@@ -2847,17 +2993,21 @@
 						{#if quote}
 							<XQuoteCard
 								url={quote.url}
-								onRemove={() => removeQuote(index)}
+								onRemove={publishedLock ? undefined : () => removeQuote(index)}
 								otherPlatforms={quoteLinkPlatforms}
-								onOnlyOnX={canQuoteOnlyOnX(index) ? () => quoteOnlyOnX(index) : undefined}
+								onOnlyOnX={!publishedLock && canQuoteOnlyOnX(index)
+									? () => quoteOnlyOnX(index)
+									: undefined}
 								withheldFrom={xWithheldFrom}
-								onShareWithAll={sharedQuote(index) ? () => shareQuoteWithAll(index) : undefined}
+								onShareWithAll={!publishedLock && sharedQuote(index)
+									? () => shareQuoteWithAll(index)
+									: undefined}
 							/>
 						{:else}
 							<LinkPreview text={segment} hasMedia={segMedia.length > 0} />
 						{/if}
 
-						{#if strayLinks.length > 0}
+						{#if strayLinks.length > 0 && !publishedLock}
 							<div
 								class="mt-3 flex flex-col gap-2 rounded-xl border border-amber-200/70 bg-amber-50/60 px-3 py-2"
 								data-testid="x-quote-stray"
@@ -2901,46 +3051,48 @@
 							<div
 								class="flex items-center gap-2 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100"
 							>
-								{#if tabSupportsThreads}
-									{#if index === segments.length - 1}
+								{#if !publishedLock}
+									{#if tabSupportsThreads}
+										{#if index === segments.length - 1}
+											<button
+												type="button"
+												data-testid="add-thread-post"
+												onclick={onAddSegment}
+												class="flex items-center gap-1.5 rounded-full border border-stone-100 bg-stone-50 px-3 py-1.5 text-[12px] font-bold text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-900"
+											>
+												<Plus class="h-3.5 w-3.5" /> Thread
+											</button>
+										{/if}
+									{/if}
+									{#if segments.length > 1}
 										<button
 											type="button"
-											data-testid="add-thread-post"
-											onclick={onAddSegment}
-											class="flex items-center gap-1.5 rounded-full border border-stone-100 bg-stone-50 px-3 py-1.5 text-[12px] font-bold text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-900"
+											data-testid="remove-segment-{index}"
+											onclick={() => onRemoveSegment(index)}
+											class="flex items-center justify-center rounded-lg p-1.5 text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
+											title="Remove post from thread"
+											aria-label="Remove post from thread"
 										>
-											<Plus class="h-3.5 w-3.5" /> Thread
+											<Trash2 class="h-3.5 w-3.5" />
+										</button>
+									{:else if index === 0 && canDiscard}
+										<button
+											type="button"
+											data-testid="discard-draft"
+											onclick={requestDiscard}
+											class="flex items-center justify-center rounded-lg p-1.5 text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
+											title="Discard draft"
+											aria-label="Discard draft"
+										>
+											<Trash2 class="h-3.5 w-3.5" />
 										</button>
 									{/if}
-								{/if}
-								{#if segments.length > 1}
-									<button
-										type="button"
-										data-testid="remove-segment-{index}"
-										onclick={() => onRemoveSegment(index)}
-										class="flex items-center justify-center rounded-lg p-1.5 text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
-										title="Remove post from thread"
-										aria-label="Remove post from thread"
-									>
-										<Trash2 class="h-3.5 w-3.5" />
-									</button>
-								{:else if index === 0 && canDiscard}
-									<button
-										type="button"
-										data-testid="discard-draft"
-										onclick={requestDiscard}
-										class="flex items-center justify-center rounded-lg p-1.5 text-red-600 transition-colors hover:bg-red-50 hover:text-red-700"
-										title="Discard draft"
-										aria-label="Discard draft"
-									>
-										<Trash2 class="h-3.5 w-3.5" />
-									</button>
 								{/if}
 							</div>
 
 							<!-- Right: Quote, Image & Char Count -->
 							<div class="quote-picker-container relative flex items-center gap-3">
-								{#if xQuoteActive && !quote}
+								{#if xQuoteActive && !quote && !publishedLock}
 									<button
 										type="button"
 										data-testid="quote-post-{index}"
@@ -2999,32 +3151,34 @@
 										</div>
 									{/if}
 								{/if}
-								<button
-									type="button"
-									data-testid="attach-image-{index}"
-									disabled={uploadingSegment === index}
-									class="flex items-center justify-center rounded-lg p-1.5 text-stone-500 opacity-0 transition-all group-focus-within:opacity-100 group-hover:opacity-100 hover:bg-stone-50 hover:text-stone-900 disabled:opacity-40 pointer-coarse:opacity-100"
-									aria-label={uploadingSegment === index
-										? `Uploading to post ${index + 1}`
-										: `Add image to post ${index + 1}`}
-									title={uploadingSegment === index ? 'Uploading…' : 'Add Image'}
-									onclick={() => fileRefs[index]?.click()}
-								>
-									<ImageIcon class="h-4 w-4" />
-								</button>
-								<input
-									bind:this={fileRefs[index]}
-									type="file"
-									accept={ACCEPTED_MEDIA}
-									multiple
-									class="hidden"
-									data-testid="file-input-{index}"
-									onchange={(e) => {
-										const list = e.currentTarget.files;
-										if (list?.length) void attachFilesToSegment(index, Array.from(list));
-										e.currentTarget.value = '';
-									}}
-								/>
+								{#if !publishedLock}
+									<button
+										type="button"
+										data-testid="attach-image-{index}"
+										disabled={uploadingSegment === index}
+										class="flex items-center justify-center rounded-lg p-1.5 text-stone-500 opacity-0 transition-all group-focus-within:opacity-100 group-hover:opacity-100 hover:bg-stone-50 hover:text-stone-900 disabled:opacity-40 pointer-coarse:opacity-100"
+										aria-label={uploadingSegment === index
+											? `Uploading to post ${index + 1}`
+											: `Add image to post ${index + 1}`}
+										title={uploadingSegment === index ? 'Uploading…' : 'Add Image'}
+										onclick={() => fileRefs[index]?.click()}
+									>
+										<ImageIcon class="h-4 w-4" />
+									</button>
+									<input
+										bind:this={fileRefs[index]}
+										type="file"
+										accept={ACCEPTED_MEDIA}
+										multiple
+										class="hidden"
+										data-testid="file-input-{index}"
+										onchange={(e) => {
+											const list = e.currentTarget.files;
+											if (list?.length) void attachFilesToSegment(index, Array.from(list));
+											e.currentTarget.value = '';
+										}}
+									/>
+								{/if}
 								<div
 									data-testid="segment-count-{index}"
 									class="rounded-full px-2.5 py-1 text-[11px] font-bold tracking-wider transition-colors {isOver
@@ -3041,475 +3195,484 @@
 		</div>
 	</div>
 
-	<!-- Floating Bottom Action Dock -->
-	<div
-		class="pointer-events-none fixed bottom-[max(2rem,env(safe-area-inset-bottom))] left-1/2 z-30 w-full max-w-2xl -translate-x-1/2 px-4 sm:px-6"
-	>
-		<div class="flex items-center justify-center gap-4">
-			<!-- Left side: Account Selector -->
-			<div class="accounts-popover-container pointer-events-auto relative flex items-center">
-				<button
-					type="button"
-					data-testid="destinations-toggle"
-					class="flex items-center gap-2 rounded-full border border-stone-200/80 bg-white/95 px-4 py-2.5 text-[13px] font-bold text-stone-700 shadow-[0_16px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl transition-all hover:border-stone-300 hover:bg-white {isAccountsPopoverOpen
-						? 'border-stone-300 bg-stone-50'
-						: ''}"
-					onclick={openDestinations}
-					aria-haspopup="dialog"
-					aria-expanded={isAccountsPopoverOpen}
-				>
-					<div class="mr-0.5 flex -space-x-1.5">
-						{#each selectedAccounts.slice(0, 3) as account (account.id)}
-							<div
-								class="z-10 flex h-[20px] w-[20px] items-center justify-center rounded-full border-2 border-white bg-stone-100"
-							>
-								<SocialIcon
-									platform={account.platform}
-									className={`h-2.5 w-2.5 ${platformColorClass(account.platform)}`}
-								/>
-							</div>
-						{/each}
-					</div>
-					<span
-						>{selectedAccounts.length}
-						<span class="hidden sm:inline">selected</span></span
-					>
-					<ChevronUp
-						class="ml-1 h-3.5 w-3.5 text-stone-500 transition-transform {isAccountsPopoverOpen
-							? 'rotate-180'
+	<!-- Floating Bottom Action Dock: nothing to send once the post is published -->
+	{#if !publishedLock}
+		<div
+			class="pointer-events-none fixed bottom-[max(2rem,env(safe-area-inset-bottom))] left-1/2 z-30 w-full max-w-2xl -translate-x-1/2 px-4 sm:px-6"
+		>
+			<div class="flex items-center justify-center gap-4">
+				<!-- Left side: Account Selector -->
+				<div class="accounts-popover-container pointer-events-auto relative flex items-center">
+					<button
+						type="button"
+						data-testid="destinations-toggle"
+						class="flex items-center gap-2 rounded-full border border-stone-200/80 bg-white/95 px-4 py-2.5 text-[13px] font-bold text-stone-700 shadow-[0_16px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl transition-all hover:border-stone-300 hover:bg-white {isAccountsPopoverOpen
+							? 'border-stone-300 bg-stone-50'
 							: ''}"
-					/>
-				</button>
-
-				<!-- Sleek Popover Menu -->
-				{#if isAccountsPopoverOpen}
-					<div
-						class="absolute bottom-full left-0 z-40 mb-3 w-72 rounded-[1.5rem] border border-stone-200/80 bg-white p-2 shadow-[0_16px_40px_-12px_rgb(28_25_23/0.15)]"
-						transition:slide={{ duration: 200 }}
-						role="dialog"
-						aria-label="Destinations"
+						onclick={openDestinations}
+						aria-haspopup="dialog"
+						aria-expanded={isAccountsPopoverOpen}
 					>
-						<div class="mb-2 flex items-center justify-between border-b border-stone-100 px-3 py-2">
-							<span class="text-[11px] font-bold tracking-widest text-stone-500 uppercase"
-								>Destinations</span
-							>
-							<button
-								type="button"
-								onclick={clearSelection}
-								disabled={selected.size === 0}
-								class="rounded-md bg-stone-100 px-2.5 py-1 text-[11px] font-bold text-stone-700 transition hover:bg-stone-200 hover:text-stone-900 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-stone-100 disabled:hover:text-stone-700"
-							>
-								Clear all
-							</button>
-						</div>
-
-						<div class="max-h-[40vh] space-y-1 overflow-y-auto px-1 pb-2">
-							{#each sortedConnections as account (account.id)}
-								{@const isSelected = selected.has(account.id)}
-								{@const needsReconnect = account.status && account.status !== 'active'}
+						<div class="mr-0.5 flex -space-x-1.5">
+							{#each selectedAccounts.slice(0, 3) as account (account.id)}
 								<div
-									class="group flex w-full items-center gap-1 rounded-xl px-2 py-1.5 transition-colors {isSelected
-										? 'bg-stone-50/80'
-										: 'hover:bg-stone-50/50'}"
-								>
-									<button
-										type="button"
-										class="flex min-w-0 flex-1 items-center gap-3 text-left"
-										onclick={() => toggleAccountSelection(account.id)}
-										aria-pressed={isSelected}
-										title={`${platformName(account.platform)}: ${account.displayName || account.handle || ''}`}
-									>
-										<AccountAvatar
-											platform={account.platform}
-											handle={account.handle}
-											displayName={account.displayName}
-											avatarUrl={account.avatarUrl}
-											size={24}
-											title={accountLabel(account.displayName, account.handle) || undefined}
-										/>
-										<span
-											class="min-w-0 flex-1 truncate text-[13px] font-bold {isSelected
-												? 'text-stone-900'
-												: 'text-stone-600'}"
-										>
-											{account.displayName ||
-												displayHandle(account.handle) ||
-												platformName(account.platform)}
-										</span>
-										{#if needsReconnect}
-											<span class="shrink-0 text-[11px] font-bold text-red-500"
-												>needs reconnect</span
-											>
-										{/if}
-										<span
-											aria-hidden="true"
-											class="flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors {isSelected
-												? 'border-stone-900 bg-stone-900 text-white'
-												: 'border-stone-200 text-transparent'}"
-										>
-											<Check class="h-3 w-3" />
-										</span>
-									</button>
-									<div class="flex shrink-0 items-center gap-2">
-										{#if needsReconnect}
-											<button
-												type="button"
-												onclick={() => void verifyConnection(account.id)}
-												disabled={reconnecting === account.id}
-												class="text-[11px] font-bold text-stone-900 underline"
-											>
-												{reconnecting === account.id ? 'Checking…' : 'Reconnect'}
-											</button>
-										{/if}
-										{#if !needsReconnect && sortedConnections.length > 1}
-											<button
-												type="button"
-												onclick={() => selectOnly(account.id)}
-												title={`Post only to ${account.displayName || account.handle || platformName(account.platform)}`}
-												aria-label={`Select only ${account.displayName || account.handle || platformName(account.platform)}`}
-												class="rounded bg-stone-200 px-2 py-0.5 text-[10px] font-bold text-stone-600 shadow-sm transition hover:bg-stone-300 sm:pointer-events-none sm:opacity-0 sm:group-focus-within:pointer-events-auto sm:group-focus-within:opacity-100 sm:group-hover:pointer-events-auto sm:group-hover:opacity-100 sm:focus-visible:pointer-events-auto sm:focus-visible:opacity-100"
-											>
-												ONLY
-											</button>
-										{/if}
-									</div>
-								</div>
-							{/each}
-							{#if connections.length === 0}
-								<div class="px-3 py-4 text-center">
-									<p class="text-[13px] font-bold text-stone-900">Connect an account first</p>
-									<p class="mt-1 text-[12px] font-medium text-stone-500">
-										Add one, then come back to write.
-									</p>
-									<a
-										href="/accounts"
-										class="mt-3 inline-flex rounded-full bg-stone-900 px-4 py-2 text-[12px] font-bold text-white"
-										>Open accounts</a
-									>
-								</div>
-							{/if}
-						</div>
-					</div>
-				{/if}
-			</div>
-
-			<!-- Right side: Split Post Button -->
-			<div
-				class="post-actions-container pointer-events-auto relative flex items-center rounded-full bg-stone-900 text-white shadow-[0_16px_40px_-12px_rgb(28_25_23/0.3)]"
-			>
-				<button
-					type="button"
-					data-testid="publish-now"
-					class="flex cursor-pointer items-center gap-2 rounded-l-full px-6 py-2.5 text-[13px] font-bold transition-all hover:bg-stone-800 disabled:opacity-60"
-					disabled={publishing}
-					aria-busy={publishButtonBusy}
-					onclick={() => void onPublish()}
-				>
-					<span>{publishButtonLabel}</span>
-					{#if publishButtonBusy}
-						<LoaderCircle class="h-3.5 w-3.5 animate-spin" />
-					{:else}
-						<Send class="h-3.5 w-3.5" />
-					{/if}
-				</button>
-				<div class="h-5 w-px bg-stone-700/80"></div>
-				<button
-					type="button"
-					data-testid="schedule-toggle"
-					class="group flex cursor-pointer items-center justify-center rounded-r-full px-4 py-2.5 transition-all hover:bg-stone-800"
-					title="Schedule Options"
-					aria-label="Schedule Options"
-					aria-expanded={scheduleOpen}
-					disabled={publishing}
-					onclick={openSchedule}
-				>
-					<Calendar class="h-4 w-4 text-stone-300 transition-colors group-hover:text-white" />
-				</button>
-
-				<!-- Post Confirmation Popover -->
-				{#if isPostConfirmOpen && pendingPublish}
-					<div
-						class="absolute right-0 bottom-full z-40 mb-3 w-64 origin-bottom-right rounded-[1.5rem] border border-stone-200/80 bg-white/95 p-3 text-stone-900 shadow-[0_12px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl"
-						transition:fly={{ y: 10, duration: 250, opacity: 0 }}
-						role="dialog"
-						aria-label={publishProgress?.some((d) => d.status === 'failed')
-							? 'Publish results'
-							: 'Confirm post'}
-						use:dialogFocus={{
-							onEscape: () => dismissPostConfirm(),
-							// Publishing is not destructive — the draft is saved — so
-							// the confirm button is preferred. It is disabled while
-							// the draft is still being saved, and the action falls
-							// back to the first control that can take focus.
-							initial: publishNowBtn
-						}}
-					>
-						<div class="px-2 pt-2 pb-4 text-center">
-							{#if publishProgress?.some((d) => d.status === 'failed')}
-								<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">
-									Couldn’t publish everywhere
-								</h4>
-								<p class="text-[12px] font-medium text-stone-500">
-									Fix the problems below, then retry from Posts.
-								</p>
-							{:else}
-								<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">Confirm Post</h4>
-								<p class="text-[12px] font-medium text-stone-500">
-									Publishing to {pendingAccounts.length}
-									{pendingAccounts.length === 1 ? 'destination' : 'destinations'}.
-								</p>
-							{/if}
-						</div>
-
-						<div
-							class="mb-4 flex justify-center -space-x-2"
-							data-testid="publish-confirm-destinations"
-						>
-							{#each pendingAccounts as account (account.id)}
-								{@const state = publishProgress?.find((d) => d.connectionId === account.id)}
-								<div
-									class="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-stone-50 shadow-sm"
-									title="{platformName(account.platform)}: {account.displayName || account.handle}"
+									class="z-10 flex h-[20px] w-[20px] items-center justify-center rounded-full border-2 border-white bg-stone-100"
 								>
 									<SocialIcon
 										platform={account.platform}
-										className={`h-3.5 w-3.5 ${platformColorClass(account.platform)}`}
+										className={`h-2.5 w-2.5 ${platformColorClass(account.platform)}`}
 									/>
-									{#if state?.status === 'published'}
-										<span
-											class="absolute -right-1 -bottom-1 flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white"
-										>
-											<Check class="h-2.5 w-2.5" />
-										</span>
-									{:else if state?.status === 'failed'}
-										<span
-											class="absolute -right-1 -bottom-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-white"
-										>
-											<X class="h-2.5 w-2.5" />
-										</span>
-									{/if}
 								</div>
 							{/each}
 						</div>
+						<span
+							>{selectedAccounts.length}
+							<span class="hidden sm:inline">selected</span></span
+						>
+						<ChevronUp
+							class="ml-1 h-3.5 w-3.5 text-stone-500 transition-transform {isAccountsPopoverOpen
+								? 'rotate-180'
+								: ''}"
+						/>
+					</button>
 
-						{#if publishProgress?.some((d) => d.status === 'failed')}
-							<ul class="mb-3 space-y-1.5" data-testid="publish-progress">
-								{#each publishProgress ?? [] as dest (dest.connectionId)}
-									<li
-										class="flex items-start gap-2 rounded-xl bg-stone-50 px-2.5 py-2"
-										data-testid="publish-dest"
-										data-status={dest.status}
+					<!-- Sleek Popover Menu -->
+					{#if isAccountsPopoverOpen}
+						<div
+							class="absolute bottom-full left-0 z-40 mb-3 w-72 rounded-[1.5rem] border border-stone-200/80 bg-white p-2 shadow-[0_16px_40px_-12px_rgb(28_25_23/0.15)]"
+							transition:slide={{ duration: 200 }}
+							role="dialog"
+							aria-label="Destinations"
+						>
+							<div
+								class="mb-2 flex items-center justify-between border-b border-stone-100 px-3 py-2"
+							>
+								<span class="text-[11px] font-bold tracking-widest text-stone-500 uppercase"
+									>Destinations</span
+								>
+								<button
+									type="button"
+									onclick={clearSelection}
+									disabled={selected.size === 0}
+									class="rounded-md bg-stone-100 px-2.5 py-1 text-[11px] font-bold text-stone-700 transition hover:bg-stone-200 hover:text-stone-900 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-stone-100 disabled:hover:text-stone-700"
+								>
+									Clear all
+								</button>
+							</div>
+
+							<div class="max-h-[40vh] space-y-1 overflow-y-auto px-1 pb-2">
+								{#each sortedConnections as account (account.id)}
+									{@const isSelected = selected.has(account.id)}
+									{@const needsReconnect = account.status && account.status !== 'active'}
+									<div
+										class="group flex w-full items-center gap-1 rounded-xl px-2 py-1.5 transition-colors {isSelected
+											? 'bg-stone-50/80'
+											: 'hover:bg-stone-50/50'}"
 									>
-										{#if dest.status === 'pending' || dest.status === 'publishing'}
-											<LoaderCircle
-												class="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-stone-500"
+										<button
+											type="button"
+											class="flex min-w-0 flex-1 items-center gap-3 text-left"
+											onclick={() => toggleAccountSelection(account.id)}
+											aria-pressed={isSelected}
+											title={`${platformName(account.platform)}: ${account.displayName || account.handle || ''}`}
+										>
+											<AccountAvatar
+												platform={account.platform}
+												handle={account.handle}
+												displayName={account.displayName}
+												avatarUrl={account.avatarUrl}
+												size={24}
+												title={accountLabel(account.displayName, account.handle) || undefined}
 											/>
-											<span class="text-[11px] font-bold text-stone-600">
-												{destinationName(dest.connectionId)} — publishing…
-											</span>
-										{:else if dest.status === 'published'}
-											<Check class="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
-											<span class="text-[11px] font-bold text-stone-700">
-												{destinationName(dest.connectionId)} — published
-											</span>
-										{:else if dest.status === 'retrying'}
-											<RefreshCw class="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
 											<span
-												class="min-w-0 flex-1 text-[11px] font-medium break-words text-amber-700"
+												class="min-w-0 flex-1 truncate text-[13px] font-bold {isSelected
+													? 'text-stone-900'
+													: 'text-stone-600'}"
 											>
-												{destinationName(dest.connectionId)}: {dest.error ||
-													'retrying automatically'}
-												— retrying automatically
+												{account.displayName ||
+													displayHandle(account.handle) ||
+													platformName(account.platform)}
 											</span>
-										{:else}
-											<X class="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-500" />
-											<span class="min-w-0 flex-1 text-[11px] font-medium break-words text-red-600">
-												{destinationName(dest.connectionId)}: {dest.error || 'Publish failed'}
+											{#if needsReconnect}
+												<span class="shrink-0 text-[11px] font-bold text-red-500"
+													>needs reconnect</span
+												>
+											{/if}
+											<span
+												aria-hidden="true"
+												class="flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors {isSelected
+													? 'border-stone-900 bg-stone-900 text-white'
+													: 'border-stone-200 text-transparent'}"
+											>
+												<Check class="h-3 w-3" />
+											</span>
+										</button>
+										<div class="flex shrink-0 items-center gap-2">
+											{#if needsReconnect}
+												<button
+													type="button"
+													onclick={() => void verifyConnection(account.id)}
+													disabled={reconnecting === account.id}
+													class="text-[11px] font-bold text-stone-900 underline"
+												>
+													{reconnecting === account.id ? 'Checking…' : 'Reconnect'}
+												</button>
+											{/if}
+											{#if !needsReconnect && sortedConnections.length > 1}
+												<button
+													type="button"
+													onclick={() => selectOnly(account.id)}
+													title={`Post only to ${account.displayName || account.handle || platformName(account.platform)}`}
+													aria-label={`Select only ${account.displayName || account.handle || platformName(account.platform)}`}
+													class="rounded bg-stone-200 px-2 py-0.5 text-[10px] font-bold text-stone-600 shadow-sm transition hover:bg-stone-300 sm:pointer-events-none sm:opacity-0 sm:group-focus-within:pointer-events-auto sm:group-focus-within:opacity-100 sm:group-hover:pointer-events-auto sm:group-hover:opacity-100 sm:focus-visible:pointer-events-auto sm:focus-visible:opacity-100"
+												>
+													ONLY
+												</button>
+											{/if}
+										</div>
+									</div>
+								{/each}
+								{#if connections.length === 0}
+									<div class="px-3 py-4 text-center">
+										<p class="text-[13px] font-bold text-stone-900">Connect an account first</p>
+										<p class="mt-1 text-[12px] font-medium text-stone-500">
+											Add one, then come back to write.
+										</p>
+										<a
+											href="/accounts"
+											class="mt-3 inline-flex rounded-full bg-stone-900 px-4 py-2 text-[12px] font-bold text-white"
+											>Open accounts</a
+										>
+									</div>
+								{/if}
+							</div>
+						</div>
+					{/if}
+				</div>
+
+				<!-- Right side: Split Post Button -->
+				<div
+					class="post-actions-container pointer-events-auto relative flex items-center rounded-full bg-stone-900 text-white shadow-[0_16px_40px_-12px_rgb(28_25_23/0.3)]"
+				>
+					<button
+						type="button"
+						data-testid="publish-now"
+						class="flex cursor-pointer items-center gap-2 rounded-l-full px-6 py-2.5 text-[13px] font-bold transition-all hover:bg-stone-800 disabled:opacity-60"
+						disabled={publishing}
+						aria-busy={publishButtonBusy}
+						onclick={() => void onPublish()}
+					>
+						<span>{publishButtonLabel}</span>
+						{#if publishButtonBusy}
+							<LoaderCircle class="h-3.5 w-3.5 animate-spin" />
+						{:else}
+							<Send class="h-3.5 w-3.5" />
+						{/if}
+					</button>
+					<div class="h-5 w-px bg-stone-700/80"></div>
+					<button
+						type="button"
+						data-testid="schedule-toggle"
+						class="group flex cursor-pointer items-center justify-center rounded-r-full px-4 py-2.5 transition-all hover:bg-stone-800"
+						title="Schedule Options"
+						aria-label="Schedule Options"
+						aria-expanded={scheduleOpen}
+						disabled={publishing}
+						onclick={openSchedule}
+					>
+						<Calendar class="h-4 w-4 text-stone-300 transition-colors group-hover:text-white" />
+					</button>
+
+					<!-- Post Confirmation Popover -->
+					{#if isPostConfirmOpen && pendingPublish}
+						<div
+							class="absolute right-0 bottom-full z-40 mb-3 w-64 origin-bottom-right rounded-[1.5rem] border border-stone-200/80 bg-white/95 p-3 text-stone-900 shadow-[0_12px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl"
+							transition:fly={{ y: 10, duration: 250, opacity: 0 }}
+							role="dialog"
+							aria-label={publishProgress?.some((d) => d.status === 'failed')
+								? 'Publish results'
+								: 'Confirm post'}
+							use:dialogFocus={{
+								onEscape: () => dismissPostConfirm(),
+								// Publishing is not destructive — the draft is saved — so
+								// the confirm button is preferred. It is disabled while
+								// the draft is still being saved, and the action falls
+								// back to the first control that can take focus.
+								initial: publishNowBtn
+							}}
+						>
+							<div class="px-2 pt-2 pb-4 text-center">
+								{#if publishProgress?.some((d) => d.status === 'failed')}
+									<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">
+										Couldn’t publish everywhere
+									</h4>
+									<p class="text-[12px] font-medium text-stone-500">
+										Fix the problems below, then retry from Posts.
+									</p>
+								{:else}
+									<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">Confirm Post</h4>
+									<p class="text-[12px] font-medium text-stone-500">
+										Publishing to {pendingAccounts.length}
+										{pendingAccounts.length === 1 ? 'destination' : 'destinations'}.
+									</p>
+								{/if}
+							</div>
+
+							<div
+								class="mb-4 flex justify-center -space-x-2"
+								data-testid="publish-confirm-destinations"
+							>
+								{#each pendingAccounts as account (account.id)}
+									{@const state = publishProgress?.find((d) => d.connectionId === account.id)}
+									<div
+										class="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-stone-50 shadow-sm"
+										title="{platformName(account.platform)}: {account.displayName ||
+											account.handle}"
+									>
+										<SocialIcon
+											platform={account.platform}
+											className={`h-3.5 w-3.5 ${platformColorClass(account.platform)}`}
+										/>
+										{#if state?.status === 'published'}
+											<span
+												class="absolute -right-1 -bottom-1 flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white"
+											>
+												<Check class="h-2.5 w-2.5" />
+											</span>
+										{:else if state?.status === 'failed'}
+											<span
+												class="absolute -right-1 -bottom-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-white"
+											>
+												<X class="h-2.5 w-2.5" />
 											</span>
 										{/if}
-									</li>
-								{/each}
-							</ul>
-						{/if}
-
-						{#if publishProgress?.some((d) => d.status === 'failed')}
-							<button
-								type="button"
-								data-testid="publish-progress-close"
-								class="w-full cursor-pointer rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800"
-								onclick={() => dismissPostConfirm()}
-							>
-								Close
-							</button>
-						{:else}
-							<button
-								type="button"
-								bind:this={publishNowBtn}
-								data-testid="confirm-dialog-ok"
-								class="flex w-full cursor-pointer items-center justify-center gap-2 rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
-								disabled={pendingPublish?.saving || !pendingPublish?.draftId}
-								onclick={() => void confirmPublish()}
-							>
-								{pendingPublish?.saving ? 'Saving…' : 'Publish Now'}
-								<Send class="h-3.5 w-3.5" />
-							</button>
-							<button
-								type="button"
-								class="mt-1 w-full rounded-full py-1.5 text-[12px] font-bold text-stone-500 transition-colors hover:text-stone-900"
-								onclick={() => dismissPostConfirm()}
-							>
-								Keep editing
-							</button>
-							<label
-								class="mt-1 flex items-center justify-center gap-1.5 text-[11px] font-medium text-stone-500"
-							>
-								<input
-									type="checkbox"
-									checked={skipAsk}
-									onchange={(e) => {
-										skipAsk = e.currentTarget.checked;
-										setLocalFlag(SKIP_ASK_KEY, skipAsk);
-									}}
-								/>
-								Publish without asking next time
-							</label>
-						{/if}
-					</div>
-				{/if}
-
-				<!-- Schedule Popover -->
-				{#if scheduleOpen}
-					<div
-						data-testid="schedule-panel"
-						class="absolute right-0 bottom-full z-40 mb-3 w-72 origin-bottom-right rounded-[1.5rem] border border-stone-200/80 bg-white/95 p-3 text-stone-900 shadow-[0_12px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl"
-						transition:fly={{ y: 10, duration: 250, opacity: 0 }}
-						role="dialog"
-						aria-label="Schedule post"
-					>
-						<div class="flex items-center gap-2 px-2 pt-2 pb-3">
-							<Calendar class="h-4 w-4 text-stone-900" />
-							<h4 class="text-[14px] font-extrabold text-stone-900">Schedule Post</h4>
-						</div>
-
-						<div class="mx-1 mb-4 flex rounded-lg bg-stone-100 p-1">
-							<button
-								type="button"
-								class="flex-1 rounded-md py-1.5 text-[12px] font-bold transition-colors {scheduleMode ===
-								'relative'
-									? 'bg-white text-stone-900 shadow-sm'
-									: 'text-stone-500 hover:text-stone-900'}"
-								onclick={() => {
-									scheduleMode = 'relative';
-									scheduleTouched = true;
-									applyRelativeFields();
-								}}
-							>
-								Relative
-							</button>
-							<button
-								type="button"
-								class="flex-1 rounded-md py-1.5 text-[12px] font-bold transition-colors {scheduleMode ===
-								'absolute'
-									? 'bg-white text-stone-900 shadow-sm'
-									: 'text-stone-500 hover:text-stone-900'}"
-								onclick={() => {
-									scheduleMode = 'absolute';
-								}}
-							>
-								Specific Date
-							</button>
-						</div>
-
-						{#if scheduleMode === 'relative'}
-							<div class="mb-4 flex flex-col gap-2 px-1" data-testid="schedule-offsets">
-								<span class="text-[10px] font-bold tracking-widest text-stone-500 uppercase"
-									>Publish in</span
-								>
-								<label class="flex items-center gap-2">
-									<input
-										type="number"
-										min="1"
-										data-testid="schedule-offset-value"
-										aria-label="Publish in amount"
-										bind:value={relativeValue}
-										oninput={() => {
-											scheduleTouched = true;
-											applyRelativeFields();
-										}}
-										class="w-20 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-center text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
-									/>
-									<select
-										data-testid="schedule-offset-unit"
-										aria-label="Publish in unit"
-										bind:value={relativeUnit}
-										onchange={() => {
-											scheduleTouched = true;
-											applyRelativeFields();
-										}}
-										class="flex-1 appearance-none rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
-									>
-										<option value="mins">Minutes</option>
-										<option value="hours">Hours</option>
-										<option value="days">Days</option>
-									</select>
-								</label>
-							</div>
-						{:else}
-							<div class="mb-4 flex flex-col gap-2 px-1">
-								<span class="text-[10px] font-bold tracking-widest text-stone-500 uppercase"
-									>Publish at ({tzShort})</span
-								>
-								<!-- At the 16px a touch screen needs, the two pickers no longer fit
-								     side by side in the popover. -->
-								<div class="flex gap-2 pointer-coarse:flex-col">
-									<div class="flex-1">
-										<input
-											type="date"
-											data-testid="schedule-date"
-											bind:value={schedDate}
-											oninput={() => (scheduleTouched = true)}
-											min={minSchedDate}
-											aria-label="Schedule date"
-											class="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
-										/>
 									</div>
-									<div class="flex-1">
+								{/each}
+							</div>
+
+							{#if publishProgress?.some((d) => d.status === 'failed')}
+								<ul class="mb-3 space-y-1.5" data-testid="publish-progress">
+									{#each publishProgress ?? [] as dest (dest.connectionId)}
+										<li
+											class="flex items-start gap-2 rounded-xl bg-stone-50 px-2.5 py-2"
+											data-testid="publish-dest"
+											data-status={dest.status}
+										>
+											{#if dest.status === 'pending' || dest.status === 'publishing'}
+												<LoaderCircle
+													class="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-stone-500"
+												/>
+												<span class="text-[11px] font-bold text-stone-600">
+													{destinationName(dest.connectionId)} — publishing…
+												</span>
+											{:else if dest.status === 'published'}
+												<Check class="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+												<span class="text-[11px] font-bold text-stone-700">
+													{destinationName(dest.connectionId)} — {dest.already
+														? 'already published'
+														: 'published'}
+												</span>
+											{:else if dest.status === 'retrying'}
+												<RefreshCw class="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
+												<span
+													class="min-w-0 flex-1 text-[11px] font-medium break-words text-amber-700"
+												>
+													{destinationName(dest.connectionId)}: {dest.error ||
+														'retrying automatically'}
+													— retrying automatically
+												</span>
+											{:else}
+												<X class="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-500" />
+												<span
+													class="min-w-0 flex-1 text-[11px] font-medium break-words text-red-600"
+												>
+													{destinationName(dest.connectionId)}: {dest.error || 'Publish failed'}
+												</span>
+											{/if}
+										</li>
+									{/each}
+								</ul>
+							{/if}
+
+							{#if publishProgress?.some((d) => d.status === 'failed')}
+								<button
+									type="button"
+									data-testid="publish-progress-close"
+									class="w-full cursor-pointer rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800"
+									onclick={() => dismissPostConfirm()}
+								>
+									Close
+								</button>
+							{:else}
+								<button
+									type="button"
+									bind:this={publishNowBtn}
+									data-testid="confirm-dialog-ok"
+									class="flex w-full cursor-pointer items-center justify-center gap-2 rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
+									disabled={pendingPublish?.saving || !pendingPublish?.draftId}
+									onclick={() => void confirmPublish()}
+								>
+									{pendingPublish?.saving ? 'Saving…' : 'Publish Now'}
+									<Send class="h-3.5 w-3.5" />
+								</button>
+								<button
+									type="button"
+									class="mt-1 w-full rounded-full py-1.5 text-[12px] font-bold text-stone-500 transition-colors hover:text-stone-900"
+									onclick={() => dismissPostConfirm()}
+								>
+									Keep editing
+								</button>
+								<label
+									class="mt-1 flex items-center justify-center gap-1.5 text-[11px] font-medium text-stone-500"
+								>
+									<input
+										type="checkbox"
+										checked={skipAsk}
+										onchange={(e) => {
+											skipAsk = e.currentTarget.checked;
+											setLocalFlag(SKIP_ASK_KEY, skipAsk);
+										}}
+									/>
+									Publish without asking next time
+								</label>
+							{/if}
+						</div>
+					{/if}
+
+					<!-- Schedule Popover -->
+					{#if scheduleOpen}
+						<div
+							data-testid="schedule-panel"
+							class="absolute right-0 bottom-full z-40 mb-3 w-72 origin-bottom-right rounded-[1.5rem] border border-stone-200/80 bg-white/95 p-3 text-stone-900 shadow-[0_12px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl"
+							transition:fly={{ y: 10, duration: 250, opacity: 0 }}
+							role="dialog"
+							aria-label="Schedule post"
+						>
+							<div class="flex items-center gap-2 px-2 pt-2 pb-3">
+								<Calendar class="h-4 w-4 text-stone-900" />
+								<h4 class="text-[14px] font-extrabold text-stone-900">Schedule Post</h4>
+							</div>
+
+							<div class="mx-1 mb-4 flex rounded-lg bg-stone-100 p-1">
+								<button
+									type="button"
+									class="flex-1 rounded-md py-1.5 text-[12px] font-bold transition-colors {scheduleMode ===
+									'relative'
+										? 'bg-white text-stone-900 shadow-sm'
+										: 'text-stone-500 hover:text-stone-900'}"
+									onclick={() => {
+										scheduleMode = 'relative';
+										scheduleTouched = true;
+										applyRelativeFields();
+									}}
+								>
+									Relative
+								</button>
+								<button
+									type="button"
+									class="flex-1 rounded-md py-1.5 text-[12px] font-bold transition-colors {scheduleMode ===
+									'absolute'
+										? 'bg-white text-stone-900 shadow-sm'
+										: 'text-stone-500 hover:text-stone-900'}"
+									onclick={() => {
+										scheduleMode = 'absolute';
+									}}
+								>
+									Specific Date
+								</button>
+							</div>
+
+							{#if scheduleMode === 'relative'}
+								<div class="mb-4 flex flex-col gap-2 px-1" data-testid="schedule-offsets">
+									<span class="text-[10px] font-bold tracking-widest text-stone-500 uppercase"
+										>Publish in</span
+									>
+									<label class="flex items-center gap-2">
 										<input
-											type="time"
-											data-testid="schedule-time"
-											bind:value={schedTime}
-											oninput={() => (scheduleTouched = true)}
-											aria-label="Schedule time"
-											class="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
+											type="number"
+											min="1"
+											data-testid="schedule-offset-value"
+											aria-label="Publish in amount"
+											bind:value={relativeValue}
+											oninput={() => {
+												scheduleTouched = true;
+												applyRelativeFields();
+											}}
+											class="w-20 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-center text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
 										/>
+										<select
+											data-testid="schedule-offset-unit"
+											aria-label="Publish in unit"
+											bind:value={relativeUnit}
+											onchange={() => {
+												scheduleTouched = true;
+												applyRelativeFields();
+											}}
+											class="flex-1 appearance-none rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
+										>
+											<option value="mins">Minutes</option>
+											<option value="hours">Hours</option>
+											<option value="days">Days</option>
+										</select>
+									</label>
+								</div>
+							{:else}
+								<div class="mb-4 flex flex-col gap-2 px-1">
+									<span class="text-[10px] font-bold tracking-widest text-stone-500 uppercase"
+										>Publish at ({tzShort})</span
+									>
+									<!-- At the 16px a touch screen needs, the two pickers no longer fit
+									     side by side in the popover. -->
+									<div class="flex gap-2 pointer-coarse:flex-col">
+										<div class="flex-1">
+											<input
+												type="date"
+												data-testid="schedule-date"
+												bind:value={schedDate}
+												oninput={() => (scheduleTouched = true)}
+												min={minSchedDate}
+												aria-label="Schedule date"
+												class="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
+											/>
+										</div>
+										<div class="flex-1">
+											<input
+												type="time"
+												data-testid="schedule-time"
+												bind:value={schedTime}
+												oninput={() => (scheduleTouched = true)}
+												aria-label="Schedule time"
+												class="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[13px] font-bold text-stone-900 transition-colors focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
+											/>
+										</div>
 									</div>
 								</div>
-							</div>
-						{/if}
+							{/if}
 
-						{#if schedulePreview}
-							<p
-								data-testid="schedule-preview"
-								class="mb-3 px-2 text-center text-[12px] font-bold text-stone-500"
+							{#if schedulePreview}
+								<p
+									data-testid="schedule-preview"
+									class="mb-3 px-2 text-center text-[12px] font-bold text-stone-500"
+								>
+									Will publish {schedulePreview}
+								</p>
+							{/if}
+
+							<button
+								type="button"
+								data-testid="schedule-confirm"
+								class="w-full cursor-pointer rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
+								disabled={publishing}
+								onclick={() => void onSchedule()}
 							>
-								Will publish {schedulePreview}
-							</p>
-						{/if}
-
-						<button
-							type="button"
-							data-testid="schedule-confirm"
-							class="w-full cursor-pointer rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
-							disabled={publishing}
-							onclick={() => void onSchedule()}
-						>
-							Confirm Schedule
-						</button>
-					</div>
-				{/if}
+								Confirm Schedule
+							</button>
+						</div>
+					{/if}
+				</div>
 			</div>
 		</div>
-	</div>
+	{/if}
 
 	<!-- Toast -->
 	<!-- Publishing progress/results for screen readers (the popover closes while publishing). -->

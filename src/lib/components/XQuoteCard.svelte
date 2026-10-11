@@ -28,7 +28,8 @@
 		onShareWithAll
 	}: {
 		url: string;
-		onRemove: () => void;
+		/** Absent on a post that can no longer change, which hides the remove button. */
+		onRemove?: () => void;
 		/** Platforms that get this text with the link as a plain link. */
 		otherPlatforms?: string[];
 		onOnlyOnX?: () => void;
@@ -101,16 +102,18 @@
 				<span class="font-bold text-stone-900">This post can't be loaded.</span>
 				It may be deleted or from a protected account. X will show it as unavailable.
 			</p>
-			<button
-				type="button"
-				data-testid="x-quote-remove"
-				onclick={onRemove}
-				class="flex min-h-6 min-w-6 items-center justify-center rounded-md text-stone-500 hover:bg-stone-200 hover:text-stone-900"
-				title="Remove quote"
-				aria-label="Remove quote"
-			>
-				<X class="h-3.5 w-3.5" />
-			</button>
+			{#if onRemove}
+				<button
+					type="button"
+					data-testid="x-quote-remove"
+					onclick={onRemove}
+					class="flex min-h-6 min-w-6 items-center justify-center rounded-md text-stone-500 hover:bg-stone-200 hover:text-stone-900"
+					title="Remove quote"
+					aria-label="Remove quote"
+				>
+					<X class="h-3.5 w-3.5" />
+				</button>
+			{/if}
 		</div>
 	{:else}
 		<div
@@ -118,16 +121,18 @@
 			data-testid="x-quote-card"
 			aria-busy={loading}
 		>
-			<button
-				type="button"
-				data-testid="x-quote-remove"
-				onclick={onRemove}
-				class="absolute top-2 right-2 flex h-6 w-6 items-center justify-center rounded-full bg-stone-900/70 text-white transition-colors hover:bg-stone-900"
-				title="Remove quote"
-				aria-label="Remove quote"
-			>
-				<X class="h-3 w-3" />
-			</button>
+			{#if onRemove}
+				<button
+					type="button"
+					data-testid="x-quote-remove"
+					onclick={onRemove}
+					class="absolute top-2 right-2 flex h-6 w-6 items-center justify-center rounded-full bg-stone-900/70 text-white transition-colors hover:bg-stone-900"
+					title="Remove quote"
+					aria-label="Remove quote"
+				>
+					<X class="h-3 w-3" />
+				</button>
+			{/if}
 			<div class="flex min-w-0 items-center gap-1.5 pr-8 text-[13px]">
 				{#if loaded?.kind === 'post' && loaded.post.name}
 					<span class="max-w-[60%] flex-shrink-0 truncate font-bold text-stone-900"

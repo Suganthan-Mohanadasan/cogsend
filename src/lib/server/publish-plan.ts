@@ -1,6 +1,7 @@
 import { and, eq, inArray, isNull, lte, or } from 'drizzle-orm';
 import type { InferSelectModel } from 'drizzle-orm';
 import { STALE_CLAIM_MS, isFreshPublishing } from '#lib/domain/due-jobs.js';
+import { PUBLISHED_EDIT_ERROR, isFullyPublished } from '#lib/domain/published-lock.js';
 import { newId, type AppDb } from './db/client';
 import { draftVariants, publishTargets } from './db/schema';
 
@@ -85,6 +86,24 @@ export function draftHasInFlightPublish(
 	now: Date = new Date()
 ): boolean {
 	return targets.some((t) => t.jobId || isFreshPublishing(t, now));
+}
+
+/**
+ * Why the draft's content may not change right now, or null. A publish in
+ * flight is reported first: it is temporary, and the client retries it.
+ */
+export function draftEditBlock(
+	targets: Array<{
+		status: string;
+		updatedAt?: Date | string | number | null;
+		remotePostId?: string | null;
+		jobId?: string | null;
+	}>,
+	now: Date = new Date()
+): string | null {
+	if (draftHasInFlightPublish(targets, now)) return 'Publishing in progress — try again shortly';
+	if (isFullyPublished(targets)) return PUBLISHED_EDIT_ERROR;
+	return null;
 }
 
 export function refuseInFlightOrPublished(

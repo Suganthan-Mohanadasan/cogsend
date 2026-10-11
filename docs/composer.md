@@ -87,9 +87,11 @@ on under **Settings → Preferences → Ask for confirmation before publishing**
 The calendar button next to it schedules instead: either **Publish in** an offset
 of minutes, hours or days (one hour by default), or a **Specific Date** and time in
 your own timezone. Opening a scheduled post again with **Edit Post** starts on the time it is already set for, so confirming without a change keeps it. A scheduled post waits in **Posts → Scheduled** until a
-[tick](scheduling.md) publishes it.
+[tick](scheduling.md) publishes it. Scheduling goes to exactly the accounts ticked: untick one and schedule again, and its earlier time is cancelled.
 
-If some accounts fail, the composer says **Couldn't publish everywhere** and lists
+Once a post is scheduled, or published to every account, the composer empties for the next one and the message links to it in **Posts**. A post you opened from **Posts** takes you back there instead. Publishing again to an account that already has the post sends nothing, and the message says so.
+
+If some accounts fail, the composer keeps the post open, says **Couldn't publish everywhere** and lists
 why; **Posts → Failed** has a **Retry** for each. A scheduled post that hits a
 retryable failure (a rate limit, a platform timeout) tries again on its own,
 backing off from one minute up to thirty — five attempts, then it stops in

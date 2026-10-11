@@ -5,7 +5,7 @@ import { chunkIds, first, newId } from '#lib/server/db/client.js';
 import { draftMedia, draftVariants, drafts, publishTargets } from '#lib/server/db/schema.js';
 import { fail, handleError, ok } from '#lib/server/http.js';
 import { deleteMediaObjects, saveMediaBytes } from '#lib/server/media.js';
-import { draftHasInFlightPublish } from '#lib/server/publish-plan.js';
+import { draftEditBlock } from '#lib/server/publish-plan.js';
 import { requireScope, requireUser } from '#lib/server/require.js';
 
 const MAX_SEGMENT_INDEX = 100;
@@ -34,12 +34,10 @@ function cleanAltText(value: unknown): string | null {
 	return trimmed.slice(0, MAX_ALT_LENGTH);
 }
 
-async function rejectIfPublishing(db: App.Locals['db'], draftId: string) {
+async function rejectIfNotEditable(db: App.Locals['db'], draftId: string) {
 	const targets = await db.select().from(publishTargets).where(eq(publishTargets.draftId, draftId));
-	if (draftHasInFlightPublish(targets)) {
-		return fail('Publishing in progress — try again shortly', 409);
-	}
-	return null;
+	const blocked = draftEditBlock(targets);
+	return blocked ? fail(blocked, 409) : null;
 }
 import { splitThreadSegments } from '#lib/domain/thread-segments.js';
 import { serializeMedia } from '#lib/server/serialize.js';
@@ -94,7 +92,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		requireScope(locals, 'write');
 		const draft = await ownDraft(locals, params.id, user.id);
 		if (!draft) return fail('Not found', 404);
-		const busy = await rejectIfPublishing(locals.db, params.id);
+		const busy = await rejectIfNotEditable(locals.db, params.id);
 		if (busy) return busy;
 		const form = await request.formData();
 		const segmentIndex = parseSegmentIndex(form.get('segmentIndex'));
@@ -217,7 +215,7 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 		requireScope(locals, 'write');
 		const draft = await ownDraft(locals, params.id, user.id);
 		if (!draft) return fail('Not found', 404);
-		const busy = await rejectIfPublishing(locals.db, params.id);
+		const busy = await rejectIfNotEditable(locals.db, params.id);
 		if (busy) return busy;
 		let body: Record<string, unknown>;
 		try {
@@ -281,7 +279,7 @@ export const DELETE: RequestHandler = async ({ params, url, locals }) => {
 		const user = requireUser(locals.user);
 		requireScope(locals, 'write');
 		if (!(await ownDraft(locals, params.id, user.id))) return fail('Not found', 404);
-		const busy = await rejectIfPublishing(locals.db, params.id);
+		const busy = await rejectIfNotEditable(locals.db, params.id);
 		if (busy) return busy;
 		const mediaId = url.searchParams.get('mediaId');
 		if (!mediaId) return fail('mediaId required');

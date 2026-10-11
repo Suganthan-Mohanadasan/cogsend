@@ -1,4 +1,14 @@
-import { and, desc, eq, inArray, isNull, lte, or, type InferSelectModel } from 'drizzle-orm';
+import {
+	and,
+	desc,
+	eq,
+	inArray,
+	isNull,
+	lte,
+	notInArray,
+	or,
+	type InferSelectModel
+} from 'drizzle-orm';
 import {
 	countGraphemes,
 	mastodonWeightedLength,
@@ -35,6 +45,7 @@ import {
 	classifyConnections,
 	ensureTargets,
 	refuseInFlightOrPublished,
+	draftEditBlock,
 	draftHasInFlightPublish
 } from '#lib/server/publish-plan.js';
 import { refreshDraftStatus, publishTarget } from '#lib/server/publish.js';
@@ -108,8 +119,8 @@ export async function updateDraft(
 		.select()
 		.from(publishTargets)
 		.where(eq(publishTargets.draftId, id));
-	if (draftHasInFlightPublish(liveTargets))
-		invalid('Publishing in progress — try again shortly', 409);
+	const blocked = draftEditBlock(liveTargets);
+	if (blocked) invalid(blocked, 409);
 	if (!body || typeof body !== 'object') invalid('Invalid JSON body');
 	const input = body as Record<string, unknown>;
 	const selection = normalizeSelectedConnectionIds(input.selectedConnectionIds);
@@ -147,9 +158,11 @@ export async function scheduleDraft(
 	);
 	if (!draft) invalid('Not found', 404);
 	if (!body || typeof body !== 'object') invalid('Invalid JSON body');
-	const input = body as { connectionIds?: unknown; runAt?: unknown };
+	const input = body as { connectionIds?: unknown; runAt?: unknown; cancelOthers?: unknown };
 	const now = new Date();
 	if (connectionIdsOverflow(input.connectionIds)) invalid('Too many connections (max 10)');
+	if (input.cancelOthers !== undefined && typeof input.cancelOthers !== 'boolean')
+		invalid('cancelOthers must be a boolean');
 	const ids = normalizeConnectionIds(input.connectionIds);
 	const runAt = input.runAt ? new Date(input.runAt as string) : null;
 	if (!ids.length) invalid('connectionIds required');
@@ -182,8 +195,30 @@ export async function scheduleDraft(
 			alreadyPublished: blocked.filter((i) => i.alreadyPublished).map((i) => i.target.connectionId),
 			inFlight: blocked.filter((i) => i.inFlight).map((i) => i.target.connectionId)
 		});
+	// Opt-in, so the API stays additive: the composer sends the whole destination
+	// list, and an account taken off it must not keep its old time. Only rows
+	// still waiting are touched; a jobId means the tick is already sending it.
+	const cancelled = input.cancelOthers
+		? await ctx.db
+				.update(publishTargets)
+				.set({ status: 'cancelled', jobId: null, scheduledFor: null, updatedAt: now })
+				.where(
+					and(
+						eq(publishTargets.draftId, draftId),
+						notInArray(publishTargets.connectionId, ids),
+						inArray(publishTargets.status, ['scheduled', 'pending']),
+						isNull(publishTargets.remotePostId),
+						isNull(publishTargets.jobId)
+					)
+				)
+				.returning({ connectionId: publishTargets.connectionId })
+		: [];
 	await refreshDraftStatus(ctx.db, draftId);
-	return { targets: ensured.map((i) => i.target), scheduledFor: runAt.toISOString() };
+	return {
+		targets: ensured.map((i) => i.target),
+		scheduledFor: runAt.toISOString(),
+		cancelled: [...new Set(cancelled.map((row) => row.connectionId))]
+	};
 }
 
 export async function cancelDelivery(ctx: OperationContext, userId: string, id: string) {
@@ -571,12 +606,13 @@ function validateVariantOptions(options: unknown): string | null {
 	return null;
 }
 
-async function ensureDraftNotPublishing(ctx: OperationContext, draftId: string) {
+async function ensureDraftEditable(ctx: OperationContext, draftId: string) {
 	const targets = await ctx.db
 		.select()
 		.from(publishTargets)
 		.where(eq(publishTargets.draftId, draftId));
-	if (draftHasInFlightPublish(targets)) invalid('Publishing in progress — try again shortly', 409);
+	const blocked = draftEditBlock(targets);
+	if (blocked) invalid(blocked, 409);
 }
 
 export async function setDraftVariant(
@@ -592,7 +628,7 @@ export async function setDraftVariant(
 			.where(and(eq(drafts.id, draftId), eq(drafts.userId, userId)))
 	);
 	if (!draft) invalid('Not found', 404);
-	await ensureDraftNotPublishing(ctx, draftId);
+	await ensureDraftEditable(ctx, draftId);
 	if (!input || typeof input !== 'object') invalid('Invalid JSON body');
 	const fields = input as Record<string, unknown>;
 	const optionsError = validateVariantOptions(fields.options);
@@ -668,7 +704,7 @@ export async function deleteDraftVariant(
 			.where(and(eq(drafts.id, draftId), eq(drafts.userId, userId)))
 	);
 	if (!draft) invalid('Not found', 404);
-	await ensureDraftNotPublishing(ctx, draftId);
+	await ensureDraftEditable(ctx, draftId);
 	if (!platform) invalid('platform required');
 	await ctx.db
 		.delete(draftVariants)
