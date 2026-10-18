@@ -109,14 +109,6 @@ export function parseRelease(json: unknown): ReleaseInfo | null {
 }
 
 /**
- * The highest semver tag from a `/tags` listing.
- *
- * Not every project publishes GitHub releases — this one shipped a `v1.0.0`
- * tag before it had a release object — and `/releases/latest` answers 404 in
- * that case. The tags endpoint has no ordering guarantee, so the versions are
- * compared rather than trusted in the order they arrive.
- */
-/**
  * The highest version among GitHub's release list, pre-releases included and
  * drafts left out: "latest" on GitHub never names a pre-release, and the list
  * is ordered by date, not version.
@@ -177,6 +169,14 @@ export function newestOf(releases: ReleaseInfo[], prereleases: boolean): Release
 	return best;
 }
 
+/**
+ * The highest semver tag from a `/tags` listing.
+ *
+ * Not every project publishes GitHub releases — this one shipped a `v1.0.0`
+ * tag before it had a release object — and `/releases/latest` answers 404 in
+ * that case. The tags endpoint has no ordering guarantee, so the versions are
+ * compared rather than trusted in the order they arrive.
+ */
 export function highestVersionTag(json: unknown): ReleaseInfo | null {
 	if (!Array.isArray(json)) return null;
 	let best: { tag: string; parts: number[] } | null = null;

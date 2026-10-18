@@ -12,8 +12,7 @@ function messageFor(key: string, exp: number): string {
 
 // Key separation: derive a dedicated HMAC sub-key instead of using
 // APP_ENCRYPTION_KEY directly (that key also does AES-GCM + TOTP + OAuth).
-// HMAC(secret, fixed-label) is a standard single-step KDF. Old URLs are
-// invalidated on deploy — acceptable (2h TTL, re-minted at publish).
+// HMAC(secret, fixed-label) is a standard single-step KDF.
 async function signingKey(secret: string): Promise<string> {
 	return hmacHex(secret, 'subkey:media-url:v1');
 }

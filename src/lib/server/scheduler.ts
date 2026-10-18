@@ -36,9 +36,9 @@ import { purgeExpiredSessions } from './auth';
 import { readAppSetting, writeAppSetting } from './app-settings';
 
 export const HEARTBEAT_ID = 'default';
-/** GitHub cron is often delayed 15–75 minutes. This is display-only. */
-// GitHub throttles the every-minute tick to ~1 run per 2h, so a 2h threshold
-// flaps red all day. 6h only fires on a genuinely dead scheduler.
+/** Display-only. GitHub throttles the every-minute tick to ~1 run per 2h, so
+ *  a 2h threshold flaps red all day; 6h only fires on a genuinely dead
+ *  scheduler. */
 export const HEARTBEAT_STALE_MS = 6 * 60 * 60_000;
 
 export type QueueLike = {
