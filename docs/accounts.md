@@ -43,6 +43,8 @@ the account's history. The usual cause is LinkedIn: a self-created LinkedIn app
 gets a 60-day token and nothing to renew it with, so it has to be reconnected every
 60 days ([why](oauth-apps.md#linkedin)).
 
+Posts already scheduled for the account still go out at their time, and the first one that succeeds clears the reconnect flag on its own; you can't publish, schedule, retry or reschedule anything new to it until then.
+
 ## Disconnecting
 
 Disconnecting an account removes its scheduled posts, returns drafts that were

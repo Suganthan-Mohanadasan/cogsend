@@ -33,7 +33,7 @@ A post that published to every account can't be edited, since changing it would 
 
 A scheduled post that fails with something retryable — a rate limit, a platform
 timeout — is not failed yet: it backs off and tries again on its own, up to five
-attempts, and only then lands in **Failed**. The dashboard shows a banner when
+attempts, and only then lands in **Failed**. **Retry** and **Reschedule** start the five attempts afresh; publishing or scheduling the same post to the same account again does not. The dashboard shows a banner when
 something has failed, and [failure emails](scheduling.md#failure-alerts-optional)
 can tell you the next morning.
 
