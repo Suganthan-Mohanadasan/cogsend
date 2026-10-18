@@ -1,6 +1,9 @@
+import { storedXLimit } from './x-limits';
+
 /**
  * Character limits per platform, in one place. Mastodon's real limit is the
- * instance's own (`metaJson.maxCharacters`), so this is its fallback.
+ * instance's own (`metaJson.maxCharacters`), and X's is the account's own
+ * (280, or 25,000 on a paid plan), so these are their fallbacks.
  */
 export const PLATFORM_LIMITS = {
 	bluesky: 300,
@@ -28,6 +31,14 @@ export interface LimitedAccount {
  */
 export function platformLimit(platform: string, accounts: LimitedAccount[]): number {
 	const fallback = PLATFORM_LIMITS[platform as LimitedPlatform] ?? PLATFORM_LIMITS.mastodon;
+	if (platform === 'x') {
+		// An account with no stored limit (via Zernio, or connected before long
+		// posts) is a 280 one, and one such account holds the whole post to it.
+		const maxes = accounts
+			.filter((account) => account.platform === 'x')
+			.map((account) => storedXLimit(account.metaJson?.maxCharacters));
+		return maxes.length ? Math.min(...maxes) : fallback;
+	}
 	if (platform !== 'mastodon') return fallback;
 	const maxes = accounts
 		.filter((account) => account.platform === 'mastodon')

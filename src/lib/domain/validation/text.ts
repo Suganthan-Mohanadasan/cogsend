@@ -176,6 +176,6 @@ export function validateXText(
 	maxChars = X_MAX_CHARS
 ): { ok: boolean; length: number; max: number; message?: string } {
 	const length = xWeightedLength(text);
-	if (length > maxChars) return tooLong(length, maxChars, 'X max 280');
+	if (length > maxChars) return tooLong(length, maxChars, `X max ${maxChars}`);
 	return { ok: true, length, max: maxChars };
 }

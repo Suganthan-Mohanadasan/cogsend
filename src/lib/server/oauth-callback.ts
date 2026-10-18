@@ -47,6 +47,15 @@ export interface OAuthCallbackOptions {
 	 * was kept still match on the handle.
 	 */
 	accountIdKey?: string;
+	/**
+	 * The meta stored on a reconnect, given what the exchange returned and what
+	 * the row held. Without it the exchange's meta replaces the old one, which
+	 * would drop a setting the operator chose on the Accounts page.
+	 */
+	reconcileMeta?(
+		incoming: Record<string, unknown>,
+		existing: Record<string, unknown>
+	): Record<string, unknown>;
 	complete(input: {
 		pending: PendingRow;
 		code: string;
@@ -145,7 +154,13 @@ export function createOAuthCallback(opts: OAuthCallbackOptions): RequestHandler 
 				opts.accountIdKey
 			);
 			if (existing) {
-				await locals.db.update(connections).set(data).where(eq(connections.id, existing.id));
+				const meta = opts.reconcileMeta
+					? opts.reconcileMeta(exchanged.meta, parseJson(existing.metaJson, {}))
+					: exchanged.meta;
+				await locals.db
+					.update(connections)
+					.set({ ...data, metaJson: JSON.stringify(meta) })
+					.where(eq(connections.id, existing.id));
 			} else {
 				await locals.db.insert(connections).values({
 					id: newId(),

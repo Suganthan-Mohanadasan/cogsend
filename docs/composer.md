@@ -33,6 +33,8 @@ as 23 characters, and X also counts CJK characters and each emoji as 2.
 LinkedIn has no threads: a thread sent there is flattened into one post. The
 limits for every platform are in [OAuth apps → Platforms](oauth-apps.md#platforms).
 
+An X account on a paid plan can post up to 25,000 characters in one post ([how CogSend knows](accounts.md#long-posts-on-x)). The counter still follows the strictest account you picked, so adding a free X account holds the whole post to 280. X shows about the first 280 characters of a long post and folds the rest behind **Show more**, and the card says so once the text passes that point. If X refuses a long post, it fails without a retry and that account drops back to 280; the message says how to turn long posts on again.
+
 ## Images and alt text
 
 Each card takes up to four images. Every image has an alt-text field ("Describe

@@ -1,12 +1,15 @@
 import { and, eq, inArray, isNull, lte, ne, or } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
 import { STALE_CLAIM_MS } from '#lib/domain/due-jobs.js';
-import { chunkIds, first } from '#lib/server/db/client.js';
+import { xLimitFor } from '#lib/domain/x-limits.js';
+import { isZernioConnection } from '#lib/domain/zernio.js';
+import { chunkIds, first, parseJson } from '#lib/server/db/client.js';
 import { connections, publishAttempts, publishTargets } from '#lib/server/db/schema.js';
 import { fail, handleError, ok } from '#lib/server/http.js';
 import { refreshDraftStatuses } from '#lib/server/publish.js';
 import { draftHasInFlightPublish } from '#lib/server/publish-plan.js';
 import { requireSession } from '#lib/server/require.js';
+import { serializeConnection } from '#lib/server/serialize.js';
 
 export const DELETE: RequestHandler = async ({ params, locals }) => {
 	try {
@@ -98,6 +101,40 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 			await locals.db.delete(connections).where(eq(connections.id, conn.id));
 		}
 		return ok({ ok: true, removed: removable.length, archived });
+	} catch (err) {
+		return handleError(err);
+	}
+};
+
+/**
+ * The long-post switch on an X account: `true` or `false` overrides what X
+ * reported about the account's plan, and `null` goes back to that report.
+ * Session-only, like connecting: a key cannot change what an account may post.
+ */
+export const PATCH: RequestHandler = async ({ params, request, locals }) => {
+	try {
+		const user = requireSession(locals.user, locals.authMethod);
+		const body = (await request.json().catch(() => null)) as { longPosts?: unknown } | null;
+		const longPosts = body?.longPosts;
+		if (!body || !Object.hasOwn(body, 'longPosts')) return fail('Send longPosts', 400);
+		if (longPosts !== null && typeof longPosts !== 'boolean') {
+			return fail('longPosts must be true, false or null', 400);
+		}
+		const owned = and(eq(connections.id, params.id), eq(connections.userId, user.id));
+		const conn = await first(locals.db.select().from(connections).where(owned));
+		if (!conn) return fail('Not found', 404);
+		if (conn.platform !== 'x' || isZernioConnection(conn.metaJson)) {
+			return fail('Long posts can only be set on an X account connected directly', 400);
+		}
+		if (conn.status === 'disconnected')
+			return fail('Account disconnected — reconnect it first', 409);
+		const meta = parseJson<Record<string, unknown>>(conn.metaJson, {});
+		if (longPosts === null) delete meta.longPosts;
+		else meta.longPosts = longPosts;
+		meta.maxCharacters = xLimitFor(meta);
+		const metaJson = JSON.stringify(meta);
+		await locals.db.update(connections).set({ metaJson, updatedAt: new Date() }).where(owned);
+		return ok({ connection: serializeConnection({ ...conn, metaJson }) });
 	} catch (err) {
 		return handleError(err);
 	}

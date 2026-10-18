@@ -79,6 +79,7 @@
 	} from '#lib/domain/schedule-helpers.js';
 	import { localTimezoneShort } from '#lib/domain/relative-time.js';
 	import { splitLongText } from '#lib/domain/text-split.js';
+	import { X_FOLD } from '#lib/domain/x-limits.js';
 	import {
 		addSegment,
 		flattenThreadBody,
@@ -585,7 +586,10 @@
 				len: maxThreadSegmentLength(threadsText, countGraphemes),
 				max: PLATFORM_LIMITS.threads
 			},
-			x: { len: maxThreadSegmentLength(xText, xWeightedLength), max: PLATFORM_LIMITS.x }
+			x: {
+				len: maxThreadSegmentLength(xText, xWeightedLength),
+				max: platformMax('x', accountsFor('x'))
+			}
 		};
 	});
 	const blueskyBytesOver = $derived.by(() => {
@@ -3427,6 +3431,12 @@
 							/>
 						{:else}
 							<LinkPreview text={segment} hasMedia={segMedia.length > 0} />
+						{/if}
+
+						{#if xQuoteActive && counters.x.max > X_FOLD && xWeightedLength(segment) > X_FOLD}
+							<p class="mt-3 text-[12px] font-medium text-stone-500" data-testid="x-fold-{index}">
+								X shows about the first {X_FOLD} characters, then Show more.
+							</p>
 						{/if}
 
 						{#if strayLinks.length > 0 && !editLocked}

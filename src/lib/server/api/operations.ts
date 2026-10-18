@@ -89,7 +89,7 @@ export function validatePost(input: {
 		x = validateXText(text);
 	const issues =
 		platform && isPlatformId(platform)
-			? getProvider(platform).validate({ text }, { maxCharacters: maxCharacters ?? 500 })
+			? getProvider(platform).validate({ text }, { maxCharacters })
 			: [];
 	return {
 		graphemes: countGraphemes(text),

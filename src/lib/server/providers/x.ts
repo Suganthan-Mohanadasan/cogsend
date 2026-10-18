@@ -1,4 +1,5 @@
-import { validateXText } from '#lib/domain/validation/text.js';
+import { validateXText, xWeightedLength } from '#lib/domain/validation/text.js';
+import { storedXLimit, xLimitFor } from '#lib/domain/x-limits.js';
 import { mediaByteLength } from './types';
 import type {
 	ConnectionCredentials,
@@ -54,6 +55,31 @@ export function xPostUrl(postId: string, username?: string): string | null {
 		return `https://x.com/${username}/status/${encodeURIComponent(postId)}`;
 	}
 	return `https://x.com/i/status/${encodeURIComponent(postId)}`;
+}
+
+/**
+ * X answers a long post from an account without a paid plan with a 400 that
+ * says the text is too long. Paying accounts have also been refused with a
+ * bare 403 "not permitted" (devcommunity.x.com thread 260165), so a 403 on a
+ * long post counts too: either way, posting the same text again cannot work.
+ * A duplicate is also a 403, and says nothing about the account's plan.
+ */
+function isLongPostRefusal(status: number, body: string): boolean {
+	if (status === 403) return !/duplicate/i.test(body);
+	return status === 400 && /too long/i.test(body);
+}
+
+/** Holds the account to 280 from here on, until the operator says otherwise. */
+function longPostRefused(status: number, detail: string): ProviderError {
+	return new ProviderError(
+		'X refused a post over 280 characters. Long posts need X Premium on this account, so CogSend now holds it to 280. If it does have Premium, turn Long posts back on under Accounts.',
+		{
+			status,
+			code: 'forbidden',
+			detail,
+			metaPatch: { maxCharacters: X_MAX_CHARS, longPosts: false }
+		}
+	);
 }
 
 function isGif(m: MediaAttachment): boolean {
@@ -213,16 +239,31 @@ type XMe = {
 		username?: string;
 		name?: string;
 		profile_image_url?: string;
+		subscription_type?: string;
 	};
 };
 
 async function fetchMe(
 	accessToken: string,
 	fetchImpl: FetchLike
-): Promise<{ id: string; username?: string; name?: string; avatarUrl?: string }> {
-	const res = await fetchImpl(`${X_API}/2/users/me?user.fields=profile_image_url,verified`, {
-		headers: { Authorization: `Bearer ${accessToken}` }
-	});
+): Promise<{
+	id: string;
+	username?: string;
+	name?: string;
+	avatarUrl?: string;
+	subscriptionType?: string;
+}> {
+	const lookup = (fields: string) =>
+		fetchImpl(`${X_API}/2/users/me?user.fields=${fields}`, {
+			headers: { Authorization: `Bearer ${accessToken}` }
+		});
+	let res = await lookup('profile_image_url,verified,subscription_type');
+	// The plan is a hint, so an app X will not show it to costs only the hint:
+	// the account still connects, held to 280 until someone says otherwise.
+	if (res.status === 400 || res.status === 403) {
+		await res.body?.cancel().catch(() => {});
+		res = await lookup('profile_image_url,verified');
+	}
 	if (!res.ok) {
 		throw Object.assign(
 			new Error(`X profile lookup failed (${res.status}): ${(await res.text()).slice(0, 300)}`),
@@ -231,7 +272,16 @@ async function fetchMe(
 	}
 	const me = ((await res.json()) as XMe).data ?? {};
 	if (!me.id) throw new Error('X profile lookup returned no user id');
-	return { id: me.id, username: me.username, name: me.name, avatarUrl: me.profile_image_url };
+	return {
+		id: me.id,
+		username: me.username,
+		name: me.name,
+		avatarUrl: me.profile_image_url,
+		subscriptionType:
+			typeof me.subscription_type === 'string'
+				? me.subscription_type.trim() || undefined
+				: undefined
+	};
 }
 
 export async function xExchangeCode(
@@ -273,18 +323,29 @@ export async function xExchangeCode(
 		handle,
 		displayName: me.name || handle || 'X',
 		avatarUrl: me.avatarUrl,
-		maxCharacters: X_MAX_CHARS
+		xSubscription: me.subscriptionType,
+		maxCharacters: xLimitFor({ xSubscription: me.subscriptionType })
 	};
 }
 
 export async function xVerify(
 	creds: ConnectionCredentials,
 	fetchImpl: FetchLike = providerFetch
-): Promise<{ displayName?: string; avatarUrl?: string; handle?: string }> {
+): Promise<{
+	displayName?: string;
+	avatarUrl?: string;
+	handle?: string;
+	subscriptionType?: string;
+}> {
 	if (!creds.accessToken) throw new Error('Missing accessToken');
 	const me = await fetchMe(creds.accessToken, fetchImpl);
 	const handle = me.username ? `@${me.username}` : undefined;
-	return { displayName: me.name || handle, avatarUrl: me.avatarUrl, handle };
+	return {
+		displayName: me.name || handle,
+		avatarUrl: me.avatarUrl,
+		handle,
+		subscriptionType: me.subscriptionType
+	};
 }
 
 /**
@@ -461,8 +522,9 @@ export const xProvider: PlatformProvider = {
 		supportsThreads: true
 	},
 
-	validate(content: NormalizedPost): ValidationIssue[] {
+	validate(content: NormalizedPost, meta?: ConnectionMeta): ValidationIssue[] {
 		const issues: ValidationIssue[] = [];
+		const max = storedXLimit(meta?.maxCharacters);
 		const segments = content.thread && content.thread.length > 0 ? content.thread : [content];
 		for (let i = 0; i < segments.length; i++) {
 			const seg = segments[i];
@@ -475,7 +537,7 @@ export const xProvider: PlatformProvider = {
 					code: 'empty'
 				});
 			}
-			const check = validateXText(seg.text || '', X_MAX_CHARS);
+			const check = validateXText(seg.text || '', max);
 			if (!check.ok) {
 				issues.push({
 					field: `thread[${i}].text`,
@@ -541,10 +603,13 @@ export const xProvider: PlatformProvider = {
 					throw unconfirmedPostError('X', err);
 				}
 				if (!res.ok) {
-					throw Object.assign(
-						new Error(`X post failed (${res.status}): ${(await res.text()).slice(0, 300)}`),
-						{ status: res.status }
-					);
+					const detail = (await res.text()).slice(0, 300);
+					if (xWeightedLength(text) > X_MAX_CHARS && isLongPostRefusal(res.status, detail)) {
+						throw longPostRefused(res.status, detail);
+					}
+					throw Object.assign(new Error(`X post failed (${res.status}): ${detail}`), {
+						status: res.status
+					});
 				}
 				// A 2xx is a posted tweet even when its body cannot be read: retrying
 				// it for want of an id would post it twice.
@@ -574,7 +639,8 @@ export const xProvider: PlatformProvider = {
 				if (segmentIds.length) {
 					throw new PublishPartialError(message, {
 						segmentIds,
-						remoteUrl: firstUrl ?? opts?.resume?.remoteUrl ?? null
+						remoteUrl: firstUrl ?? opts?.resume?.remoteUrl ?? null,
+						metaPatch: err instanceof ProviderError ? err.metaPatch : undefined
 					});
 				}
 				throw err;

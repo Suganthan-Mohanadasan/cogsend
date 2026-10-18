@@ -1,11 +1,23 @@
 import { createOAuthCallback } from '#lib/server/oauth-callback.js';
 import { decryptSecret } from '#lib/server/crypto.js';
 import { unpackXPendingSecret, xExchangeCode } from '#lib/server/providers/index.js';
+import { xLimitFor } from '#lib/domain/x-limits.js';
 
 export const GET = createOAuthCallback({
 	platform: 'x',
 	pendingMarker: 'x',
 	accountIdKey: 'xUserId',
+	reconcileMeta(incoming, existing) {
+		// X can leave the plan out of a profile; the last one it gave still holds.
+		const xSubscription = incoming.xSubscription ?? existing.xSubscription;
+		const longPosts = typeof existing.longPosts === 'boolean' ? existing.longPosts : undefined;
+		const meta = {
+			...incoming,
+			...(typeof xSubscription === 'string' ? { xSubscription } : {}),
+			...(longPosts !== undefined ? { longPosts } : {})
+		};
+		return { ...meta, maxCharacters: xLimitFor(meta) };
+	},
 	async complete({ pending, code, env }) {
 		const packed = await decryptSecret(pending.clientSecretEnc, env.APP_ENCRYPTION_KEY);
 		const { clientSecret, codeVerifier } = unpackXPendingSecret(packed);
@@ -32,7 +44,11 @@ export const GET = createOAuthCallback({
 			displayName: exchanged.displayName,
 			handle: exchanged.handle,
 			avatarUrl: exchanged.avatarUrl,
-			meta: { xUserId: exchanged.xUserId, maxCharacters: 280 }
+			meta: {
+				xUserId: exchanged.xUserId,
+				...(exchanged.xSubscription ? { xSubscription: exchanged.xSubscription } : {}),
+				maxCharacters: exchanged.maxCharacters
+			}
 		};
 	}
 });

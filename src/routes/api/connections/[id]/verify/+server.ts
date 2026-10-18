@@ -16,6 +16,7 @@ import {
 } from '#lib/server/providers/index.js';
 import { mastodonVerifyCredentials } from '#lib/server/providers/mastodon.js';
 import { isLocalAppUrl } from '#lib/domain/app-url.js';
+import { xLimitFor, type XLimitMeta } from '#lib/domain/x-limits.js';
 import { requireSession } from '#lib/server/require.js';
 import { isZernioAccountDead, listAccounts } from '#lib/server/zernio.js';
 
@@ -252,6 +253,12 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 				resolvedUsername !== checkCreds.xUsername &&
 				checkCreds.xUserId &&
 				resolvedUsername !== checkCreds.xUserId;
+			// A plan bought or cancelled since connecting shows up here. X leaves
+			// the field out for some tokens, and then the stored answer stands.
+			const meta = parseJson<Record<string, unknown> & XLimitMeta>(conn.metaJson, {});
+			const detected = info.subscriptionType
+				? { ...meta, xSubscription: info.subscriptionType }
+				: null;
 			await locals.db
 				.update(connections)
 				.set({
@@ -259,6 +266,9 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 					displayName: info.displayName || conn.displayName,
 					avatarUrl: info.avatarUrl || conn.avatarUrl,
 					handle: info.handle || conn.handle,
+					...(detected
+						? { metaJson: JSON.stringify({ ...detected, maxCharacters: xLimitFor(detected) }) }
+						: {}),
 					...(needsCredsUsername
 						? {
 								credentialsEncrypted: await encryptJson(

@@ -27,6 +27,14 @@ Once the secrets are on the Worker, reload the page and connect as usual.
 If you would rather not set up an app, you can connect these through
 [Zernio](zernio.md) instead.
 
+## Long posts on X
+
+An X account connected directly shows whether it can post long: **Long posts on, up to 25,000 characters** or **Long posts off, 280 characters**, and where that came from. CogSend asks X for the account's plan when you connect it and when you press **Check plan**, and any paid plan (Basic, Premium or Premium+) turns long posts on.
+
+Some accounts that can post long, such as Verified Organizations, report no plan, so **Turn on** and **Turn off** let you decide. **Use what X reports** goes back to the plan. A reconnect keeps your choice. If X refuses a long post, CogSend turns long posts off for that account; turn them back on if it does have a paid plan.
+
+X accounts connected through [Zernio](zernio.md) stay at 280, since Zernio's X route stops there.
+
 ## When an account needs reconnecting
 
 A token that stops working marks the account as needing a reconnect, both here and

@@ -91,6 +91,9 @@ export interface ConnectionMeta {
 	personUrn?: string;
 	threadsUserId?: string;
 	xUserId?: string;
+	/** X: the last `subscription_type` seen, and the operator's long-post switch. */
+	xSubscription?: string;
+	longPosts?: boolean;
 	provider?: 'zernio';
 	zernioAccountId?: string;
 	zernioProfileId?: string;
@@ -141,16 +144,24 @@ export class ProviderError extends Error {
 	 * codes/subcodes the 300-char message slice cuts off.
 	 */
 	readonly detail?: string;
+	/** What the failure proved about the account, merged into its metaJson. */
+	readonly metaPatch?: Record<string, unknown>;
 
 	constructor(
 		message: string,
-		opts: { status?: number; code?: ProviderErrorCode; detail?: string } = {}
+		opts: {
+			status?: number;
+			code?: ProviderErrorCode;
+			detail?: string;
+			metaPatch?: Record<string, unknown>;
+		} = {}
 	) {
 		super(message);
 		this.name = 'ProviderError';
 		this.status = opts.status;
 		this.code = opts.code;
 		this.detail = opts.detail;
+		this.metaPatch = opts.metaPatch;
 		this.retryable =
 			opts.code === 'rate_limited' || opts.code === 'network' || opts.code === 'upstream';
 	}
@@ -220,15 +231,23 @@ export class PublishPartialError extends Error {
 	readonly segmentIds: string[];
 	readonly segmentCids?: string[];
 	readonly remoteUrl?: string | null;
+	/** Carried over from the ProviderError that stopped the thread. */
+	readonly metaPatch?: Record<string, unknown>;
 
 	constructor(
 		message: string,
-		opts: { segmentIds: string[]; segmentCids?: string[]; remoteUrl?: string | null }
+		opts: {
+			segmentIds: string[];
+			segmentCids?: string[];
+			remoteUrl?: string | null;
+			metaPatch?: Record<string, unknown>;
+		}
 	) {
 		super(message);
 		this.name = 'PublishPartialError';
 		this.segmentIds = opts.segmentIds;
 		this.segmentCids = opts.segmentCids;
+		this.metaPatch = opts.metaPatch;
 		this.remoteUrl = opts.remoteUrl;
 	}
 }

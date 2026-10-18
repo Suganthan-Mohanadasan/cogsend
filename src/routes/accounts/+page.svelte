@@ -27,6 +27,7 @@
 	import { dialogFocus } from '#lib/components/dialog-focus.js';
 	import { ZERNIO_API_KEYS_URL } from '#lib/domain/zernio.js';
 	import { zernioLink } from '#lib/domain/zernio-links.js';
+	import { isPaidXSubscription } from '#lib/domain/x-limits.js';
 
 	let { data } = $props();
 
@@ -38,7 +39,13 @@
 		avatarUrl?: string | null;
 		instanceUrl: string | null;
 		status: string;
-		metaJson?: { provider?: string; zernioProfileId?: string } | null;
+		metaJson?: {
+			provider?: string;
+			zernioProfileId?: string;
+			maxCharacters?: number;
+			xSubscription?: string;
+			longPosts?: boolean;
+		} | null;
 	};
 	type ZernioAccount = {
 		id: string;
@@ -56,6 +63,16 @@
 	const isZernioPlatform = (p: string): p is (typeof ZERNIO_PLATFORMS)[number] =>
 		(ZERNIO_PLATFORMS as readonly string[]).includes(p);
 	const viaZernio = (account: Connection) => account.metaJson?.provider === 'zernio';
+
+	/** What the long-post line says decided it: the operator, or X's report. */
+	function longPostSource(account: Connection): string {
+		const meta = account.metaJson ?? {};
+		if (typeof meta.longPosts === 'boolean') return 'set by you';
+		if (!meta.xSubscription) return 'plan not checked yet';
+		if (!isPaidXSubscription(meta.xSubscription)) return 'X reports no paid plan';
+		const plan = meta.xSubscription === 'PremiumPlus' ? 'Premium+' : meta.xSubscription;
+		return `X reports ${plan}`;
+	}
 
 	// Same order load() applies after a refresh, so the first paint matches it.
 	// svelte-ignore state_referenced_locally
@@ -529,19 +546,43 @@
 		void verify(account.id);
 	}
 
-	async function verify(id: string) {
+	async function verify(id: string, done = 'Account is active again') {
 		verifying = id;
 		err = null;
 		try {
 			const res = await fetch(`/api/connections/${id}/verify`, { method: 'POST' });
 			const payload = await res.json();
 			if (!res.ok) throw new Error(payload.error || 'Could not verify');
-			msg = 'Account is active again';
+			msg = done;
 			await load();
 		} catch (e) {
 			err = humanizeError(e instanceof Error ? e.message : 'Could not verify');
 		} finally {
 			verifying = null;
+		}
+	}
+
+	let savingLongPosts = $state<string | null>(null);
+
+	/** `null` hands the decision back to what X reports. */
+	async function setLongPosts(account: Connection, longPosts: boolean | null) {
+		savingLongPosts = account.id;
+		err = null;
+		try {
+			const res = await fetch(`/api/connections/${account.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ longPosts })
+			});
+			const payload = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(payload.error || 'Could not change long posts');
+			connections = connections.map((c) =>
+				c.id === account.id ? { ...c, metaJson: payload.connection.metaJson } : c
+			);
+		} catch (e) {
+			err = humanizeError(e instanceof Error ? e.message : 'Could not change long posts');
+		} finally {
+			savingLongPosts = null;
 		}
 	}
 
@@ -662,6 +703,40 @@
 								{/if}
 								{account.instanceUrl ? ` · ${displayHost(account.instanceUrl)}` : ''}
 							</p>
+							{#if account.platform === 'x' && !viaZernio(account) && !needsReconnect}
+								{@const long = (account.metaJson?.maxCharacters ?? 280) > 280}
+								<p
+									class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] font-medium text-stone-500"
+									data-testid="x-long-posts-{account.id}"
+								>
+									<span>
+										Long posts {long ? 'on, up to 25,000 characters' : 'off, 280 characters'} ·
+										{longPostSource(account)}
+									</span>
+									<button
+										type="button"
+										onclick={() => setLongPosts(account, !long)}
+										disabled={savingLongPosts === account.id}
+										class="font-bold text-stone-900 underline"
+										>{long ? 'Turn off' : 'Turn on'}</button
+									>
+									{#if typeof account.metaJson?.longPosts === 'boolean'}
+										<button
+											type="button"
+											onclick={() => setLongPosts(account, null)}
+											disabled={savingLongPosts === account.id}
+											class="font-bold text-stone-500 underline">Use what X reports</button
+										>
+									{/if}
+									<button
+										type="button"
+										onclick={() => verify(account.id, 'Checked with X')}
+										disabled={verifying === account.id}
+										class="font-bold text-stone-500 underline"
+										>{verifying === account.id ? 'Checking…' : 'Check plan'}</button
+									>
+								</p>
+							{/if}
 						</div>
 					</div>
 					<div class="mt-2 flex items-center justify-between gap-3 sm:mt-0 sm:justify-end">

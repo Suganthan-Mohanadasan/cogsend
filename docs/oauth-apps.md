@@ -97,13 +97,13 @@ cannot succeed. Mastodon and Bluesky keep working either way.
 
 ## Platforms
 
-| Platform | Auth                                                                     | Text                       | Images                                 | Threads                      |
-| -------- | ------------------------------------------------------------------------ | -------------------------- | -------------------------------------- | ---------------------------- |
-| Mastodon | OAuth (per instance)                                                     | instance max (default 500) | 4, 16MB                                | yes                          |
-| Bluesky  | handle + app password                                                    | 300                        | 4, 2MB                                 | yes                          |
-| LinkedIn | OAuth (`openid profile email w_member_social`)                           | 3000                       | 4, 8MB (no WebP)                       | no — flattened into one post |
-| Threads  | OAuth (`threads_basic threads_content_publish` `threads_manage_replies`) | 500, max 5 links           | 4 uploadable, 10 allowed, 8MB JPEG/PNG | yes                          |
-| X        | OAuth 2.0 + PKCE                                                         | 280, max 1 cashtag         | 4, 5MB (15MB GIF)                      | yes                          |
+| Platform | Auth                                                                     | Text                                         | Images                                 | Threads                      |
+| -------- | ------------------------------------------------------------------------ | -------------------------------------------- | -------------------------------------- | ---------------------------- |
+| Mastodon | OAuth (per instance)                                                     | instance max (default 500)                   | 4, 16MB                                | yes                          |
+| Bluesky  | handle + app password                                                    | 300                                          | 4, 2MB                                 | yes                          |
+| LinkedIn | OAuth (`openid profile email w_member_social`)                           | 3000                                         | 4, 8MB (no WebP)                       | no — flattened into one post |
+| Threads  | OAuth (`threads_basic threads_content_publish` `threads_manage_replies`) | 500, max 5 links                             | 4 uploadable, 10 allowed, 8MB JPEG/PNG | yes                          |
+| X        | OAuth 2.0 + PKCE                                                         | 280 (25,000 with a paid plan), max 1 cashtag | 4, 5MB (15MB GIF)                      | yes                          |
 
 LinkedIn rejects WebP at publish time — upload JPEG, PNG or GIF.
 
