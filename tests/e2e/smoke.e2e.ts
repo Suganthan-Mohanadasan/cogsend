@@ -624,7 +624,7 @@ test('a saved draft restores the accounts it was written for', async () => {
 	await expect(page.getByTestId('destinations-toggle')).toContainText('1 selected');
 });
 
-test('publish without asking runs headless and still reports failures', async () => {
+test('publish without asking hands off at once and still reports failures', async () => {
 	test.setTimeout(120_000);
 	await page.evaluate(() => localStorage.setItem('cogsend-skip-publish-confirm', '1'));
 	await page.goto('/compose');
@@ -632,12 +632,14 @@ test('publish without asking runs headless and still reports failures', async ()
 	// No confirmation dialog: the click publishes straight away.
 	await page.getByTestId('publish-now').click();
 	await expect(page.getByTestId('publish-confirm-destinations')).toHaveCount(0);
-	await expect(page.getByText(/isn’t allowed|needs reconnect|failed/i).first()).toBeVisible({
-		timeout: 30000
-	});
-	// The button returns to its idle label once every destination settled.
-	await expect(page.getByTestId('publish-now')).toHaveText(/^Publish\s*$/, { timeout: 30000 });
-	await expect(page.getByTestId('segment-input-0')).toHaveValue('skip-ask fan-out probe');
+	// Handed off like a confirmed publish: the composer is free at once.
+	await expect(page.getByTestId('segment-input-0')).toHaveValue('', { timeout: 30000 });
+	await expect(page.getByTestId('publish-now')).toHaveText(/^Publish\s*$/);
+	// The failure still comes back, as a toast that stays until dismissed.
+	const toast = page.getByTestId('publish-toast');
+	await expect(toast).toContainText('Failed on', { timeout: 30000 });
+	await expect(toast).toHaveAttribute('role', 'alert');
+	await page.getByTestId('toast-dismiss').click();
 	await page.evaluate(() => localStorage.removeItem('cogsend-skip-publish-confirm'));
 });
 
