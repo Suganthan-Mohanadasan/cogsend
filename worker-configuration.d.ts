@@ -22,19 +22,39 @@ interface D1Database {
 	batch<T>(statements: D1PreparedStatement[]): Promise<T[]>;
 }
 
+interface R2MultipartUpload {
+	readonly uploadId: string;
+	uploadPart(
+		partNumber: number,
+		value: ReadableStream | ArrayBuffer | ArrayBufferView | string | Blob
+	): Promise<{ partNumber: number; etag: string }>;
+	complete(parts: { partNumber: number; etag: string }[]): Promise<{ size: number }>;
+	abort(): Promise<void>;
+}
+
 interface R2Bucket {
 	get(
 		key: string,
 		options?: { range?: { offset?: number; length?: number } }
-	): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; body: ReadableStream; size: number } | null>;
+	): Promise<{
+		arrayBuffer(): Promise<ArrayBuffer>;
+		body: ReadableStream;
+		size: number;
+		httpMetadata?: { contentType?: string };
+	} | null>;
 	head(key: string): Promise<{ size: number } | null>;
 	put(
 		key: string,
-		value: ArrayBuffer | ArrayBufferView | string | Blob,
+		value: ReadableStream | ArrayBuffer | ArrayBufferView | string | Blob,
 		options?: { httpMetadata?: { contentType?: string } }
 	): Promise<unknown>;
 	/** One key, or up to 1,000 at once — the bulk form is one subrequest. */
 	delete(key: string | string[]): Promise<void>;
+	createMultipartUpload(
+		key: string,
+		options?: { httpMetadata?: { contentType?: string } }
+	): Promise<R2MultipartUpload>;
+	resumeMultipartUpload(key: string, uploadId: string): R2MultipartUpload;
 }
 
 interface Env {
@@ -86,10 +106,6 @@ interface Env {
 	/** Local-dev only: skips 2FA. Honored only while the resolved URL is a
 	 *  localhost one, so it cannot weaken a real deployment. */
 	SKIP_TOTP?: string;
-	/** Set to "1" to enable video uploads (LinkedIn). The path is wired but not
-	 *  verified against the live API yet, so it is off by default: the editor
-	 *  hides the affordance and the API refuses video files without it. */
-	ENABLE_VIDEO_UPLOAD?: string;
 }
 
 /** Cloudflare's Rate Limiting binding: `limit()` costs no network round trip and

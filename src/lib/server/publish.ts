@@ -9,6 +9,7 @@ import {
 	parseThreadsMetaMarker
 } from '#lib/domain/threads-error.js';
 import { decodeImageDimensions } from './image-dimensions';
+import { coverKey, type StoredVideoMeta } from './media';
 import { parsePollConfig } from '#lib/domain/poll.js';
 import { signPublicMediaUrl } from './public-media';
 import { resolvePublishSegments } from '#lib/domain/thread-segments.js';
@@ -30,11 +31,16 @@ import {
 	providerFor,
 	ProviderError,
 	PublishPartialError,
+	PROCESSING_MARK,
 	UNCONFIRMED_POST_MARK,
 	ZERNIO_MAX_POLLS,
 	type ConnectionCredentials,
+	type ConnectionMeta,
 	type FetchLike,
+	type MediaReader,
 	type PublishCheckpoint,
+	type PublishPending,
+	type PublishResume,
 	type MediaStore,
 	type NormalizedPost
 } from './providers';
@@ -43,6 +49,10 @@ import { countingFetch, type SubrequestBudget } from './budget';
 
 /** Scheduler stops auto-retrying a target after this many claims; manual retry stays available. */
 export const MAX_PUBLISH_ATTEMPTS = 5;
+
+/** A video still processing after this long is given up on, so a platform
+ *  that never finishes cannot keep a target parked for ever. */
+export const VIDEO_PROCESSING_DEADLINE_MS = 45 * 60_000;
 
 // Exponential backoff for retryable failures: 1m, 2m, 4m, 8m … capped at 30m.
 // Without this, a 429 parks as past-due `scheduled` and the next tick hammers
@@ -126,14 +136,18 @@ export async function buildNormalizedPost(
 	const body = variant?.body ?? draft.baseBody;
 	const options = parseJson<Record<string, unknown>>(variant?.optionsJson, {});
 
-	const toAttachment = (m: (typeof media)[number]) => ({
-		storageKey: m.storageKey,
-		mime: m.mime,
-		size: m.size,
-		alt: m.altText || undefined,
-		width: m.width ?? undefined,
-		height: m.height ?? undefined
-	});
+	const toAttachment = (m: (typeof media)[number]) => {
+		const video = isVideoMedia(m) ? parseJson<StoredVideoMeta | null>(m.metaJson, null) : null;
+		return {
+			storageKey: m.storageKey,
+			mime: m.mime,
+			size: m.size,
+			alt: m.altText || undefined,
+			width: m.width ?? undefined,
+			height: m.height ?? undefined,
+			...(video ? { video, coverKey: video.cover ? coverKey(m.storageKey) : undefined } : {})
+		};
+	};
 
 	const mediaForSegment = (segmentIndex: number) =>
 		media.filter((m) => (m.segmentIndex ?? 0) === segmentIndex).map(toAttachment);
@@ -200,6 +214,9 @@ async function hydrateMedia(content: NormalizedPost, store: MediaStore): Promise
 			? await Promise.all(
 					post.media.map(async (m) => {
 						let next = m;
+						// Videos are read in slices by the provider (opts.mediaReader):
+						// a 300 MB file does not fit in the isolate's 128 MB.
+						if (isVideoMedia(next)) return next;
 						if (!next.bytes && next.storageKey) {
 							const bytes = await store.get(next.storageKey);
 							if (bytes) next = { ...next, bytes };
@@ -271,10 +288,13 @@ export function publishCallEstimate(platform: string, content: NormalizedPost): 
 	// and draft status, a checkpoint per segment, and one more for whichever of
 	// a credential write, a lease renewal or a connection-status fix happens.
 	const database = 8 + segments.length;
-	// One read per attachment, except where the platform is handed URLs instead
+	// One read per image, except where the platform is handed URLs instead
 	// (PlatformProvider.mediaByUrl): then publish reads nothing from storage.
-	let storage = media.length;
-	let platformCalls = 1;
+	let storage = images.length;
+	// A video is resumable work: the provider parks it when the request runs
+	// low (opts.callsLeft) and the next tick carries on, so it needs room to
+	// start and to park, not room to finish.
+	let platformCalls = 1 + videos.length * VIDEO_START_CALLS;
 	switch (platform) {
 		case 'x':
 			for (const m of images) {
@@ -296,9 +316,6 @@ export function publishCallEstimate(platform: string, content: NormalizedPost): 
 			break;
 		case 'linkedin':
 			platformCalls += images.length * 2 + 1;
-			for (const v of videos) {
-				platformCalls += 2 + Math.max(1, Math.ceil((v.size ?? v.bytes?.length ?? 0) / 4_194_304));
-			}
 			if (!media.length && hasLink(content)) platformCalls += 5;
 			break;
 		case 'threads':
@@ -306,12 +323,13 @@ export function publishCallEstimate(platform: string, content: NormalizedPost): 
 			// carousel adds a container and polls per item; the permalink lookup
 			// and the identity check run once.
 			platformCalls += segments.length * 4 + images.length * 3 + 4;
+			platformCalls -= videos.length * (VIDEO_START_CALLS - 3);
 			storage = 0;
 			break;
 		case 'zernio':
 			// One create and the status polls; media travels as URLs, so there
 			// are no uploads and no storage reads.
-			platformCalls += ZERNIO_MAX_POLLS;
+			platformCalls = 1 + ZERNIO_MAX_POLLS;
 			storage = 0;
 			break;
 		default:
@@ -319,6 +337,9 @@ export function publishCallEstimate(platform: string, content: NormalizedPost): 
 	}
 	return database + storage + platformCalls;
 }
+
+/** Platform calls and slice reads a video needs before it can park. */
+const VIDEO_START_CALLS = 12;
 
 /** Calls the caller still needs after a publish returns (reads for the
  *  response, the draft status, the failure digest on a tick). */
@@ -521,7 +542,10 @@ export async function publishTarget(
 
 	// A holder rather than a `let`: the assignment happens inside the callback,
 	// which TypeScript's narrowing cannot see from the catch block below.
-	const resumeState: { last: PublishCheckpoint | null } = { last: null };
+	const resumeState: { last: PublishCheckpoint | null; from: PublishResume | null } = {
+		last: null,
+		from: null
+	};
 	const checkpoint = async (state: PublishCheckpoint) => {
 		resumeState.last = state;
 		await renewLease();
@@ -547,18 +571,13 @@ export async function publishTarget(
 			conn.credentialsEncrypted,
 			env.APP_ENCRYPTION_KEY
 		);
-		const meta = parseJson<{ maxCharacters?: number; handle?: string }>(conn.metaJson, {});
+		const meta = parseJson<ConnectionMeta>(conn.metaJson, {});
 		const provider = providerFor(conn);
 		const built = prebuilt ?? (await buildNormalizedPost(db, target.draftId, conn.platform));
 		const content = provider.mediaByUrl ? built : await hydrateMedia(built, store);
-		// A row uploaded before the feature was switched off (or on another
-		// instance) must fail with something a person can act on.
-		if (!env.videoUploadEnabled && (content.media ?? []).some(isVideoMedia)) {
-			throw new Error('Video uploads are not enabled on this instance');
-		}
 
 		const issues = provider.validate(content, {
-			maxCharacters: meta.maxCharacters,
+			...meta,
 			handle: meta.handle || conn.handle || undefined
 		});
 		if (issues.length) throw new Error(issues.map((i) => i.message).join('; '));
@@ -607,7 +626,8 @@ export async function publishTarget(
 			}
 		}
 
-		const resumeFrom = await lastPartialResume(db, targetId);
+		resumeState.from = await lastPartialResume(db, targetId);
+		const resumeFrom = resumeState.from;
 		// The upload-heavy part of a publish lives inside provider.publish; make
 		// sure the lease is current before handing over to it.
 		await renewLease();
@@ -632,6 +652,8 @@ export async function publishTarget(
 					resume: resumeFrom ?? undefined,
 					allowLocalHosts: isLocalAppUrl(env.APP_URL),
 					mediaUrlFor: (storageKey: string) => publicMediaUrlFor(env, storageKey),
+					mediaReader: mediaReaderFor(store),
+					callsLeft: () => options.budget?.remaining ?? Infinity,
 					checkpoint,
 					// Deliberately not attempt-scoped: the whole point is that a
 					// retry of the same target and segment carries the same key, so
@@ -717,6 +739,10 @@ export async function publishTarget(
 		}
 		const partial = err instanceof PublishPartialError ? err : null;
 		const errorDetail = err instanceof ProviderError ? (err.detail ?? null) : null;
+		const parked = parkedVideo(err, resumeState.from?.pending ?? null, now.getTime());
+		const finalMessage = parked?.expired
+			? `${message.split(` ${PROCESSING_MARK}`)[0]} took too long to process the video — Retry starts it again`
+			: message;
 		// The returned status is what callers report to the UI: `scheduled`
 		// means "retrying automatically", `failed` means terminal.
 		const nextStatus = await markFailed(
@@ -724,11 +750,13 @@ export async function publishTarget(
 			targetId,
 			target.draftId,
 			attemptId,
-			message,
+			finalMessage,
 			claimedGeneration,
 			{
 				scheduledFor: target.scheduledFor,
-				retryable: isFailureRetryable(err, message),
+				retryable: parked?.expired ? false : isFailureRetryable(err, message),
+				park: parked && !parked.expired ? parked : null,
+				resume: resumeState.from,
 				now,
 				partial,
 				errorDetail,
@@ -739,8 +767,48 @@ export async function publishTarget(
 				lastCheckpoint: resumeState.last
 			}
 		);
-		return { status: nextStatus, error: message };
+		return { status: nextStatus, error: finalMessage };
 	}
+}
+
+/** The store's streaming reads, when it has them all (R2 and the test store do). */
+function mediaReaderFor(store: MediaStore): MediaReader | undefined {
+	if (!store.getRange || !store.size || !store.open) return undefined;
+	return {
+		getRange: store.getRange.bind(store),
+		size: store.size.bind(store),
+		open: store.open.bind(store)
+	};
+}
+
+/**
+ * A provider parked a video (code `processing`): when to look again, and the
+ * pending state to resume from. The clock starts when this video was first
+ * parked, so a different video, or a different segment, starts it afresh.
+ */
+function parkedVideo(
+	err: unknown,
+	prior: PublishPending | null,
+	nowMs: number
+): { pending: PublishPending; retryAt: Date; expired: boolean } | null {
+	const source =
+		err instanceof ProviderError && err.code === 'processing'
+			? err
+			: err instanceof PublishPartialError && err.pending
+				? err
+				: null;
+	if (!source?.pending) return null;
+	const same =
+		prior &&
+		prior.segment === source.pending.segment &&
+		prior.storageKey === source.pending.storageKey;
+	const startedAt = same ? prior.startedAt : nowMs;
+	const wait = Math.min(Math.max(source.retryAfterMs ?? 30_000, 15_000), 10 * 60_000);
+	return {
+		pending: { ...source.pending, startedAt },
+		retryAt: new Date(nowMs + wait),
+		expired: nowMs - startedAt > VIDEO_PROCESSING_DEADLINE_MS
+	};
 }
 
 /**
@@ -793,7 +861,19 @@ async function lastPartialResume(db: AppDb, targetId: string) {
 			segmentCids?: string[];
 			remoteUrl?: string | null;
 			remotePostId?: string;
+			pending?: PublishPending | null;
 		}>(attempt.responseSummary, {});
+		// A parked video resumes even before any segment is posted, which is
+		// what an empty list otherwise means.
+		const pending = validPending(summary.pending);
+		if (pending) {
+			return {
+				segmentIds: Array.isArray(summary.segmentIds) ? summary.segmentIds : [],
+				segmentCids: summary.segmentCids,
+				remoteUrl: summary.remoteUrl ?? null,
+				pending
+			};
+		}
 		// An empty list is a statement, not an absence: the provider found the
 		// remote post it was resuming dead and asked for a fresh start.
 		if (Array.isArray(summary.segmentIds)) {
@@ -806,6 +886,21 @@ async function lastPartialResume(db: AppDb, targetId: string) {
 		}
 	}
 	return null;
+}
+
+function validPending(value: unknown): PublishPending | null {
+	if (!value || typeof value !== 'object') return null;
+	const p = value as Partial<PublishPending>;
+	if (
+		typeof p.segment !== 'number' ||
+		typeof p.storageKey !== 'string' ||
+		typeof p.startedAt !== 'number' ||
+		!p.state ||
+		typeof p.state !== 'object'
+	) {
+		return null;
+	}
+	return { segment: p.segment, storageKey: p.storageKey, startedAt: p.startedAt, state: p.state };
 }
 
 async function markFailed(
@@ -822,11 +917,20 @@ async function markFailed(
 		partial?: PublishPartialError | null;
 		errorDetail?: string | null;
 		lastCheckpoint?: PublishCheckpoint | null;
+		/** A video still processing: look again at `retryAt`, from `pending`. */
+		park?: { pending: PublishPending; retryAt: Date } | null;
+		/** What this run resumed from, so a pending video it did not finish
+		 *  survives a retryable failure. */
+		resume?: PublishResume | null;
 	} = {}
 ): Promise<'scheduled' | 'failed' | 'published'> {
 	const now = opts.now ?? new Date();
-	const nextStatus =
-		claimedGeneration >= MAX_PUBLISH_ATTEMPTS
+	const park = opts.park ?? null;
+	// Waiting on a platform is not a failed attempt: a long video could
+	// otherwise spend all five before it is ready.
+	const nextStatus = park
+		? 'scheduled'
+		: claimedGeneration >= MAX_PUBLISH_ATTEMPTS
 			? 'failed'
 			: statusAfterFailedPublish({
 					retryable: Boolean(opts.retryable),
@@ -836,8 +940,8 @@ async function markFailed(
 	// Backoff for manual failures and past-due schedules; a future schedule
 	// keeps its own time. The scheduler tick claims `scheduled` rows once due,
 	// so a retryable manual publish retries itself instead of parking.
-	let retryAt: Date | undefined;
-	if (nextStatus === 'scheduled') {
+	let retryAt: Date | undefined = park?.retryAt;
+	if (nextStatus === 'scheduled' && !park) {
 		const when = opts.scheduledFor
 			? opts.scheduledFor instanceof Date
 				? opts.scheduledFor.getTime()
@@ -854,6 +958,9 @@ async function markFailed(
 			errorMessage: message,
 			jobId: null,
 			...(retryAt ? { scheduledFor: retryAt } : {}),
+			// Handing the claim back is safe: every write of a run is also fenced
+			// on status 'publishing', which a parked row has left.
+			...(park ? { attemptCount: claimedGeneration - 1 } : {}),
 			updatedAt: now
 		})
 		.where(
@@ -869,15 +976,28 @@ async function markFailed(
 		// user-facing message slice cuts off). Resume parsing only reads
 		// segment keys, so the extra field is inert there.
 		const summary: Record<string, unknown> = {};
-		if (opts.partial) {
-			summary.segmentIds = opts.partial.segmentIds;
-			summary.segmentCids = opts.partial.segmentCids;
-			summary.remoteUrl = opts.partial.remoteUrl ?? null;
-		} else if (opts.lastCheckpoint) {
-			summary.segmentIds = opts.lastCheckpoint.segmentIds;
-			summary.segmentCids = opts.lastCheckpoint.segmentCids;
-			summary.remoteUrl = opts.lastCheckpoint.remoteUrl ?? null;
+		// A run that resumed a pending video and posted nothing new still owes
+		// the next run those segments; otherwise an older attempt's pending
+		// state would be read back after it was given up on.
+		const carried =
+			opts.partial ??
+			opts.lastCheckpoint ??
+			(park || opts.resume?.pending ? (opts.resume ?? null) : null);
+		if (carried) {
+			summary.segmentIds = carried.segmentIds;
+			summary.segmentCids = carried.segmentCids;
+			summary.remoteUrl = carried.remoteUrl ?? null;
+		} else if (park) {
+			summary.segmentIds = [];
 		}
+		const pending =
+			park?.pending ??
+			(nextStatus === 'scheduled' &&
+			opts.resume?.pending &&
+			opts.resume.pending.segment >= ((summary.segmentIds as string[] | undefined)?.length ?? 0)
+				? opts.resume.pending
+				: null);
+		if (pending) summary.pending = pending;
 		if (opts.errorDetail) summary.errorDetail = opts.errorDetail;
 		await db
 			.update(publishAttempts)
@@ -970,6 +1090,22 @@ export function isRetryableError(message: string): boolean {
 	// The post may already be live (unconfirmedPostError). A thread that failed
 	// part-way is classified by its message alone, so the code is not enough.
 	if (lower.includes(UNCONFIRMED_POST_MARK)) return false;
+	// A parked video is waited on, not failed (processingError); the rules in
+	// #lib/domain/video-rules describe the file, which a retry does not change.
+	if (lower.includes(PROCESSING_MARK)) return true;
+	if (lower.includes('took too long to process the video')) return false;
+	if (
+		lower.includes('missing from storage') ||
+		lower.includes('one video per post') ||
+		lower.includes('cannot mix with images')
+	)
+		return false;
+	if (
+		/takes videos (up to|between)|needs a video of at least|frames a second|index at the start of the file|needs [a-z0-9. ]+ video — this one/.test(
+			lower
+		)
+	)
+		return false;
 	if (lower.includes('grapheme') || lower.includes('characters on this')) return false;
 	if (lower.includes('segment needs') || lower.includes('empty')) return false;
 	if (lower.includes('max 4 images') || lower.includes('max 4 photos')) return false;
@@ -980,10 +1116,6 @@ export function isRetryableError(message: string): boolean {
 	if (/x max \d+/.test(lower) || lower.includes('max 1 cashtag')) return false;
 	// The same long text to the same account fails the same way: see x.ts.
 	if (lower.includes('x refused a post over 280')) return false;
-	// Video while ENABLE_VIDEO_UPLOAD is off: only the operator can change this,
-	// so retrying on a backoff wastes the attempt budget and buries the reason.
-	if (lower.includes('video uploads are not enabled')) return false;
-	if (lower.includes('x video is not supported')) return false;
 	if (lower.includes('utf-8 bytes') || lower.includes('max 16mb')) return false;
 	// The app's own host allowlist rejected the stored instance (Mastodon:
 	// "Instance host not allowed", Bluesky: "PDS host not allowed"). That is

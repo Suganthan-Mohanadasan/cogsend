@@ -12,11 +12,12 @@ import {
 } from '#lib/server/db/schema.js';
 import { POST as duplicatePOST } from '../src/routes/api/drafts/[id]/duplicate/+server';
 import { DELETE as draftDELETE } from '../src/routes/api/drafts/[id]/+server';
+import { buildMp4 } from './mp4-fixture';
 
 // Real magic bytes: the duplicate route re-sniffs attachment bytes instead of
 // trusting the row, so the fixtures have to be shaped like the media they claim.
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
-const MP4_BYTES = new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]);
+const MP4_BYTES = buildMp4();
 
 describe('POST /api/drafts/[id]/duplicate', () => {
 	let db: AppDb;

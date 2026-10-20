@@ -141,7 +141,8 @@ export const draftMedia = sqliteTable(
 		altText: text('alt_text'),
 		sortOrder: integer('sort_order').notNull().default(0),
 		segmentIndex: integer('segment_index').notNull().default(0),
-		createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull()
+		createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
+		metaJson: text('meta_json')
 	},
 	(t) => [
 		index('draft_media_draft_idx').on(t.draftId),

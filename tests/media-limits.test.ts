@@ -41,7 +41,7 @@ describe('validateVideoUpload', () => {
 	it('rejects empty and oversized files', () => {
 		expect(validateVideoUpload({ mime: 'video/mp4', size: 0 }).ok).toBe(false);
 		const big = validateVideoUpload({ mime: 'video/mp4', size: MAX_VIDEO_BYTES + 1 });
-		expect(big).toEqual({ ok: false, message: 'Video too large (max 95MB)' });
+		expect(big).toEqual({ ok: false, message: 'Video too large (max 300MB)' });
 		expect(validateVideoUpload({ mime: 'video/mp4', size: MAX_VIDEO_BYTES }).ok).toBe(true);
 	});
 

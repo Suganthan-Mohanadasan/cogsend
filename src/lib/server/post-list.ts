@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, sql, type InferSelectModel } from 'drizzle-orm';
-import { batchQueries, chunkIds, type AppDb } from './db/client';
+import { batchQueries, chunkIds, parseJson, type AppDb } from './db/client';
 import { connections, draftMedia, drafts, publishTargets } from './db/schema';
 import { serializeMedia } from './serialize';
 
@@ -46,6 +46,7 @@ export async function loadDraftSummaries(db: AppDb, userId: string, limit = DRAF
 		altText: string | null;
 		sortOrder: number;
 		segmentIndex: number;
+		metaJson: string | null;
 	};
 	type TargetRow = {
 		draftId: string;
@@ -65,7 +66,8 @@ export async function loadDraftSummaries(db: AppDb, userId: string, limit = DRAF
 					mime: draftMedia.mime,
 					altText: draftMedia.altText,
 					sortOrder: draftMedia.sortOrder,
-					segmentIndex: draftMedia.segmentIndex
+					segmentIndex: draftMedia.segmentIndex,
+					metaJson: draftMedia.metaJson
 				})
 				.from(draftMedia)
 				.where(inArray(draftMedia.draftId, chunk)),
@@ -103,10 +105,14 @@ export async function loadDraftSummaries(db: AppDb, userId: string, limit = DRAF
 		);
 	}
 	const connById = new Map(conns.map((c) => [c.id, c]));
-	const mediaByDraft = new Map<string, MediaRow[]>();
-	for (const m of allMedia) {
+	// `meta` as serializeMedia shapes it: a video's cover is what the grid shows.
+	const mediaByDraft = new Map<
+		string,
+		(Omit<MediaRow, 'metaJson'> & { meta: Record<string, unknown> | null })[]
+	>();
+	for (const { metaJson, ...m } of allMedia) {
 		const list = mediaByDraft.get(m.draftId) ?? [];
-		list.push(m);
+		list.push({ ...m, meta: metaJson ? parseJson<Record<string, unknown>>(metaJson, {}) : null });
 		mediaByDraft.set(m.draftId, list);
 	}
 	const targetsByDraft = new Map<

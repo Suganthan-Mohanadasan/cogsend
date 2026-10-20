@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS \`draft_media\` (
 	\`sort_order\` integer NOT NULL DEFAULT 0,
 	\`segment_index\` integer NOT NULL DEFAULT 0,
 	\`created_at\` integer NOT NULL,
+	\`meta_json\` text,
 	FOREIGN KEY (\`draft_id\`) REFERENCES \`drafts\`(\`id\`) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS \`draft_media_draft_idx\` ON \`draft_media\` (\`draft_id\`);
@@ -294,6 +295,7 @@ const COLUMN_BACKFILLS: Array<{ table: string; columns: { name: string; ddl: str
 		columns: [{ name: 'selected_connection_ids', ddl: 'selected_connection_ids text' }]
 	},
 	{ table: 'api_keys', columns: [{ name: 'scopes', ddl: 'scopes text' }] },
+	{ table: 'draft_media', columns: [{ name: 'meta_json', ddl: 'meta_json text' }] },
 	{
 		table: 'sessions',
 		columns: [{ name: 'mfa_verified', ddl: 'mfa_verified integer NOT NULL DEFAULT 0' }]

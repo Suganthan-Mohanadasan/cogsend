@@ -13,9 +13,10 @@ export const X_MAX_GIF_BYTES = 15_000_000;
 export const THREADS_MAX_IMAGE_BYTES = 8_000_000;
 export const MAX_IMAGES_PER_SEGMENT = 4;
 
-// LinkedIn video posts: single mp4 per post. 95MB keeps uploads under the
-// Worker request body limit.
-export const MAX_VIDEO_BYTES = 95_000_000;
+// The largest video any route stores. Bluesky's 300 MB is the smallest cap
+// among the platforms that take long videos; larger files go up in parts
+// (api/drafts/[id]/media/uploads), so the 100 MB request limit does not apply.
+export const MAX_VIDEO_BYTES = 300_000_000;
 
 function looksLikeMp4(bytes: Uint8Array): boolean {
 	return (
@@ -45,7 +46,7 @@ export function validateVideoUpload(input: {
 	}
 	if (input.size <= 0) return { ok: false, message: 'Empty file' };
 	if (input.size > MAX_VIDEO_BYTES) {
-		return { ok: false, message: 'Video too large (max 95MB)' };
+		return { ok: false, message: 'Video too large (max 300MB)' };
 	}
 	return { ok: true, mime: 'video/mp4' };
 }
@@ -150,6 +151,16 @@ export function mediaSizeProblem(
 			}
 		}
 	}
+	return null;
+}
+
+/**
+ * Every platform takes one video per post, on its own: the upload routes
+ * refuse anything else on a card so it cannot fail later at publish.
+ */
+export function videoMixProblem(videos: number, images: number): string | null {
+	if (videos > 1) return 'Only one video per post';
+	if (videos > 0 && images > 0) return 'Videos cannot mix with images on the same post';
 	return null;
 }
 

@@ -1,6 +1,14 @@
 import { validateXText, xWeightedLength } from '#lib/domain/validation/text.js';
 import { storedXLimit, xLimitFor } from '#lib/domain/x-limits.js';
-import { mediaByteLength } from './types';
+import { mediaByteLength, processingError, resumedVideoState } from './types';
+import {
+	isVideoAttachment,
+	readVideoSlice,
+	requireMediaReader,
+	segmentVideo,
+	storedVideoSize,
+	videoValidation
+} from './video';
 import type {
 	ConnectionCredentials,
 	ConnectionMeta,
@@ -86,11 +94,24 @@ function isGif(m: MediaAttachment): boolean {
 	return (m.mime || '').toLowerCase() === 'image/gif';
 }
 
-function isVideo(m: MediaAttachment): boolean {
-	return (m.mime || '').toLowerCase().startsWith('video/');
+const isVideo = isVideoAttachment;
+
+/**
+ * X refuses a video longer than the account's plan allows (2:20 without
+ * Premium) with a message naming the length; retrying cannot change that.
+ */
+function isVideoLengthRefusal(body: string): boolean {
+	return /longer than|duration/i.test(body) && /video|second|minute/i.test(body);
 }
 
-function validateSegmentMedia(media: MediaAttachment[]): ValidationIssue[] {
+function videoTooLong(status: number, detail: string): ProviderError {
+	return new ProviderError(
+		'X refused the video as too long for this account. Videos over 2:20 need X Premium.',
+		{ status, code: 'forbidden', detail }
+	);
+}
+
+function validateSegmentMedia(media: MediaAttachment[], meta?: ConnectionMeta): ValidationIssue[] {
 	const issues: ValidationIssue[] = [];
 	if (media.length > X_MAX_IMAGES) {
 		issues.push({
@@ -99,14 +120,7 @@ function validateSegmentMedia(media: MediaAttachment[]): ValidationIssue[] {
 			code: 'max_images'
 		});
 	}
-	const videos = media.filter(isVideo);
-	if (videos.length > 0) {
-		issues.push({
-			field: 'media',
-			message: 'X video is not supported yet — post it to LinkedIn',
-			code: 'no_video'
-		});
-	}
+	issues.push(...videoValidation('x', media, meta, 'media'));
 	const gifs = media.filter(isGif);
 	if (gifs.length > 1) {
 		issues.push({
@@ -487,27 +501,156 @@ async function uploadOneMedia(
 		throw new Error('X media is still processing — try again in a minute');
 	}
 
-	// Alt text is best-effort: it must never fail the post.
-	if (m.alt?.trim()) {
-		const alt = m.alt.trim().slice(0, 1000);
-		for (const shape of [
-			{ media_id: mediaId, alt_text: { text: alt } },
-			{ id: mediaId, alt_text: { text: alt } }
-		]) {
-			try {
-				const metaRes = await fetchImpl(`${X_API}/2/media/metadata`, {
-					method: 'POST',
-					headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-					body: JSON.stringify(shape)
-				});
-				if (metaRes.ok) break;
-			} catch {
-				break;
-			}
+	await setAltText(token, mediaId, m.alt, fetchImpl);
+	return mediaId;
+}
+
+/** Best effort: alt text must never fail the post. */
+async function setAltText(
+	token: string,
+	mediaId: string,
+	altText: string | undefined,
+	fetchImpl: FetchLike
+): Promise<void> {
+	if (!altText?.trim()) return;
+	const alt = altText.trim().slice(0, 1000);
+	for (const shape of [
+		{ media_id: mediaId, alt_text: { text: alt } },
+		{ id: mediaId, alt_text: { text: alt } }
+	]) {
+		try {
+			const metaRes = await fetchImpl(`${X_API}/2/media/metadata`, {
+				method: 'POST',
+				headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+				body: JSON.stringify(shape)
+			});
+			if (metaRes.ok) break;
+		} catch {
+			break;
 		}
 	}
+}
 
-	return mediaId;
+interface XVideoState {
+	mediaId: string;
+	size: number;
+	/** The next APPEND segment to send. */
+	next: number;
+	finalized?: boolean;
+}
+
+// Calls kept back for a status check, alt text, the post and publish.ts's writes.
+const X_VIDEO_RESERVE_CALLS = 8;
+
+function xVideoState(value: Record<string, unknown> | null): XVideoState | null {
+	if (!value || typeof value.mediaId !== 'string' || typeof value.size !== 'number') return null;
+	return value as unknown as XVideoState;
+}
+
+async function xFailure(prefix: string, res: Response): Promise<Error> {
+	const detail = (await res.text()).slice(0, 300);
+	if (isVideoLengthRefusal(detail)) return videoTooLong(res.status, detail);
+	return Object.assign(new Error(`${prefix} failed (${res.status}): ${detail}`), {
+		status: res.status
+	});
+}
+
+/**
+ * A video goes up in 5 MB APPEND segments read from storage one at a time,
+ * so a 300 MB file never sits in memory. When the request is about to run out
+ * of calls, or X is still transcoding, the media id and the next segment are
+ * parked (processingError) and a later run carries on from there.
+ */
+async function uploadVideo(
+	token: string,
+	m: MediaAttachment,
+	segmentIndex: number,
+	fetchImpl: FetchLike,
+	opts: Parameters<PlatformProvider['publish']>[4]
+): Promise<string> {
+	if (!m.storageKey) throw new Error('X video is missing its storage key');
+	const storageKey = m.storageKey;
+	const reader = requireMediaReader(opts?.mediaReader);
+	const callsLeft = opts?.callsLeft ?? (() => Infinity);
+	let state = xVideoState(resumedVideoState(opts?.resume, segmentIndex, storageKey));
+	const park = (current: XVideoState, retryAfterMs: number): never => {
+		throw processingError(
+			'X',
+			{ segment: segmentIndex, storageKey, state: current as unknown as Record<string, unknown> },
+			retryAfterMs
+		);
+	};
+	if (!state) {
+		const size = await storedVideoSize(reader, storageKey);
+		const initRes = await fetchImpl(`${X_API}/2/media/upload/initialize`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				media_type: 'video/mp4',
+				total_bytes: size,
+				media_category: 'tweet_video'
+			})
+		});
+		if (!initRes.ok) throw await xFailure('X media init', initRes);
+		const initData = (await initRes.json()) as { data?: { id?: string }; id?: string };
+		const mediaId = initData.data?.id ?? initData.id;
+		if (!mediaId) throw new Error('X media init returned no media id');
+		state = { mediaId, size, next: 0 };
+	}
+	const totalChunks = Math.max(1, Math.ceil(state.size / X_UPLOAD_CHUNK_BYTES));
+	while (state.next < totalChunks) {
+		// A segment is a storage read and an APPEND.
+		if (callsLeft() < X_VIDEO_RESERVE_CALLS + 2) park(state, 15_000);
+		const start = state.next * X_UPLOAD_CHUNK_BYTES;
+		const end = Math.min(state.size, start + X_UPLOAD_CHUNK_BYTES) - 1;
+		const slice = await readVideoSlice(reader, storageKey, start, end);
+		const form = new FormData();
+		form.append('segment_index', String(state.next));
+		form.append('media', new Blob([slice as BlobPart], { type: 'video/mp4' }), 'upload');
+		const appRes = await fetchImpl(`${X_API}/2/media/upload/${state.mediaId}/append`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}` },
+			body: form
+		});
+		if (!appRes.ok) throw await xFailure('X media upload', appRes);
+		state = { ...state, next: state.next + 1 };
+	}
+	let proc: ReturnType<typeof processingState>;
+	if (!state.finalized) {
+		const finRes = await fetchImpl(`${X_API}/2/media/upload/${state.mediaId}/finalize`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}` }
+		});
+		if (!finRes.ok) throw await xFailure('X media finalize', finRes);
+		proc = processingState(await finRes.json().catch(() => ({})));
+		state = { ...state, finalized: true };
+	} else {
+		proc = { state: 'in_progress', checkAfterSecs: 0 };
+	}
+	for (let attempt = 0; attempt < X_MEDIA_POLL_ATTEMPTS; attempt++) {
+		if (!proc.state || proc.state === 'succeeded') break;
+		if (proc.state === 'failed') {
+			const message = proc.error?.message ?? '';
+			if (isVideoLengthRefusal(message)) throw videoTooLong(400, message);
+			throw new ProviderError(`X could not process the video${message ? `: ${message}` : ''}`, {
+				code: 'forbidden'
+			});
+		}
+		if (callsLeft() < X_VIDEO_RESERVE_CALLS) break;
+		const wait = Math.min((proc.checkAfterSecs ?? 1) * 1000, X_MEDIA_POLL_MAX_WAIT_MS);
+		if (wait > 0) await sleep(wait);
+		const stRes = await fetchImpl(
+			`${X_API}/2/media/upload?command=STATUS&media_id=${encodeURIComponent(state.mediaId)}`,
+			{ headers: { Authorization: `Bearer ${token}` } }
+		);
+		if (!stRes.ok) throw await xFailure('X media status', stRes);
+		proc = processingState(await stRes.json().catch(() => ({})));
+	}
+	if (proc.state && proc.state !== 'succeeded') {
+		park(state, Math.max(15_000, (proc.checkAfterSecs ?? 30) * 1000));
+	}
+	await setAltText(token, state.mediaId, m.alt, fetchImpl);
+	return state.mediaId;
 }
 
 // --- Provider ---
@@ -545,7 +688,7 @@ export const xProvider: PlatformProvider = {
 					code: 'max_length'
 				});
 			}
-			for (const mi of validateSegmentMedia(segMedia)) {
+			for (const mi of validateSegmentMedia(segMedia, meta)) {
 				issues.push({ ...mi, field: `thread[${i}].${mi.field ?? 'media'}` });
 			}
 			if (countCashtags(seg.text || '') > 1) {
@@ -576,15 +719,20 @@ export const xProvider: PlatformProvider = {
 			try {
 				const seg = segments[i];
 				const segMedia = (seg.media ?? []).slice(0, X_MAX_IMAGES);
-				for (const m of segMedia) {
-					if (isVideo(m)) throw new Error('X video is not supported yet — post it to LinkedIn');
+				const video = segmentVideo(segMedia);
+				if (!video && segMedia.some(isVideo)) {
+					throw new Error('Videos cannot mix with images on the same post');
 				}
 				const text = (seg.text || '').trim();
 				if (!text && segMedia.length === 0) throw new Error('Segment needs text or media');
 
 				const mediaIds: string[] = [];
-				for (const m of segMedia) {
-					mediaIds.push(await uploadOneMedia(token, m, fetchImpl));
+				if (video) {
+					mediaIds.push(await uploadVideo(token, video, i, fetchImpl, opts));
+				} else {
+					for (const m of segMedia) {
+						mediaIds.push(await uploadOneMedia(token, m, fetchImpl));
+					}
 				}
 
 				const body: Record<string, unknown> = {};
@@ -604,6 +752,7 @@ export const xProvider: PlatformProvider = {
 				}
 				if (!res.ok) {
 					const detail = (await res.text()).slice(0, 300);
+					if (video && isVideoLengthRefusal(detail)) throw videoTooLong(res.status, detail);
 					if (xWeightedLength(text) > X_MAX_CHARS && isLongPostRefusal(res.status, detail)) {
 						throw longPostRefused(res.status, detail);
 					}
@@ -640,7 +789,8 @@ export const xProvider: PlatformProvider = {
 					throw new PublishPartialError(message, {
 						segmentIds,
 						remoteUrl: firstUrl ?? opts?.resume?.remoteUrl ?? null,
-						metaPatch: err instanceof ProviderError ? err.metaPatch : undefined
+						metaPatch: err instanceof ProviderError ? err.metaPatch : undefined,
+						cause: err
 					});
 				}
 				throw err;

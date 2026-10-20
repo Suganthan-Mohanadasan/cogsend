@@ -49,7 +49,6 @@ const wanted = keys.length
 			'RESEND_API_KEY',
 			'NOTIFY_EMAIL',
 			'NOTIFY_FROM',
-			'ENABLE_VIDEO_UPLOAD',
 			'SUBREQUEST_LIMIT'
 		];
 

@@ -5,6 +5,7 @@ import { draftMedia, drafts } from '#lib/server/db/schema.js';
 import { fail, handleError } from '#lib/server/http.js';
 import {
 	assertSafeStorageKey,
+	coverKey,
 	jpegResponse,
 	PRIVATE_MEDIA_CACHE,
 	serveMediaBytes,
@@ -30,6 +31,13 @@ export const GET: RequestHandler = async ({ params, locals, request, url }) => {
 				.where(and(eq(drafts.id, media.draftId), eq(drafts.userId, user.id)))
 		);
 		if (!draft) return fail('Not found', 404);
+		// A video's cover; the query value is its version, so a new cover is a
+		// new URL and the immutable cache never shows the old one.
+		if (url.searchParams.has('cover')) {
+			const cover = await locals.media.get(coverKey(key));
+			if (!cover) return fail('Not found', 404);
+			return jpegResponse(cover, PRIVATE_MEDIA_CACHE);
+		}
 		// Posts grid. Only a deployment that bound Cloudflare Images gets a
 		// smaller file; everyone else, and any encode that fails, gets the
 		// original. Skipping the attempt when the binding is absent avoids an

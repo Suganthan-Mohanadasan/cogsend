@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { expect, test, type Page } from '@playwright/test';
+import { buildMp4 } from '../mp4-fixture';
 import {
 	E2E_ACCOUNT,
 	E2E_D1_FLAGS,
@@ -1439,27 +1440,34 @@ test('a retryable publish failure is reported as retrying, not failed', async ()
 	}
 });
 
-test('video is not offered or accepted while ENABLE_VIDEO_UPLOAD is off', async () => {
+test('a video attaches in parts, shows what each platform makes of it, and comes off again', async () => {
 	// The media affordance needs a destination, like every other composer test.
-	await seedFirewalledBluesky(page, 'video-probe.bsky.social');
-	await page.goto('/compose');
-	const input = page.getByTestId('file-input-0');
-	await expect(input).toBeAttached();
+	const connId = await seedFirewalledBluesky(page, 'video-probe.bsky.social');
+	try {
+		await page.goto('/compose');
+		const input = page.getByTestId('file-input-0');
+		await expect(input).toBeAttached();
+		expect((await input.getAttribute('accept')) ?? '').toContain('video/mp4');
 
-	// The picker does not advertise video…
-	const accept = (await input.getAttribute('accept')) ?? '';
-	expect(accept).toContain('image/png');
-	expect(accept).not.toContain('video');
+		// Already H.264 in MP4 with its index first: it goes up as it is.
+		const strip = page.getByTestId('segment-media-0');
+		await attachUntilAnswered(
+			input,
+			{ name: 'clip.mp4', mimeType: 'video/mp4', buffer: Buffer.from(buildMp4()) },
+			strip.locator('video')
+		);
+		await expect(page.getByTestId('video-checklist-0-bluesky')).toHaveAttribute('data-level', 'ok');
 
-	// …and a programmatic drop of an MP4 is filtered out with a plain message
-	// rather than reaching the API, which refuses video while the flag is off.
-	await attachUntilAnswered(
-		input,
-		{
-			name: 'clip.mp4',
-			mimeType: 'video/mp4',
-			buffer: Buffer.from([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])
-		},
-		page.getByText('Only image files (PNG, JPEG, WebP, GIF) are supported')
-	);
+		await strip.locator('[data-testid^="video-cover-"]').click();
+		await expect(page.getByTestId('video-cover-dialog')).toBeVisible();
+		await page.getByTestId('video-cover-dialog').getByRole('button', { name: 'Cancel' }).click();
+		await expect(page.getByTestId('video-cover-dialog')).toHaveCount(0);
+
+		await strip.locator('[data-testid^="remove-media-"]').click();
+		await expect(page.getByText('Remove this video?')).toBeVisible();
+		await page.getByTestId('confirm-dialog-ok-media').click();
+		await expect(strip).toHaveCount(0);
+	} finally {
+		await deleteConnection(connId);
+	}
 });

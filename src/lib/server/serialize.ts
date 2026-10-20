@@ -46,7 +46,8 @@ export function serializeMedia(m: Media) {
 		altText: m.altText,
 		sortOrder: m.sortOrder,
 		segmentIndex: m.segmentIndex,
-		createdAt: m.createdAt
+		createdAt: m.createdAt,
+		meta: m.metaJson ? parseJson<Record<string, unknown>>(m.metaJson, {}) : null
 	};
 }
 

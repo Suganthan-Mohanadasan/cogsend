@@ -64,6 +64,7 @@ export const INTROSPECTION_SQL = `SELECT
   (SELECT group_concat(name, ' ') FROM pragma_table_info('sessions')) AS sessions_cols,
   (SELECT group_concat(name, ' ') FROM pragma_table_info('api_keys')) AS api_keys_cols,
   (SELECT group_concat(name, ' ') FROM pragma_table_info('drafts')) AS drafts_cols,
+  (SELECT group_concat(name, ' ') FROM pragma_table_info('draft_media')) AS draft_media_cols,
   (SELECT group_concat(name || ':' || "unique", ' ') FROM pragma_index_list('publish_targets')) AS publish_targets_idx,
   (SELECT group_concat(name, ' ') FROM pragma_index_list('oauth_pending')) AS oauth_pending_idx,
   (SELECT group_concat(name, ' ') FROM pragma_index_list('mfa_challenges')) AS mfa_challenges_idx,
@@ -87,7 +88,7 @@ export function readState(row) {
 			.filter(Boolean);
 	/** @type {Map<string, Set<string>>} */
 	const columns = new Map();
-	for (const table of ['users', 'sessions', 'api_keys', 'drafts']) {
+	for (const table of ['users', 'sessions', 'api_keys', 'drafts', 'draft_media']) {
 		columns.set(table, new Set(list(row?.[`${table}_cols`])));
 	}
 	/** @type {Map<string, Map<string, boolean>>} */
@@ -166,7 +167,8 @@ export function satisfiedMigrations(state) {
 		['0014_notification_digest.sql', tables.has('notification_state')],
 		['0015_draft_selected_connections.sql', col('drafts', 'selected_connection_ids')],
 		['0016_mfa_challenges_expires_idx.sql', idx('mfa_challenges', 'mfa_challenges_expires_idx')],
-		['0017_app_settings.sql', tables.has('app_settings')]
+		['0017_app_settings.sql', tables.has('app_settings')],
+		['0018_draft_media_meta.sql', col('draft_media', 'meta_json')]
 	]
 		.filter(([, ok]) => ok)
 		.map(([name]) => String(name));

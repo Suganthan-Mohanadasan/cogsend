@@ -18,10 +18,7 @@ export const TEST_ENV: AppEnv = {
 	APP_NAME: 'CogSend',
 	APP_ENCRYPTION_KEY: 'feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface',
 	AUTH_SECRET: 'test-auth-secret-at-least-8',
-	skipTotp: false,
-	// The in-progress LinkedIn video path stays off in tests unless a test
-	// opts in with { ...TEST_ENV, videoUploadEnabled: true }.
-	videoUploadEnabled: false
+	skipTotp: false
 };
 
 /**

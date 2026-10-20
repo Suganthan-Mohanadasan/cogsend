@@ -99,12 +99,24 @@ describe('xProvider.validate', () => {
 		expect(issues.some((i) => i.code === 'max_images')).toBe(true);
 	});
 
-	it('rejects video', () => {
-		const issues = xProvider.validate({
+	it('holds a video to the account plan and refuses mixing it with images', () => {
+		const video = {
+			mime: 'video/mp4',
+			size: 1_000_000,
+			video: { durationMs: 200_000, videoCodec: 'avc' }
+		};
+		const free = xProvider.validate({ text: 'hi', media: [video] });
+		expect(free.map((i) => i.message)).toContain(
+			'X takes videos up to 2:20 — this one is 3:20. Accounts with X Premium can post longer ones.'
+		);
+		expect(
+			xProvider.validate({ text: 'hi', media: [video] }, { xSubscription: 'Premium' })
+		).toEqual([]);
+		const mixed = xProvider.validate({
 			text: 'hi',
-			media: [{ mime: 'video/mp4', size: 10 }]
+			media: [video, { mime: 'image/png', size: 10 }]
 		});
-		expect(issues.some((i) => i.code === 'no_video')).toBe(true);
+		expect(mixed.map((i) => i.message)).toContain('Videos cannot mix with images on the same post');
 	});
 
 	it('allows a lone GIF, rejects GIF mixes', () => {

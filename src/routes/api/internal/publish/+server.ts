@@ -10,7 +10,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 		if (!body || typeof body !== 'object') return fail('Invalid JSON body', 400);
 		const targetId = String(body.targetId || '');
 		if (!targetId) return fail('targetId required');
-		const result = await consumePublishJob(locals.db, locals.env, locals.media, targetId);
+		const result = await consumePublishJob(
+			locals.db,
+			locals.env,
+			locals.media,
+			targetId,
+			undefined,
+			locals.budget
+		);
 		return ok(result);
 	} catch (err) {
 		return handleError(err);

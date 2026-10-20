@@ -34,7 +34,12 @@ export const GET = createOAuthCallback({
 			handle: exchanged.handle,
 			avatarUrl: exchanged.avatarUrl,
 			instanceUrl: exchanged.instanceUrl,
-			meta: { maxCharacters: exchanged.maxCharacters ?? 500 }
+			meta: {
+				maxCharacters: exchanged.maxCharacters ?? 500,
+				videoSizeLimit: exchanged.videoSizeLimit,
+				videoMatrixLimit: exchanged.videoMatrixLimit,
+				videoFrameRateLimit: exchanged.videoFrameRateLimit
+			}
 		};
 	}
 });

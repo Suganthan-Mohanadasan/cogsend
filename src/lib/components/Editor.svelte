@@ -34,12 +34,23 @@
 		LINKEDIN_MAX_IMAGES,
 		LINKEDIN_MAX_IMAGE_BYTES,
 		THREADS_MAX_IMAGE_BYTES,
+		MAX_VIDEO_BYTES,
 		X_MAX_GIF_BYTES,
 		X_MAX_IMAGE_BYTES,
 		groupMediaBySegment,
 		mediaSizeProblem,
 		remapSegmentIndexAfterRemoval
 	} from '#lib/domain/media-limits.js';
+	import {
+		factsOfMedia,
+		firstVideoError,
+		PROCESSING_MARK,
+		type VideoRuleMeta
+	} from '#lib/domain/video-rules.js';
+	import { prepareVideo, VideoPrepareError } from '#lib/components/video/prepare.js';
+	import { uploadVideo } from '#lib/components/video/upload.js';
+	import VideoChecklist from './video/VideoChecklist.svelte';
+	import VideoCover from './video/VideoCover.svelte';
 	import { shrinkToFit } from '#lib/components/shrink-image.js';
 	import { persistMediaLayout, type MediaMove } from '#lib/domain/media-sync.js';
 	import {
@@ -134,7 +145,7 @@
 		displayName: string | null;
 		avatarUrl?: string | null;
 		status?: string;
-		metaJson?: { maxCharacters?: number };
+		metaJson?: { maxCharacters?: number } & VideoRuleMeta;
 	};
 
 	type MediaItem = {
@@ -142,9 +153,28 @@
 		storageKey: string;
 		mime: string;
 		size?: number;
+		width?: number | null;
+		height?: number | null;
 		altText: string | null;
 		segmentIndex?: number;
 		previewUrl?: string;
+		/** A video's facts and chosen cover, as the server read them. */
+		meta?: {
+			durationMs?: number | null;
+			videoCodec?: string | null;
+			fps?: number | null;
+			faststart?: boolean | null;
+			cover?: { v: number; atMs?: number } | null;
+		} | null;
+	};
+
+	/** A video being prepared or uploaded; it becomes a MediaItem when done. */
+	type VideoJob = {
+		id: string;
+		segmentIndex: number;
+		phase: 'reading' | 'converting' | 'uploading';
+		progress: number;
+		controller: AbortController;
 	};
 
 	type ActiveTab = 'global' | PlatformId;
@@ -178,15 +208,12 @@
 		initialConnections = [],
 		initialSettings = null,
 		initialDraft = null,
-		displayName = null,
-		videoEnabled = false
+		displayName = null
 	}: {
 		initialConnections?: Connection[];
 		initialSettings?: ProfileSettings | null;
 		initialDraft?: EditorDraft | null;
 		displayName?: string | null;
-		/** In-progress LinkedIn video uploads; the server decides, this is the affordance. */
-		videoEnabled?: boolean;
 	} = $props();
 
 	// The open draft is rendered with the page. A later id change still fetches.
@@ -236,12 +263,10 @@
 		return targetIds.length ? targetIds : null;
 	})();
 
-	/** What the file picker accepts, and what a drop is filtered down to. */
-	const ACCEPTED_MEDIA = $derived(
-		videoEnabled
-			? 'image/png,image/jpeg,image/webp,image/gif,video/mp4'
-			: 'image/png,image/jpeg,image/webp,image/gif'
-	);
+	/** What the file picker accepts. Videos in other containers are converted to MP4. */
+	const ACCEPTED_MEDIA =
+		'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/quicktime,video/webm';
+	const isMediaFile = (type: string) => type.startsWith('image/') || type.startsWith('video/');
 
 	const SKIP_ASK_KEY = 'cogsend-skip-publish-confirm';
 
@@ -309,6 +334,9 @@
 	let mastoPoll = $state<PollConfig | null>(seededPoll);
 	let focusedSegment = $state(0);
 	let uploadingSegment = $state<number | null>(null);
+	let videoJobs = $state<VideoJob[]>([]);
+	let coverFor = $state<string | null>(null);
+	let coverBusy = $state(false);
 	let dirty = $state(false);
 	// URL id of a draft whose load is in flight. Autosave waits for it so a
 	// keystroke typed during a slow load cannot create a second draft.
@@ -771,8 +799,14 @@
 	// it must not hand its id, saved state or variant bookkeeping to this one.
 	let editorGeneration = 0;
 
+	function abortVideoJobs() {
+		for (const job of videoJobs) job.controller.abort();
+		videoJobs = [];
+	}
+
 	function resetEditorForNewDraft() {
 		editorGeneration++;
+		abortVideoJobs();
 		draftId = null;
 		baseBody = '';
 		overrides = {};
@@ -872,7 +906,10 @@
 				// rewritten to it), so this response must not hijack the session.
 				return;
 			}
-			if (draftId !== d.id) editorGeneration++;
+			if (draftId !== d.id) {
+				editorGeneration++;
+				abortVideoJobs();
+			}
 			draftId = d.id;
 			const locked = isFullyPublished(d.targets || []);
 			publishedLock = locked;
@@ -1292,6 +1329,14 @@
 			showToast(sizeProblem, 'warn');
 			return;
 		}
+		if (videoJobs.length) {
+			showToast('Wait for the video to finish uploading', 'warn');
+			return;
+		}
+		if (videoProblem) {
+			showToast(videoProblem, 'warn');
+			return;
+		}
 		if (overSelectedLimit) {
 			showToast('A post is over the character limit', 'warn');
 			return;
@@ -1434,13 +1479,17 @@
 						return { connectionId, status: 'retrying' as const, error: message };
 					}
 					if (row.status === 'scheduled') {
-						// Retryable failure: the scheduler retries with backoff.
-						const message = humanizeError(row.error ?? 'Retrying automatically');
+						// Retryable failure: the scheduler retries with backoff. A
+						// video the platform is still processing parks the same way.
+						const processing = (row.error ?? '').includes(PROCESSING_MARK);
+						const message = processing
+							? (row.error ?? '')
+							: humanizeError(row.error ?? 'Retrying automatically');
 						setDestinationProgress(connectionId, {
 							status: 'retrying',
 							error: message
 						});
-						return { connectionId, status: 'retrying' as const, error: message };
+						return { connectionId, status: 'retrying' as const, error: message, processing };
 					}
 					const message = humanizeError(row.error ?? 'Publish failed');
 					setDestinationProgress(connectionId, { status: 'failed', error: message });
@@ -1485,6 +1534,16 @@
 				(published.length ? `Published to ${published.length}. ` : '') +
 					`Failed for ${failed.map((f) => destinationName(f.connectionId)).join(', ')}.`
 			);
+		} else if (retrying.length && retrying.every((r) => r.processing)) {
+			const names = retrying.map((r) => destinationName(r.connectionId)).join(', ');
+			showToast(
+				`${names} ${retrying.length === 1 ? 'is' : 'are'} processing the video — it publishes on its own in a minute or two` +
+					(published.length ? ` · already published to ${published.length}` : '') +
+					unscheduledNote,
+				'success',
+				{ label: 'View posts', href: '/posts' }
+			);
+			announcePublish(`${names} ${retrying.length === 1 ? 'is' : 'are'} processing the video.`);
 		} else if (retrying.length) {
 			// Retryable failures are rescheduled server-side; report them as a
 			// warning with a link instead of a red failure.
@@ -1726,7 +1785,14 @@
 	 */
 	async function startNewPost() {
 		if (startingNew) return;
-		if (publishing || discarding || unscheduling || uploadingSegment !== null || loadingDraftId) {
+		if (
+			publishing ||
+			discarding ||
+			unscheduling ||
+			uploadingSegment !== null ||
+			videoJobs.length ||
+			loadingDraftId
+		) {
 			showToast('Please wait…', 'warn');
 			return;
 		}
@@ -1939,6 +2005,14 @@
 			showToast(sizeProblem, 'warn');
 			return;
 		}
+		if (videoJobs.length) {
+			showToast('Wait for the video to finish uploading', 'warn');
+			return;
+		}
+		if (videoProblem) {
+			showToast(videoProblem, 'warn');
+			return;
+		}
 		if (overSelectedLimit) {
 			showToast('A post is over the character limit', 'warn');
 			return;
@@ -1994,16 +2068,32 @@
 
 	async function attachFilesToSegment(segmentIndex: number, files: File[]) {
 		if (editLocked) return;
-		const picked = files.filter(
-			(f) => f.type.startsWith('image/') || (videoEnabled && f.type === 'video/mp4')
-		);
+		const picked = files.filter((f) => isMediaFile(f.type));
 		if (!picked.length) {
-			showToast(
-				videoEnabled
-					? 'Only image files (PNG, JPEG, WebP, GIF) and MP4 video are supported'
-					: 'Only image files (PNG, JPEG, WebP, GIF) are supported',
-				'warn'
-			);
+			showToast('Only images (PNG, JPEG, WebP, GIF) and videos are supported', 'warn');
+			return;
+		}
+		const videoFiles = picked.filter((f) => f.type.startsWith('video/'));
+		if (videoFiles.length) {
+			if (picked.length > 1) {
+				showToast('Attach a video on its own — a post takes one video and no images', 'warn');
+				return;
+			}
+			const onSegment =
+				media.some((m) => (m.segmentIndex ?? 0) === segmentIndex) ||
+				videoJobs.some((job) => job.segmentIndex === segmentIndex);
+			if (onSegment) {
+				showToast(
+					'A video needs a post of its own — remove what is attached, or add a post to the thread',
+					'warn'
+				);
+				return;
+			}
+			void attachVideo(segmentIndex, videoFiles[0]);
+			return;
+		}
+		if (videoJobs.some((job) => job.segmentIndex === segmentIndex)) {
+			showToast('Videos cannot mix with images on the same post', 'warn');
 			return;
 		}
 		// Shrink to Bluesky's cap, the strictest one, whatever is selected now:
@@ -2017,23 +2107,10 @@
 		);
 		const threadsSelected = connections.some((c) => selected.has(c.id) && c.platform === 'threads');
 		const xSelected = connections.some((c) => selected.has(c.id) && c.platform === 'x');
-		const videos = images.filter((f) => f.type === 'video/mp4');
-		const nonLinkedinSelected = connections.some(
-			(c) => selected.has(c.id) && c.platform !== 'linkedin'
-		);
-		const linkedinOnly = connections.some((c) => selected.has(c.id) && c.platform === 'linkedin');
 		const webpSelected = images.some((f) => f.type === 'image/webp') && linkedinSelected;
 		const overBluesky = images.filter((f) => f.size > BLUESKY_MAX_IMAGE_BYTES);
 		const overLinkedin = images.filter((f) => f.size > LINKEDIN_MAX_IMAGE_BYTES);
 		const advisories: string[] = [];
-		if (videos.length && nonLinkedinSelected) {
-			advisories.push(
-				'Video posts only go to LinkedIn — other selected accounts will fail unless you uncheck them.'
-			);
-		}
-		if (videos.length && !linkedinOnly) {
-			advisories.push('Select a LinkedIn account or the video has nowhere to go.');
-		}
 		if (overBluesky.length && blueskySelected) {
 			advisories.push(
 				`${overBluesky[0].name} is over Bluesky's 2MB image cap. Use a smaller image or uncheck Bluesky — Mastodon can still take it.`
@@ -2071,13 +2148,10 @@
 				f.type === 'image/gif' ? f.size > X_MAX_GIF_BYTES : f.size > X_MAX_IMAGE_BYTES
 			);
 		if (xBadType) {
-			advisories.push('X takes JPEG/PNG/GIF/WebP images only — video goes to LinkedIn.');
+			advisories.push('X takes JPEG/PNG/GIF/WebP images only.');
 		}
 		if (xOversize) {
 			advisories.push("An image is over X's 5MB cap (15MB for GIFs) — compress it or uncheck X.");
-		}
-		if (videos.length && xSelected) {
-			advisories.push('Video posts only go to LinkedIn — X accounts will fail unless unchecked.');
 		}
 		if (advisories.length) showToast(advisories[0], 'warn');
 		uploadingSegment = segmentIndex;
@@ -2115,6 +2189,145 @@
 			uploadingSegment = null;
 		}
 	}
+
+	function updateVideoJob(id: string, patch: Partial<VideoJob>) {
+		videoJobs = videoJobs.map((job) => (job.id === id ? { ...job, ...patch } : job));
+	}
+
+	/**
+	 * Prepare the video in the browser (convert it when a platform would refuse
+	 * it as it is), upload it in parts, then keep a frame as its cover so Posts
+	 * and the platforms that take one have something to show.
+	 */
+	async function attachVideo(segmentIndex: number, file: File) {
+		const job: VideoJob = {
+			id: crypto.randomUUID(),
+			segmentIndex,
+			phase: 'reading',
+			progress: 0,
+			controller: new AbortController()
+		};
+		videoJobs = [...videoJobs, job];
+		const generation = editorGeneration;
+		const signal = job.controller.signal;
+		try {
+			const prepared = await prepareVideo(file, {
+				signal,
+				onProgress: (phase, fraction) => updateVideoJob(job.id, { phase, progress: fraction })
+			});
+			if (prepared.file.size > MAX_VIDEO_BYTES) {
+				throw new Error(
+					`Videos can be up to ${MAX_VIDEO_BYTES / 1_000_000} MB — this one is ${Math.round(prepared.file.size / 1_000_000)} MB. Trim it or export it smaller.`
+				);
+			}
+			if (signal.aborted) return;
+			const id = await persistAll(true);
+			if (!id) throw new Error('Could not create draft for upload');
+			if (signal.aborted || generation !== editorGeneration) return;
+			updateVideoJob(job.id, { phase: 'uploading', progress: 0 });
+			const item = await uploadVideo<MediaItem>(id, {
+				file: prepared.file,
+				segmentIndex,
+				signal,
+				onProgress: (fraction) => updateVideoJob(job.id, { progress: fraction })
+			});
+			if (generation !== editorGeneration) return;
+			media = [...media, { ...item, segmentIndex: item.segmentIndex ?? segmentIndex }];
+			showToast('Video attached', 'success');
+			if (prepared.poster) {
+				await saveCover(item.id, prepared.poster, null).catch(() => {});
+			}
+		} catch (e) {
+			if (signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) {
+				if (generation === editorGeneration) showToast('Video upload cancelled', 'warn');
+				return;
+			}
+			const message =
+				e instanceof VideoPrepareError || e instanceof Error ? e.message : 'Upload failed';
+			showToast(message, 'error');
+		} finally {
+			videoJobs = videoJobs.filter((j) => j.id !== job.id);
+		}
+	}
+
+	async function saveCover(mediaId: string, jpeg: Blob, atMs: number | null) {
+		if (!draftId) return;
+		const query = new URLSearchParams({ mediaId });
+		if (atMs !== null) query.set('atMs', String(atMs));
+		const res = await fetch(`/api/drafts/${draftId}/media/cover?${query}`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'image/jpeg' },
+			body: jpeg
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok) throw new Error(data.error || 'Could not save the cover');
+		const meta = (data.media as MediaItem | undefined)?.meta ?? null;
+		media = media.map((m) => (m.id === mediaId ? { ...m, meta } : m));
+	}
+
+	async function chooseCover(jpeg: Blob, atMs: number | null) {
+		const mediaId = coverFor;
+		if (!mediaId || coverBusy) return;
+		coverBusy = true;
+		try {
+			await saveCover(mediaId, jpeg, atMs);
+			coverFor = null;
+			showToast('Cover saved', 'success');
+		} catch (e) {
+			showToast(e instanceof Error ? e.message : 'Could not save the cover', 'error');
+		} finally {
+			coverBusy = false;
+		}
+	}
+
+	async function removeCover() {
+		const mediaId = coverFor;
+		if (!mediaId || !draftId || coverBusy) return;
+		coverBusy = true;
+		try {
+			const res = await fetch(
+				`/api/drafts/${draftId}/media/cover?${new URLSearchParams({ mediaId })}`,
+				{ method: 'DELETE' }
+			);
+			const data = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(data.error || 'Could not remove the cover');
+			const meta = (data.media as MediaItem | undefined)?.meta ?? null;
+			media = media.map((m) => (m.id === mediaId ? { ...m, meta } : m));
+			coverFor = null;
+		} catch (e) {
+			showToast(e instanceof Error ? e.message : 'Could not remove the cover', 'error');
+		} finally {
+			coverBusy = false;
+		}
+	}
+
+	const jobsFor = (segmentIndex: number) =>
+		videoJobs.filter((job) => job.segmentIndex === segmentIndex);
+	const isVideoItem = (m: { mime?: string | null }) => (m.mime || '').startsWith('video/');
+	const mediaSrc = (m: MediaItem) =>
+		m.previewUrl || `/api/media/${encodeURIComponent(m.storageKey)}`;
+	const coverSrc = (m: MediaItem) =>
+		m.meta?.cover
+			? `/api/media/${encodeURIComponent(m.storageKey)}?cover=${m.meta.cover.v}`
+			: undefined;
+	/** Each selected account with the limits it is held to. */
+	const selectedVideoAccounts = $derived(
+		connections
+			.filter((c) => selected.has(c.id))
+			.map((c) => ({ platform: c.platform, meta: c.metaJson ?? null }))
+	);
+	// The first rule a selected account would refuse an attached video for;
+	// Publish and Schedule stop on it like on an over-limit image.
+	const videoProblem = $derived.by(() => {
+		for (const m of media) {
+			if (!isVideoItem(m)) continue;
+			for (const account of selectedVideoAccounts) {
+				const message = firstVideoError(account.platform, factsOfMedia(m), account.meta);
+				if (message) return message;
+			}
+		}
+		return null;
+	});
 
 	const altTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 	const altPending: Record<string, string> = {};
@@ -2218,7 +2431,7 @@
 	});
 
 	function requestDiscard() {
-		if (discarding || saving || publishing || uploadingSegment !== null) {
+		if (discarding || saving || publishing || uploadingSegment !== null || videoJobs.length) {
 			showToast('Please wait…', 'warn');
 			return;
 		}
@@ -2508,6 +2721,11 @@
 
 	function onRemoveSegment(index: number) {
 		if (editLocked) return;
+		// An upload in flight was told which post it belongs to.
+		if (videoJobs.some((job) => job.segmentIndex >= index)) {
+			showToast('Wait for the video to finish uploading', 'warn');
+			return;
+		}
 		if (uploadingSegment === index) uploadingSegment = null;
 		else if (uploadingSegment !== null && uploadingSegment > index) uploadingSegment -= 1;
 		revealTrailing = null;
@@ -2613,7 +2831,7 @@
 		const files: File[] = [];
 		for (let i = 0; i < data.items.length; i++) {
 			const item = data.items[i];
-			if (item.kind === 'file' && (item.type.startsWith('image/') || item.type === 'video/mp4')) {
+			if (item.kind === 'file' && isMediaFile(item.type)) {
 				const f = item.getAsFile();
 				if (f) files.push(f);
 			}
@@ -2631,9 +2849,7 @@
 		e.preventDefault();
 		if (editLocked) return;
 		if (e.dataTransfer?.files?.length) {
-			const files = Array.from(e.dataTransfer.files).filter(
-				(f) => f.type.startsWith('image/') || f.type === 'video/mp4'
-			);
+			const files = Array.from(e.dataTransfer.files).filter((f) => isMediaFile(f.type));
 			if (files.length) void attachFilesToSegment(index, files);
 		}
 	}
@@ -2910,7 +3126,8 @@
 
 	$effect(() => {
 		const onBeforeUnload = (event: BeforeUnloadEvent) => {
-			if (!dirty) return;
+			// A video still converting or uploading is lost with the page.
+			if (!dirty && !videoJobs.length) return;
 			event.preventDefault();
 			event.returnValue = '';
 		};
@@ -3318,15 +3535,43 @@
 							class="w-full resize-none bg-transparent text-[15px] font-medium text-stone-900 placeholder:text-stone-500 focus:outline-none pointer-coarse:text-base"
 							rows="1"></textarea>
 
-						{#if segMedia.length > 0}
+						{#if segMedia.length > 0 || jobsFor(index).length > 0}
 							<div class="mt-3 flex flex-wrap gap-2" data-testid="segment-media-{index}">
+								{#each jobsFor(index) as job (job.id)}
+									<div
+										class="flex h-20 w-20 flex-col items-center justify-center gap-1 rounded-xl border border-stone-200/80 bg-stone-50 px-1 text-center"
+										data-testid="video-progress-{index}"
+										role="status"
+										aria-live="polite"
+									>
+										<LoaderCircle class="h-4 w-4 animate-spin text-stone-500" aria-hidden="true" />
+										<span class="text-[10px] leading-tight font-bold text-stone-700">
+											{job.phase === 'uploading'
+												? 'Uploading'
+												: job.phase === 'converting'
+													? 'Converting'
+													: 'Reading'}
+											{Math.round(job.progress * 100)}%
+										</span>
+										<button
+											type="button"
+											data-testid="video-cancel-{index}"
+											onclick={() => job.controller.abort()}
+											class="text-[10px] font-bold text-stone-500 underline-offset-2 hover:text-stone-900 hover:underline"
+											aria-label={`Cancel the video for post ${index + 1}`}
+										>
+											Cancel
+										</button>
+									</div>
+								{/each}
 								{#each segMedia as m (m.id)}
 									{@const hasAlt = Boolean((m.altText || '').trim())}
 									<div class="group/media relative">
-										{#if (m.mime || '').startsWith('video/')}
+										{#if isVideoItem(m)}
 											<!-- svelte-ignore a11y_media_has_caption -->
 											<video
-												src={m.previewUrl || `/api/media/${encodeURIComponent(m.storageKey)}`}
+												src={mediaSrc(m)}
+												poster={coverSrc(m)}
 												controls
 												preload="none"
 												width="80"
@@ -3334,6 +3579,18 @@
 												aria-label={`Attached video ${index + 1} (no captions)`}
 												class="h-20 w-20 rounded-xl border border-stone-200/80 bg-black object-cover"
 											></video>
+											{#if !editLocked}
+												<button
+													type="button"
+													data-testid="video-cover-{m.id}"
+													onclick={() => (coverFor = m.id)}
+													class="absolute -bottom-1.5 -left-1.5 z-10 min-h-6 rounded-md bg-black/60 px-1.5 py-px text-[9px] font-bold tracking-wide text-white shadow-sm"
+													title="Choose the cover"
+													aria-label={`Choose the cover for video ${index + 1}`}
+												>
+													COVER
+												</button>
+											{/if}
 										{:else}
 											<img
 												src={m.previewUrl || `/api/media/${encodeURIComponent(m.storageKey)}`}
@@ -3353,9 +3610,7 @@
 												? 'bg-black/60 text-white'
 												: 'bg-amber-400 text-black'}"
 											title={hasAlt ? 'Edit alt text' : 'Add alt text (accessibility)'}
-											aria-label={hasAlt
-												? `Edit alt text for image ${index + 1}`
-												: `Add alt text for image ${index + 1}`}
+											aria-label={`${hasAlt ? 'Edit' : 'Add'} alt text for ${isVideoItem(m) ? 'video' : 'image'} ${index + 1}`}
 										>
 											ALT
 										</button>
@@ -3400,8 +3655,8 @@
 										data-testid="media-alt-{m.id}"
 										readonly={editLocked}
 										oninput={(e) => updateMediaAlt(m.id, e.currentTarget.value)}
-										placeholder="Describe this image…"
-										aria-label={`Alt text for image ${index + 1}`}
+										placeholder={isVideoItem(m) ? 'Describe this video…' : 'Describe this image…'}
+										aria-label={`Alt text for ${isVideoItem(m) ? 'video' : 'image'} ${index + 1}`}
 										class="w-full rounded-lg border border-stone-200 bg-stone-50 px-2 py-1 text-[11px] font-medium text-stone-900 focus:border-stone-400 focus:bg-white focus:outline-none pointer-coarse:text-base"
 									/>
 									<div class="mt-1 flex justify-end">
@@ -3414,6 +3669,14 @@
 									</div>
 								</div>
 							{/if}
+						{/each}
+
+						{#each segMedia.filter(isVideoItem) as m (m.id)}
+							<VideoChecklist
+								facts={factsOfMedia(m)}
+								accounts={selectedVideoAccounts}
+								testId="video-checklist-{index}"
+							/>
 						{/each}
 
 						{#if quote}
@@ -4183,6 +4446,22 @@
 	{/if}
 </div>
 
+{#if coverFor}
+	{@const coverItem = media.find((m) => m.id === coverFor)}
+	{#if coverItem}
+		<VideoCover
+			open
+			src={mediaSrc(coverItem)}
+			atMs={coverItem.meta?.cover?.atMs ?? null}
+			hasCover={Boolean(coverItem.meta?.cover)}
+			busy={coverBusy}
+			onSave={(jpeg, atMs) => void chooseCover(jpeg, atMs)}
+			onRemove={() => void removeCover()}
+			onClose={() => (coverFor = null)}
+		/>
+	{/if}
+{/if}
+
 <ConfirmDialog
 	open={isDiscardOpen}
 	idPrefix="discard-draft-dialog"
@@ -4220,7 +4499,9 @@
 			}}
 		>
 			<h2 id="remove-media-title" class="text-sm font-extrabold text-stone-900">
-				Remove this image?
+				Remove this {media.some((m) => m.id === pendingMediaRemove && isVideoItem(m))
+					? 'video'
+					: 'image'}?
 			</h2>
 			<p id="remove-media-body" class="mt-1 text-sm font-medium text-stone-500">
 				It will be deleted from this draft.

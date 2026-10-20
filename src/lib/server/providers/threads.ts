@@ -6,11 +6,14 @@ import {
 import { validateThreadsText } from '#lib/domain/validation/text.js';
 import {
 	mediaByteLength,
+	processingError,
 	ProviderError,
 	PublishPartialError,
 	providerErrorForStatus,
+	resumedVideoState,
 	unconfirmedPostError
 } from './types';
+import { isVideoAttachment, pollVideo, segmentVideo, videoValidation } from './video';
 import type {
 	ConnectionCredentials,
 	ConnectionMeta,
@@ -99,6 +102,7 @@ function normalizeSegment(seg: NormalizedPost): {
 	const text = (seg.text ?? '').trim();
 	const media = (seg.media ?? []).slice(0, THREADS_MAX_IMAGES);
 	if (!text && media.length === 0) throw new Error('Segment needs text or an image');
+	if (segmentVideo(media)) return { text, media };
 	for (const m of media) {
 		if (!THREADS_IMAGE_MIMES.has((m.mime || '').toLowerCase())) {
 			throw new Error('Threads images must be JPEG or PNG');
@@ -397,7 +401,7 @@ export const threadsProvider: PlatformProvider = {
 		supportsThreads: true
 	},
 
-	validate(content: NormalizedPost): ValidationIssue[] {
+	validate(content: NormalizedPost, meta?: ConnectionMeta): ValidationIssue[] {
 		const issues: ValidationIssue[] = [];
 		const segments = content.thread && content.thread.length > 0 ? content.thread : [content];
 		for (let i = 0; i < segments.length; i++) {
@@ -425,13 +429,10 @@ export const threadsProvider: PlatformProvider = {
 					code: 'max_images'
 				});
 			}
+			issues.push(...videoValidation('threads', seg.media, meta, `thread[${i}].media`));
 			for (const m of segMedia) {
-				if ((m.mime || '').toLowerCase().startsWith('video/')) {
-					issues.push({
-						field: `thread[${i}].media`,
-						message: 'Threads video is not supported yet — post it to LinkedIn',
-						code: 'no_video'
-					});
+				if (isVideoAttachment(m)) {
+					continue;
 				} else if (!THREADS_IMAGE_MIMES.has((m.mime || '').toLowerCase())) {
 					issues.push({
 						field: `thread[${i}].media`,
@@ -759,12 +760,83 @@ export const threadsProvider: PlatformProvider = {
 			return createContainer(params);
 		}
 
+		/**
+		 * A video container takes Meta anywhere from seconds to minutes. Wait
+		 * inside this request while it is cheap to, then park the container id
+		 * so a later run picks it up (processingError) instead of making a
+		 * second container and uploading the video again.
+		 */
+		async function readyVideoContainer(
+			segmentIndex: number,
+			text: string,
+			video: NonNullable<NormalizedPost['media']>[number],
+			reply: Record<string, string>,
+			fresh = false
+		): Promise<string> {
+			if (!video.storageKey) throw new Error('Threads video is missing its storage key');
+			const resumed = fresh
+				? null
+				: resumedVideoState(opts?.resume, segmentIndex, video.storageKey);
+			let containerId = typeof resumed?.containerId === 'string' ? resumed.containerId : '';
+			if (!containerId) {
+				if (!opts?.mediaUrlFor) throw new Error('Threads video posts need a media signer');
+				const params: Record<string, string> = {
+					media_type: 'VIDEO',
+					video_url: await opts.mediaUrlFor(video.storageKey),
+					...reply
+				};
+				if (text) params.text = text;
+				if (video.alt) params.alt_text = video.alt;
+				containerId = await createContainer(params);
+			}
+			const id = containerId;
+			let expired = false;
+			// The publish call and the permalink lookup still need room.
+			const ready = await pollVideo(
+				{
+					polls: CONTAINER_STATUS_ATTEMPTS,
+					delayMs: CONTAINER_STATUS_POLL_MS,
+					reserve: 6,
+					callsLeft: opts?.callsLeft
+				},
+				async () => {
+					const state = await readContainerStatus(id);
+					if (state?.state === 'ready') return id;
+					if (state?.state === 'failed') {
+						// A container lives for a day; one that outlived a long wait
+						// is made again from the same video.
+						if (state.status === 'EXPIRED' && resumed) {
+							expired = true;
+							return id;
+						}
+						throw new ProviderError(
+							`Threads media container ${state.status.toLowerCase()}: ${state.detail}`,
+							{ code: 'forbidden', detail: state.detail }
+						);
+					}
+					return null;
+				}
+			);
+			if (expired) return readyVideoContainer(segmentIndex, text, video, reply, true);
+			if (ready) return ready;
+			throw processingError('Threads', {
+				segment: segmentIndex,
+				storageKey: video.storageKey,
+				state: { containerId }
+			});
+		}
+
 		async function publishSegment(
+			segmentIndex: number,
 			text: string,
 			media: NonNullable<NormalizedPost['media']>,
 			replyToId: string | undefined
 		): Promise<string> {
 			const reply: Record<string, string> = replyToId ? { reply_to_id: replyToId } : {};
+			const video = segmentVideo(media);
+			if (video) {
+				return publishContainer(await readyVideoContainer(segmentIndex, text, video, reply));
+			}
 			let containerId: string;
 			if (media.length === 0) {
 				containerId = await createContainer({ media_type: 'TEXT', text, ...reply });
@@ -808,7 +880,7 @@ export const threadsProvider: PlatformProvider = {
 			try {
 				const seg = segments[i];
 				const { text, media } = normalizeSegment(seg);
-				const mediaId = await publishSegment(text, media, replyTo);
+				const mediaId = await publishSegment(i, text, media, replyTo);
 				segmentIds.push(mediaId);
 				if (!permalinkPromise && mediaId) {
 					// startAt was 0: this segment is the thread root.
@@ -833,7 +905,8 @@ export const threadsProvider: PlatformProvider = {
 				if (segmentIds.length) {
 					throw new PublishPartialError(message, {
 						segmentIds,
-						remoteUrl: (await resolvedRemoteUrl()) ?? null
+						remoteUrl: (await resolvedRemoteUrl()) ?? null,
+						cause: err
 					});
 				}
 				throw err;

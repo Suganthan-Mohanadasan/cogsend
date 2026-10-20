@@ -113,6 +113,35 @@ export function countingMediaStore(store: MediaStore, budget: SubrequestBudget):
 			return open(key, range);
 		};
 	}
+	if (store.copy) {
+		const copy = store.copy.bind(store);
+		// A get and a put.
+		counted.copy = (from, to) => {
+			budget.count(2);
+			return copy(from, to);
+		};
+	}
+	if (store.multipart) {
+		const multipart = store.multipart;
+		counted.multipart = {
+			create: (key, mime) => {
+				budget.count();
+				return multipart.create(key, mime);
+			},
+			uploadPart: (key, uploadId, partNumber, body) => {
+				budget.count();
+				return multipart.uploadPart(key, uploadId, partNumber, body);
+			},
+			complete: (key, uploadId, parts) => {
+				budget.count();
+				return multipart.complete(key, uploadId, parts);
+			},
+			abort: (key, uploadId) => {
+				budget.count();
+				return multipart.abort(key, uploadId);
+			}
+		};
+	}
 	if (store.deleteMany) {
 		const deleteMany = store.deleteMany.bind(store);
 		counted.deleteMany = (keys) => {

@@ -147,6 +147,42 @@ describe('POST /api/connections/[id]/verify — session only, gate before write'
 		vi.unstubAllGlobals();
 	});
 
+	it('stores the limits the instance reports, and keeps what it knew when the instance does not say', async () => {
+		const stored = { maxCharacters: 5000, videoSizeLimit: 40_000_000 };
+		const conn = await addConnection(ownerId, {
+			credentialsEncrypted: await encryptJson(
+				{ instanceUrl: 'https://mastodon.example', accessToken: 'good-token' },
+				TEST_ENV.APP_ENCRYPTION_KEY
+			),
+			metaJson: JSON.stringify(stored)
+		});
+		let instance: () => Response = () => new Response('', { status: 503 });
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (input: unknown) =>
+				String(input).endsWith('/api/v2/instance')
+					? instance()
+					: Response.json({ id: '1', username: 'me', display_name: 'Me' })
+			)
+		);
+		const meta = async () => JSON.parse((await statusOf(conn)).metaJson ?? '{}');
+
+		expect((await verify(conn)).status).toBe(200);
+		expect(await meta()).toEqual(stored);
+
+		instance = () => Response.json({ version: '4.3.0' });
+		expect((await verify(conn)).status).toBe(200);
+		expect(await meta()).toEqual(stored);
+
+		instance = () =>
+			Response.json({
+				configuration: { media_attachments: { video_size_limit: 99_000_000 } }
+			});
+		expect((await verify(conn)).status).toBe(200);
+		expect(await meta()).toEqual({ maxCharacters: 5000, videoSizeLimit: 99_000_000 });
+		vi.unstubAllGlobals();
+	});
+
 	it('refuses to follow an instance that redirects to an internal address', async () => {
 		const conn = await addConnection(ownerId, {
 			credentialsEncrypted: await encryptJson(

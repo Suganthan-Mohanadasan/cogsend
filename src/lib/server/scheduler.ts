@@ -507,12 +507,15 @@ export async function consumePublishJob(
 	env: AppEnv,
 	store: MediaStore,
 	targetId: string,
-	fetchImpl?: typeof fetch
+	fetchImpl?: typeof fetch,
+	budget?: SubrequestBudget
 ) {
 	// A retryable failure is not thrown back to the queue. publishTarget has
 	// already rescheduled the row with backoff, so an immediate redelivery could
 	// never claim it — it would only spend a queue retry. The tick hands the row
 	// to the queue again once it is due. Infrastructure errors still throw, and
 	// the queue retries those.
-	return publishTarget(db, env, store, targetId, { fetchImpl });
+	// The budget lets a video upload park before the request runs out of calls;
+	// one job is one target, so it is never deferred.
+	return publishTarget(db, env, store, targetId, { fetchImpl, budget, mustTry: true });
 }

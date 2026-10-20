@@ -26,7 +26,7 @@ import {
 	draftVariants,
 	publishTargets
 } from '#lib/server/db/schema.js';
-import { batchQueries, chunkIds, first, newId } from '#lib/server/db/client.js';
+import { batchQueries, chunkIds, first, newId, parseJson } from '#lib/server/db/client.js';
 import { serializeDraft, serializeVariant } from '#lib/server/serialize.js';
 import {
 	MAX_VARIANT_OPTIONS_LENGTH,
@@ -52,9 +52,17 @@ import { refreshDraftStatus, publishTarget } from '#lib/server/publish.js';
 import { humanizedCause } from '#lib/domain/human-error.js';
 import type { SubrequestBudget } from '#lib/server/budget.js';
 import { randomHex } from '#lib/domain/bytes.js';
-import { validateImageUpload, validateVideoUpload } from '#lib/domain/media-limits.js';
+import { MAX_VIDEO_BYTES, validateImageUpload } from '#lib/domain/media-limits.js';
+import type { Mp4Facts } from '#lib/domain/mp4-probe.js';
 import { validatePollConfig } from '#lib/domain/poll.js';
-import { assertSafeStorageKey, deleteMediaObjects } from '#lib/server/media.js';
+import {
+	assertSafeStorageKey,
+	coverKey,
+	deleteMediaObjects,
+	probeStoredVideo,
+	videoMetaFrom,
+	type StoredVideoMeta
+} from '#lib/server/media.js';
 import { STALE_CLAIM_MS } from '#lib/domain/due-jobs.js';
 import { ApiOperationError } from '#lib/server/api/operation-error.js';
 import { DRAFTS_LIST_LIMIT, DRAFTS_LIST_MAX_LIMIT, loadQueueList } from '#lib/server/post-list.js';
@@ -303,7 +311,12 @@ export async function retryDelivery(ctx: OperationContext, userId: string, id: s
 			return { status: 'published', remotePostId: latest.remotePostId, skipped: true };
 		invalid('Already publishing', 409);
 	}
-	const task = publishTarget(ctx.db, ctx.env, ctx.media, id, { now });
+	// The budget lets a video upload park before the request runs out of calls.
+	const task = publishTarget(ctx.db, ctx.env, ctx.media, id, {
+		now,
+		budget: ctx.budget,
+		mustTry: true
+	});
 	ctx.waitUntil?.(task.then(() => undefined).catch(() => undefined));
 	return task;
 }
@@ -368,10 +381,39 @@ export async function rescheduleDelivery(
 
 // The shape saveMediaBytes mints; anything else fails the serving route's key check.
 const ALLOWED_MEDIA_EXTENSIONS = new Set(['jpg', 'png', 'webp', 'gif', 'mp4']);
-// 11 bound parameters per media row; D1 caps a query at 100.
+// 12 bound parameters per media row; D1 caps a query at 100.
 const MEDIA_INSERT_CHUNK = 8;
 const VARIANT_PLATFORMS = new Set(['mastodon', 'bluesky', 'linkedin', 'threads', 'x']);
 const VISIBILITIES = new Set(['public', 'unlisted', 'private', 'direct']);
+
+/**
+ * Copy a stored video in storage, without reading it into the isolate (a
+ * 300 MB file would not fit), then read back what was copied: the source row
+ * is not trusted. Its cover comes along. Null when there is nothing playable
+ * to copy, in which case nothing is left behind.
+ */
+async function copyVideo(
+	store: OperationContext['media'],
+	item: { storageKey: string; metaJson: string | null },
+	storageKey: string
+): Promise<{ size: number; facts: Mp4Facts; meta: StoredVideoMeta } | null> {
+	if (!store.copy || !store.size) return null;
+	if (!(await store.copy(item.storageKey, storageKey))) return null;
+	try {
+		const size = (await store.size(storageKey)) ?? 0;
+		const facts = await probeStoredVideo(store, storageKey, size);
+		if (!facts?.videoCodec || size <= 0 || size > MAX_VIDEO_BYTES) throw new Error('unplayable');
+		const meta = videoMetaFrom(facts);
+		const cover = parseJson<Partial<StoredVideoMeta>>(item.metaJson, {}).cover;
+		if (cover && (await store.copy(coverKey(item.storageKey), coverKey(storageKey)))) {
+			meta.cover = cover;
+		}
+		return { size, facts, meta };
+	} catch {
+		await deleteMediaObjects(store, [storageKey]).catch(() => {});
+		return null;
+	}
+}
 
 export async function listDrafts(ctx: OperationContext, userId: string, requestedLimit?: number) {
 	const limit = Number.isFinite(requestedLimit)
@@ -532,9 +574,7 @@ export async function duplicateDraft(ctx: OperationContext, userId: string, draf
 		// A missing object skips that attachment rather than failing the copy.
 		const mediaValues: Array<typeof draftMedia.$inferInsert> = [];
 		for (const item of media) {
-			const bytes = await ctx.media.get(item.storageKey);
-			if (!bytes) continue;
-			// The row is not trusted: re-check the key shape and sniff the bytes.
+			// The row is not trusted: re-check the key shape and what is stored.
 			let extension: string;
 			try {
 				extension = assertSafeStorageKey(item.storageKey).split('.').pop() ?? '';
@@ -542,11 +582,31 @@ export async function duplicateDraft(ctx: OperationContext, userId: string, draf
 				continue;
 			}
 			if (!ALLOWED_MEDIA_EXTENSIONS.has(extension)) continue;
-			const validated = (item.mime || '').toLowerCase().startsWith('video/')
-				? validateVideoUpload({ mime: item.mime, size: bytes.length, bytes })
-				: validateImageUpload({ mime: item.mime, size: bytes.length, bytes });
-			if (!validated.ok) continue;
 			const storageKey = `${Date.now()}-${randomHex(8)}.${extension}`;
+			if ((item.mime || '').toLowerCase().startsWith('video/')) {
+				const copied = await copyVideo(ctx.media, item, storageKey);
+				if (!copied) continue;
+				savedKeys.push(storageKey);
+				mediaValues.push({
+					id: newId(),
+					draftId: newDraftId,
+					storageKey,
+					mime: 'video/mp4',
+					size: copied.size,
+					width: copied.facts.width,
+					height: copied.facts.height,
+					metaJson: JSON.stringify(copied.meta),
+					altText: item.altText,
+					sortOrder: item.sortOrder,
+					segmentIndex: item.segmentIndex,
+					createdAt: now
+				});
+				continue;
+			}
+			const bytes = await ctx.media.get(item.storageKey);
+			if (!bytes) continue;
+			const validated = validateImageUpload({ mime: item.mime, size: bytes.length, bytes });
+			if (!validated.ok) continue;
 			await ctx.media.put(storageKey, bytes, validated.mime);
 			savedKeys.push(storageKey);
 			mediaValues.push({
@@ -576,7 +636,7 @@ export async function duplicateDraft(ctx: OperationContext, userId: string, draf
 			draft: serializeDraft(draft, { variants: newVariants, media: newMedia, targets: [] })
 		};
 	} catch (error) {
-		for (const key of savedKeys) await ctx.media.delete(key).catch(() => {});
+		await deleteMediaObjects(ctx.media, savedKeys).catch(() => {});
 		await ctx.db
 			.delete(drafts)
 			.where(eq(drafts.id, newDraftId))

@@ -13,15 +13,26 @@ import type {
 	PublishResult,
 	ValidationIssue
 } from './types';
-import { mediaByteLength, ProviderError, unconfirmedPostError } from './types';
+import {
+	mediaByteLength,
+	processingError,
+	ProviderError,
+	resumedVideoState,
+	unconfirmedPostError
+} from './types';
+import {
+	pollVideo,
+	readVideoSlice,
+	requireMediaReader,
+	storedVideoSize,
+	videoValidation
+} from './video';
 import { LINKEDIN_MAX_IMAGE_BYTES, LINKEDIN_MAX_IMAGES } from '#lib/domain/media-limits.js';
 import { providerFetch } from './timed-fetch';
 
 export const LINKEDIN_MAX_CHARS = 3000;
 export { LINKEDIN_MAX_IMAGE_BYTES, LINKEDIN_MAX_IMAGES } from '#lib/domain/media-limits.js';
-// Single mp4 per post; 95MB keeps uploads under the Worker request body limit.
 export const LINKEDIN_VIDEO_MIMES = ['video/mp4'];
-export const LINKEDIN_MAX_VIDEO_BYTES = 95_000_000;
 // LinkedIn versions are YYYYMM and each is supported for at least a year from
 // its release, so 202609 is good until at least September 2027. Bump it before
 // then (changelog: learn.microsoft.com/linkedin/marketing/integrations/recent-changes).
@@ -185,21 +196,47 @@ function normalizeVideoInstructions(value: unknown, fileSize: number): VideoInst
 	return out;
 }
 
+interface VideoUploadState {
+	videoUrn: string;
+	uploadToken: string;
+	instructions: VideoInstruction[];
+	thumbnailUrl?: string;
+	/** ETags of the parts sent so far, in order. */
+	etags: string[];
+	thumbnailSent?: boolean;
+	finalized?: boolean;
+}
+
+function videoUploadState(value: Record<string, unknown> | null): VideoUploadState | null {
+	if (!value) return null;
+	const v = value as Partial<VideoUploadState>;
+	if (
+		typeof v.videoUrn !== 'string' ||
+		typeof v.uploadToken !== 'string' ||
+		!Array.isArray(v.instructions) ||
+		!Array.isArray(v.etags)
+	) {
+		return null;
+	}
+	return v as VideoUploadState;
+}
+
 async function initializeVideoUpload(
 	token: string,
 	ownerUrn: string,
-	bytes: Uint8Array,
+	fileSize: number,
+	withThumbnail: boolean,
 	fetchImpl: FetchLike
-): Promise<{ instructions: VideoInstruction[]; uploadToken: string; videoUrn: string }> {
+): Promise<VideoUploadState> {
 	const res = await fetchImpl('https://api.linkedin.com/rest/videos?action=initializeUpload', {
 		method: 'POST',
 		headers: restHeaders(token),
 		body: JSON.stringify({
 			initializeUploadRequest: {
 				owner: ownerUrn,
-				fileSizeBytes: bytes.length,
+				fileSizeBytes: fileSize,
 				uploadCaptions: false,
-				uploadThumbnail: false
+				uploadThumbnail: withThumbnail
 			}
 		})
 	});
@@ -215,46 +252,48 @@ async function initializeVideoUpload(
 			uploadInstructions?: unknown;
 			uploadToken?: string;
 			video?: string;
+			thumbnailUploadUrl?: string;
 		};
 	};
 	const value = data.value ?? {};
-	const instructions = normalizeVideoInstructions(value, bytes.length);
+	const instructions = normalizeVideoInstructions(value, fileSize);
 	const videoUrn = value.video ?? '';
 	const uploadToken = value.uploadToken ?? '';
 	if (!videoUrn || instructions.length === 0) {
 		throw new Error('LinkedIn video init returned no upload instructions');
 	}
-	return { instructions, uploadToken, videoUrn };
+	return {
+		videoUrn,
+		uploadToken,
+		instructions,
+		...(value.thumbnailUploadUrl ? { thumbnailUrl: value.thumbnailUploadUrl } : {}),
+		etags: []
+	};
 }
 
-async function uploadVideoParts(
-	bytes: Uint8Array,
-	instructions: VideoInstruction[],
+async function uploadVideoPart(
+	slice: Uint8Array,
+	url: string,
 	mime: string,
 	fetchImpl: FetchLike
-): Promise<string[]> {
-	const partIds: string[] = [];
-	for (const inst of instructions) {
-		const slice = bytes.slice(inst.firstByte, inst.lastByte + 1);
-		const res = await fetchImpl(inst.url, {
-			method: 'PUT',
-			headers: { 'Content-Type': mime },
-			body: slice as unknown as BodyInit
-		});
-		if (!res.ok)
-			throw Object.assign(
-				new Error(
-					`LinkedIn video part upload failed (${res.status}): ${(await res.text()).slice(0, 300)}`
-				),
-				{ status: res.status }
-			);
-		// Headers.get is case-insensitive; a missing ETag means finalize would
-		// fail opaquely — throw here with context instead of pushing ''.
-		const etag = res.headers.get('ETag');
-		if (!etag) throw new Error('LinkedIn video part upload returned no ETag');
-		partIds.push(etag.replace(/^"|"$/g, ''));
-	}
-	return partIds;
+): Promise<string> {
+	const res = await fetchImpl(url, {
+		method: 'PUT',
+		headers: { 'Content-Type': mime },
+		body: slice as unknown as BodyInit
+	});
+	if (!res.ok)
+		throw Object.assign(
+			new Error(
+				`LinkedIn video part upload failed (${res.status}): ${(await res.text()).slice(0, 300)}`
+			),
+			{ status: res.status }
+		);
+	// Headers.get is case-insensitive; a missing ETag means finalize would
+	// fail opaquely — throw here with context instead of pushing ''.
+	const etag = res.headers.get('ETag');
+	if (!etag) throw new Error('LinkedIn video part upload returned no ETag');
+	return etag.replace(/^"|"$/g, '');
 }
 
 async function finalizeVideoUpload(
@@ -282,6 +321,113 @@ async function finalizeVideoUpload(
 			),
 			{ status: res.status }
 		);
+}
+
+/** AVAILABLE, PROCESSING, WAITING_UPLOAD or PROCESSING_FAILED; null when unreadable. */
+async function videoStatus(
+	token: string,
+	videoUrn: string,
+	fetchImpl: FetchLike
+): Promise<string | null> {
+	try {
+		const res = await fetchImpl(
+			`https://api.linkedin.com/rest/videos/${encodeURIComponent(videoUrn)}`,
+			{ headers: restHeaders(token) }
+		);
+		if (!res.ok) return null;
+		const data = (await res.json()) as { status?: unknown };
+		return typeof data.status === 'string' ? data.status : null;
+	} catch {
+		return null;
+	}
+}
+
+// Calls kept back for the status check, the post and publish.ts's own writes.
+const VIDEO_RESERVE_CALLS = 8;
+const VIDEO_STATUS_POLLS = 4;
+const VIDEO_STATUS_POLL_MS = 3000;
+
+/**
+ * Upload, finalize and wait for a video, across as many runs as it takes:
+ * each part is read from storage as it is sent (a 300 MB file never sits in
+ * memory), and the run parks with the parts sent so far when the request is
+ * about to run out of calls or LinkedIn is still processing.
+ */
+async function readyVideo(
+	video: MediaAttachment,
+	token: string,
+	owner: string,
+	fetchImpl: FetchLike,
+	opts: Parameters<PlatformProvider['publish']>[4]
+): Promise<string> {
+	if (!video.storageKey) throw new Error('LinkedIn video is missing its storage key');
+	const storageKey = video.storageKey;
+	const reader = requireMediaReader(opts?.mediaReader);
+	const callsLeft = opts?.callsLeft ?? (() => Infinity);
+	let state = videoUploadState(resumedVideoState(opts?.resume, 0, storageKey));
+	const park = (current: VideoUploadState, retryAfterMs: number): never => {
+		throw processingError(
+			'LinkedIn',
+			{ segment: 0, storageKey, state: current as unknown as Record<string, unknown> },
+			retryAfterMs
+		);
+	};
+	if (!state) {
+		const size = await storedVideoSize(reader, storageKey);
+		state = await initializeVideoUpload(token, owner, size, Boolean(video.coverKey), fetchImpl);
+	}
+	while (state.etags.length < state.instructions.length) {
+		// A part is a storage read and an upload.
+		if (callsLeft() < VIDEO_RESERVE_CALLS + 2) park(state, 15_000);
+		const inst = state.instructions[state.etags.length];
+		const slice = await readVideoSlice(reader, storageKey, inst.firstByte, inst.lastByte);
+		const etag = await uploadVideoPart(slice, inst.url, video.mime, fetchImpl);
+		state = { ...state, etags: [...state.etags, etag] };
+	}
+	if (!state.finalized) {
+		// A chosen cover goes before finalize, or LinkedIn keeps its own frame;
+		// a failed upload is not worth failing the post over.
+		if (state.thumbnailUrl && video.coverKey && !state.thumbnailSent) {
+			if (callsLeft() < VIDEO_RESERVE_CALLS + 3) park(state, 15_000);
+			try {
+				const coverSize = await reader.size(video.coverKey);
+				const cover = coverSize ? await reader.getRange(video.coverKey, 0, coverSize - 1) : null;
+				if (cover) {
+					await fetchImpl(state.thumbnailUrl, {
+						method: 'PUT',
+						headers: { 'Content-Type': 'image/jpeg' },
+						body: cover as unknown as BodyInit
+					});
+				}
+			} catch {
+				/* keep LinkedIn's frame */
+			}
+			state = { ...state, thumbnailSent: true };
+		}
+		if (callsLeft() < VIDEO_RESERVE_CALLS + 1) park(state, 15_000);
+		await finalizeVideoUpload(token, state.videoUrn, state.uploadToken, state.etags, fetchImpl);
+		state = { ...state, finalized: true };
+	}
+	const videoUrn = state.videoUrn;
+	const ready = await pollVideo(
+		{
+			polls: VIDEO_STATUS_POLLS,
+			delayMs: VIDEO_STATUS_POLL_MS,
+			reserve: VIDEO_RESERVE_CALLS,
+			callsLeft
+		},
+		async () => {
+			const status = await videoStatus(token, videoUrn, fetchImpl);
+			if (status === 'AVAILABLE') return videoUrn;
+			if (status === 'PROCESSING_FAILED') {
+				throw new ProviderError('LinkedIn could not process the video — attach it again', {
+					code: 'forbidden'
+				});
+			}
+			return null;
+		}
+	);
+	return ready ?? park(state, 30_000);
 }
 
 async function putImageBytes(
@@ -351,7 +497,7 @@ export const linkedinProvider: PlatformProvider = {
 		supportsThreads: false
 	},
 
-	validate(content: NormalizedPost): ValidationIssue[] {
+	validate(content: NormalizedPost, meta?: ConnectionMeta): ValidationIssue[] {
 		const issues: ValidationIssue[] = [];
 		// Validate the flattened single post: LinkedIn combines every thread
 		// segment into one post, so limits apply to the joined text and the
@@ -390,13 +536,10 @@ export const linkedinProvider: PlatformProvider = {
 		for (const m of videos) {
 			if (!LINKEDIN_VIDEO_MIMES.includes((m.mime || '').toLowerCase())) {
 				issues.push({ field: 'media', message: 'LinkedIn video must be MP4', code: 'mime' });
-			} else if (mediaByteLength(m) > LINKEDIN_MAX_VIDEO_BYTES) {
-				issues.push({
-					field: 'media',
-					message: 'LinkedIn allows max 95MB per video',
-					code: 'max_video_bytes'
-				});
 			}
+		}
+		if (videos.length === 1 && images.length === 0) {
+			issues.push(...videoValidation('linkedin', media, meta, 'media'));
 		}
 		for (const m of images) {
 			if (mediaByteLength(m) > LINKEDIN_MAX_IMAGE_BYTES) {
@@ -450,13 +593,7 @@ export const linkedinProvider: PlatformProvider = {
 			if (!LINKEDIN_VIDEO_MIMES.includes((video.mime || '').toLowerCase())) {
 				throw new Error('LinkedIn video must be MP4');
 			}
-			const bytes = await loadBytes(video);
-			if (bytes.length > LINKEDIN_MAX_VIDEO_BYTES)
-				throw new Error('LinkedIn allows max 95MB per video');
-			const init = await initializeVideoUpload(token, owner, bytes, fetchImpl);
-			const partIds = await uploadVideoParts(bytes, init.instructions, video.mime, fetchImpl);
-			await finalizeVideoUpload(token, init.videoUrn, init.uploadToken, partIds, fetchImpl);
-			videoUrn = init.videoUrn;
+			videoUrn = await readyVideo(video, token, owner, fetchImpl, opts);
 		}
 		const imageUrns: string[] = [];
 		for (const m of images) {

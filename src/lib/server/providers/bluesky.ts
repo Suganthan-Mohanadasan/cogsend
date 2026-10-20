@@ -7,6 +7,7 @@ import { validateBlueskyText } from '#lib/domain/validation/text.js';
 import { BLUESKY_MAX_IMAGE_BYTES } from '#lib/domain/media-limits.js';
 import type {
 	ConnectionCredentials,
+	ConnectionMeta,
 	FetchLike,
 	MediaAttachment,
 	NormalizedPost,
@@ -16,10 +17,20 @@ import type {
 } from './types';
 import {
 	mediaByteLength,
+	processingError,
 	providerErrorForStatus,
 	ProviderError,
-	PublishPartialError
+	PublishPartialError,
+	resumedVideoState
 } from './types';
+import {
+	fixedLengthBody,
+	isVideoAttachment,
+	pollVideo,
+	requireMediaReader,
+	segmentVideo,
+	videoValidation
+} from './video';
 import { providerFetch } from './timed-fetch';
 
 const DEFAULT_PDS = 'https://bsky.social';
@@ -300,22 +311,209 @@ async function resolveExternalEmbed(
 	};
 }
 
+type PublishOpts = Parameters<PlatformProvider['publish']>[4];
+type BlobRef = { $type: string; ref: { $link: string }; mimeType: string; size: number };
+
+const VIDEO_SERVICE = 'https://video.bsky.app';
+const VIDEO_SERVICE_DID = 'did:web:video.bsky.app';
+const VIDEO_JOB_POLLS = 6;
+const VIDEO_JOB_POLL_MS = 2000;
+
+/**
+ * The host of the account's own PDS. A bsky.social login goes through an
+ * entryway that is not the PDS itself, and the video service hands the upload
+ * on to the PDS with a token addressed to it, so the DID document decides.
+ */
+async function pdsServiceHost(creds: ConnectionCredentials, fetchImpl: FetchLike): Promise<string> {
+	const fallback = new URL(pds(creds)).host;
+	const did = creds.did ?? '';
+	try {
+		let docUrl: string | null = null;
+		if (did.startsWith('did:plc:')) docUrl = `https://plc.directory/${encodeURIComponent(did)}`;
+		else if (did.startsWith('did:web:')) {
+			docUrl = `${sanitizeBlueskyPdsHost(decodeURIComponent(did.slice(8)))}/.well-known/did.json`;
+		}
+		if (!docUrl) return fallback;
+		const res = await fetchImpl(docUrl);
+		if (!res.ok) return fallback;
+		const doc = (await res.json()) as {
+			service?: { id?: string; type?: string; serviceEndpoint?: string }[];
+		};
+		const entry = doc.service?.find(
+			(s) => s.id === '#atproto_pds' || s.type === 'AtprotoPersonalDataServer'
+		);
+		return entry?.serviceEndpoint
+			? new URL(sanitizeBlueskyPdsHost(entry.serviceEndpoint)).host
+			: fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+async function serviceAuth(
+	creds: ConnectionCredentials,
+	aud: string,
+	lxm: string,
+	fetchImpl: FetchLike
+): Promise<string> {
+	const exp = Math.floor(Date.now() / 1000) + 30 * 60;
+	const ask = (session: ConnectionCredentials) =>
+		fetchImpl(
+			`${pds(session)}/xrpc/com.atproto.server.getServiceAuth?aud=${encodeURIComponent(aud)}&lxm=${encodeURIComponent(lxm)}&exp=${exp}`,
+			{ headers: { Authorization: `Bearer ${session.accessJwt}` } }
+		);
+	let res = await ask(creds);
+	if (res.status === 401) {
+		Object.assign(creds, await refreshSession(creds, fetchImpl));
+		res = await ask(creds);
+	}
+	if (!res.ok) throw upstreamError('Bluesky getServiceAuth', res.status, await res.text());
+	const data = (await res.json()) as { token?: string };
+	if (!data.token) throw new Error('Bluesky getServiceAuth returned no token');
+	return data.token;
+}
+
+interface VideoJob {
+	state?: string;
+	blob?: BlobRef;
+	error?: string;
+	message?: string;
+}
+
+function jobFailure(job: VideoJob): ProviderError {
+	return new ProviderError(
+		`Bluesky could not process the video: ${job.message || job.error || 'unknown error'}`,
+		{ code: 'forbidden' }
+	);
+}
+
+/**
+ * The video service transcodes before the post may reference the blob, which
+ * takes longer than a request is worth waiting: the job id is parked and a
+ * later run asks again (processingError). Daily limits and an unverified email
+ * are refused up front by getUploadLimits, with Bluesky's own words.
+ */
+async function uploadVideo(
+	creds: ConnectionCredentials,
+	video: MediaAttachment,
+	segmentIndex: number,
+	fetchImpl: FetchLike,
+	opts: PublishOpts
+): Promise<BlobRef> {
+	if (!video.storageKey) throw new Error('Bluesky video is missing its storage key');
+	const storageKey = video.storageKey;
+	const callsLeft = opts?.callsLeft ?? (() => Infinity);
+	const resumed = resumedVideoState(opts?.resume, segmentIndex, storageKey);
+	let jobId = typeof resumed?.jobId === 'string' ? resumed.jobId : '';
+	if (!jobId) {
+		const limitsToken = await serviceAuth(
+			creds,
+			VIDEO_SERVICE_DID,
+			'app.bsky.video.getUploadLimits',
+			fetchImpl
+		);
+		const limitsRes = await fetchImpl(`${VIDEO_SERVICE}/xrpc/app.bsky.video.getUploadLimits`, {
+			headers: { Authorization: `Bearer ${limitsToken}` }
+		});
+		if (limitsRes.ok) {
+			const limits = (await limitsRes.json()) as {
+				canUpload?: boolean;
+				message?: string;
+				error?: string;
+			};
+			if (limits.canUpload === false) {
+				throw new ProviderError(
+					`Bluesky will not take a video from this account right now: ${limits.message || limits.error || 'upload limit reached'}`,
+					{ code: 'forbidden' }
+				);
+			}
+		}
+		const pdsHost = await pdsServiceHost(creds, fetchImpl);
+		const uploadToken = await serviceAuth(
+			creds,
+			`did:web:${pdsHost}`,
+			'com.atproto.repo.uploadBlob',
+			fetchImpl
+		);
+		const stored = await requireMediaReader(opts?.mediaReader).open(storageKey);
+		if (!stored) throw new Error('The video file is missing from storage — attach it again');
+		const res = await fetchImpl(
+			`${VIDEO_SERVICE}/xrpc/app.bsky.video.uploadVideo?did=${encodeURIComponent(creds.did ?? '')}&name=${encodeURIComponent(storageKey)}`,
+			{
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${uploadToken}`,
+					'Content-Type': video.mime,
+					'Content-Length': String(stored.size)
+				},
+				body: fixedLengthBody(stored.body, stored.size),
+				duplex: 'half'
+			} as RequestInit
+		);
+		const answer = (await res.json().catch(() => ({}))) as VideoJob & {
+			jobId?: string;
+			jobStatus?: VideoJob & { jobId?: string };
+		};
+		const job = answer.jobStatus ?? answer;
+		// The same file uploaded before: the service answers with that job.
+		if (!res.ok && job.error !== 'already_exists') {
+			throw upstreamError('Bluesky uploadVideo', res.status, JSON.stringify(answer).slice(0, 300));
+		}
+		if (job.blob) return job.blob;
+		if (job.state === 'JOB_STATE_FAILED') throw jobFailure(job);
+		jobId = job.jobId ?? answer.jobId ?? '';
+		if (!jobId) throw new Error('Bluesky uploadVideo returned no job');
+	}
+	const job = jobId;
+	const blob = await pollVideo(
+		{ polls: VIDEO_JOB_POLLS, delayMs: VIDEO_JOB_POLL_MS, reserve: 6, callsLeft },
+		async () => {
+			const res = await fetchImpl(
+				`${VIDEO_SERVICE}/xrpc/app.bsky.video.getJobStatus?jobId=${encodeURIComponent(job)}`
+			);
+			if (!res.ok) return null;
+			const status = ((await res.json()) as { jobStatus?: VideoJob }).jobStatus ?? {};
+			if (status.blob) return status.blob;
+			if (status.state === 'JOB_STATE_FAILED') throw jobFailure(status);
+			return null;
+		}
+	);
+	if (blob) return blob;
+	throw processingError('Bluesky', { segment: segmentIndex, storageKey, state: { jobId } });
+}
+
 async function publishOne(
 	content: NormalizedPost,
 	creds: ConnectionCredentials,
 	fetchImpl: FetchLike,
 	reply?: { root: { uri: string; cid: string }; parent: { uri: string; cid: string } },
-	rkey?: string
+	rkey?: string,
+	video?: { segmentIndex: number; opts: PublishOpts }
 ): Promise<{ uri?: string; cid?: string }> {
 	let session = await ensureSession(creds, fetchImpl);
 	const media = content.media ?? [];
+	const single = segmentVideo(media);
 	let embed: unknown;
-	if (media.length > 0) {
+	if (single) {
+		const blob = await uploadVideo(
+			session,
+			single,
+			video?.segmentIndex ?? 0,
+			fetchImpl,
+			video?.opts
+		);
+		embed = {
+			$type: 'app.bsky.embed.video',
+			video: blob,
+			...(single.alt ? { alt: single.alt } : {}),
+			...(single.width && single.height
+				? { aspectRatio: { width: single.width, height: single.height } }
+				: {})
+		};
+	} else if (media.length > 0) {
 		const images = [];
 		for (const m of media.slice(0, 4)) {
-			if ((m.mime || '').toLowerCase().startsWith('video/')) {
-				throw new Error('Bluesky does not support video — post it to LinkedIn');
-			}
+			if (isVideoAttachment(m)) throw new Error('Videos cannot mix with images on the same post');
 			const blob = await uploadBlob(session, m, fetchImpl);
 			images.push({
 				alt: m.alt || '',
@@ -376,11 +574,12 @@ export const blueskyProvider: PlatformProvider = {
 		supportsThreads: true
 	},
 
-	validate(content: NormalizedPost): ValidationIssue[] {
+	validate(content: NormalizedPost, meta?: ConnectionMeta): ValidationIssue[] {
 		const issues: ValidationIssue[] = [];
 		const segments = content.thread && content.thread.length > 0 ? content.thread : [content];
 		for (let i = 0; i < segments.length; i++) {
 			const seg = segments[i];
+			issues.push(...videoValidation('bluesky', seg.media, meta, `thread[${i}].media`));
 			const hasMedia = (seg.media?.length ?? 0) > 0;
 			if (!seg.text?.trim() && !hasMedia) {
 				issues.push({
@@ -405,12 +604,8 @@ export const blueskyProvider: PlatformProvider = {
 				});
 			}
 			for (const m of seg.media ?? []) {
-				if ((m.mime || '').toLowerCase().startsWith('video/')) {
-					issues.push({
-						field: `thread[${i}].media`,
-						message: 'Bluesky does not support video — post it to LinkedIn',
-						code: 'no_video'
-					});
+				if (isVideoAttachment(m)) {
+					continue;
 				} else if (mediaByteLength(m) > BLUESKY_MAX_IMAGE_BYTES) {
 					issues.push({
 						field: `thread[${i}].media`,
@@ -458,7 +653,17 @@ export const blueskyProvider: PlatformProvider = {
 				// retry of a lost response hits the same key instead of creating a
 				// second post. It must be a TID: posts declare `"key": "tid"` and
 				// the PDS refuses any other record key.
-				const result = await publishOne(segments[i], creds, fetchImpl, reply, opts?.recordKey?.(i));
+				const result = await publishOne(
+					segments[i],
+					creds,
+					fetchImpl,
+					reply,
+					opts?.recordKey?.(i),
+					{
+						segmentIndex: i,
+						opts
+					}
+				);
 				// The count matters even when the ids are missing: the checkpoint
 				// is what stops a retry from reposting a segment.
 				segmentIds.push(result.uri ?? '');
@@ -491,7 +696,8 @@ export const blueskyProvider: PlatformProvider = {
 					throw new PublishPartialError(message, {
 						segmentIds,
 						segmentCids,
-						remoteUrl: opts?.resume?.remoteUrl || publicUrl(segmentIds[0], creds.handle)
+						remoteUrl: opts?.resume?.remoteUrl || publicUrl(segmentIds[0], creds.handle),
+						cause: err
 					});
 				}
 				throw err;

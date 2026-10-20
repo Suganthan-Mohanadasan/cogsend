@@ -1,6 +1,8 @@
 import type { PlatformId } from '#lib/domain/platforms.js';
+import { PROCESSING_MARK } from '#lib/domain/video-rules.js';
 export type { PlatformId } from '#lib/domain/platforms.js';
 export { PLATFORM_IDS, isPlatformId } from '#lib/domain/platforms.js';
+export { PROCESSING_MARK };
 
 export interface MediaAttachment {
 	storageKey?: string;
@@ -10,6 +12,16 @@ export interface MediaAttachment {
 	alt?: string;
 	width?: number;
 	height?: number;
+	/** What the server read from a video when it was stored (draft_media.meta_json). */
+	video?: {
+		durationMs?: number | null;
+		videoCodec?: string | null;
+		audioCodec?: string | null;
+		fps?: number | null;
+		faststart?: boolean | null;
+	} | null;
+	/** The chosen cover of a video, a JPEG in the media store. */
+	coverKey?: string;
 }
 
 export function mediaByteLength(media: MediaAttachment): number {
@@ -95,16 +107,35 @@ export interface ConnectionMeta {
 	xSubscription?: string;
 	longPosts?: boolean;
 	provider?: 'zernio';
+	/** Mastodon: the instance's video limits (`configuration.media_attachments`). */
+	videoSizeLimit?: number;
+	videoMatrixLimit?: number;
+	videoFrameRateLimit?: number;
 	zernioAccountId?: string;
 	zernioProfileId?: string;
 }
 
 export type FetchLike = typeof fetch;
 
+/**
+ * A video the platform is still taking in or processing, picked up on a later
+ * run instead of waited for: a large upload or a slow transcode outlasts one
+ * request. `state` belongs to the provider (a container id, an upload offset);
+ * publish.ts adds the timing.
+ */
+export interface PublishPending {
+	segment: number;
+	storageKey: string;
+	state: Record<string, unknown>;
+	/** When the first run started on this video, for the overall deadline. */
+	startedAt: number;
+}
+
 export interface PublishResume {
 	segmentIds: string[];
 	segmentCids?: string[];
 	remoteUrl?: string | null;
+	pending?: PublishPending | null;
 }
 
 /**
@@ -120,6 +151,9 @@ export interface PublishCheckpoint {
 	remoteUrl?: string | null;
 }
 
+/** Reads a stored video in slices or as a stream; a video never fits in memory whole. */
+export type MediaReader = Required<Pick<MediaStore, 'getRange' | 'size' | 'open'>>;
+
 /**
  * Structured provider failure. `code` drives two decisions in publish.ts
  * that string-matching alone gets wrong:
@@ -129,10 +163,11 @@ export interface PublishCheckpoint {
  *   unchanged content is pointless, so it is also non-retryable.
  * - `unconfirmed` → the post request went out and no answer came back, so it
  *   may be live. Non-retryable: see unconfirmedPostError.
+ * - `processing` → a video is not ready yet: park and resume, see processingError.
  * Unknown/legacy errors fall back to the previous regex classification.
  */
 export type ProviderErrorCode =
-	'auth' | 'forbidden' | 'rate_limited' | 'network' | 'upstream' | 'unconfirmed';
+	'auth' | 'forbidden' | 'rate_limited' | 'network' | 'upstream' | 'unconfirmed' | 'processing';
 
 export class ProviderError extends Error {
 	readonly status?: number;
@@ -146,6 +181,9 @@ export class ProviderError extends Error {
 	readonly detail?: string;
 	/** What the failure proved about the account, merged into its metaJson. */
 	readonly metaPatch?: Record<string, unknown>;
+	/** `processing`: where to pick up, and how soon to look again. */
+	readonly pending?: ParkedVideo;
+	readonly retryAfterMs?: number;
 
 	constructor(
 		message: string,
@@ -154,6 +192,8 @@ export class ProviderError extends Error {
 			code?: ProviderErrorCode;
 			detail?: string;
 			metaPatch?: Record<string, unknown>;
+			pending?: ParkedVideo;
+			retryAfterMs?: number;
 		} = {}
 	) {
 		super(message);
@@ -162,9 +202,44 @@ export class ProviderError extends Error {
 		this.code = opts.code;
 		this.detail = opts.detail;
 		this.metaPatch = opts.metaPatch;
+		this.pending = opts.pending;
+		this.retryAfterMs = opts.retryAfterMs;
 		this.retryable =
-			opts.code === 'rate_limited' || opts.code === 'network' || opts.code === 'upstream';
+			opts.code === 'rate_limited' ||
+			opts.code === 'network' ||
+			opts.code === 'upstream' ||
+			opts.code === 'processing';
 	}
+}
+
+export type ParkedVideo = Pick<PublishPending, 'segment' | 'storageKey' | 'state'>;
+
+/**
+ * Park a video the platform has not finished with. The run ends, the target is
+ * due again after `retryAfterMs`, and the next run resumes from `state` without
+ * counting the wait as a failed attempt (publish.ts). Segments already posted
+ * travel separately, in the checkpoint.
+ */
+export function processingError(
+	platformLabel: string,
+	pending: ParkedVideo,
+	retryAfterMs = 30_000
+): ProviderError {
+	return new ProviderError(
+		`${platformLabel} ${PROCESSING_MARK} — it publishes on its own in a minute or two`,
+		{ code: 'processing', pending, retryAfterMs }
+	);
+}
+
+/** The provider state a resume carries for this segment's video, or null to start it fresh. */
+export function resumedVideoState(
+	resume: PublishResume | undefined,
+	segment: number,
+	storageKey: string | undefined
+): Record<string, unknown> | null {
+	const pending = resume?.pending;
+	if (!pending || pending.segment !== segment || pending.storageKey !== storageKey) return null;
+	return pending.state;
 }
 
 /** In every unconfirmed-post message; publish.ts reads it to keep the row from retrying. */
@@ -233,6 +308,9 @@ export class PublishPartialError extends Error {
 	readonly remoteUrl?: string | null;
 	/** Carried over from the ProviderError that stopped the thread. */
 	readonly metaPatch?: Record<string, unknown>;
+	/** A later segment's video is still processing: park, as for a ProviderError. */
+	readonly pending?: ParkedVideo;
+	readonly retryAfterMs?: number;
 
 	constructor(
 		message: string,
@@ -241,6 +319,8 @@ export class PublishPartialError extends Error {
 			segmentCids?: string[];
 			remoteUrl?: string | null;
 			metaPatch?: Record<string, unknown>;
+			/** The error that stopped the thread; a parked video carries over. */
+			cause?: unknown;
 		}
 	) {
 		super(message);
@@ -249,6 +329,10 @@ export class PublishPartialError extends Error {
 		this.segmentCids = opts.segmentCids;
 		this.metaPatch = opts.metaPatch;
 		this.remoteUrl = opts.remoteUrl;
+		if (opts.cause instanceof ProviderError && opts.cause.code === 'processing') {
+			this.pending = opts.cause.pending;
+			this.retryAfterMs = opts.cause.retryAfterMs;
+		}
 	}
 }
 
@@ -281,6 +365,11 @@ export interface PlatformProvider {
 			allowLocalHosts?: boolean;
 			mediaUrlFor?: (storageKey: string) => Promise<string> | string;
 			checkpoint?: (state: PublishCheckpoint) => Promise<void> | void;
+			/** Videos are read through this; they are never in `media[].bytes`. */
+			mediaReader?: MediaReader;
+			/** Calls left in this request, so a long upload parks before it runs
+			 *  out instead of failing half-way. Infinity without a budget. */
+			callsLeft?: () => number;
 			/** A stable key for (target, segment), so a retry after a lost
 			 *  response is recognised by the platform instead of posting twice.
 			 *  Providers that support it use it; the rest ignore it. */
@@ -332,6 +421,27 @@ export interface MediaStore {
 		storageKey: string,
 		range?: { start: number; end: number }
 	): Promise<{ body: ReadableStream; size: number } | null>;
+	// Uploads in parts, for videos past the 100 MB a request may carry. Every
+	// part but the last has the same size (R2 requires it); parts stream into
+	// storage without passing through isolate memory.
+	multipart?: {
+		create(storageKey: string, mime: string): Promise<string>;
+		uploadPart(
+			storageKey: string,
+			uploadId: string,
+			partNumber: number,
+			body: ReadableStream | Uint8Array
+		): Promise<{ partNumber: number; etag: string }>;
+		/** The completed object's size. */
+		complete(
+			storageKey: string,
+			uploadId: string,
+			parts: { partNumber: number; etag: string }[]
+		): Promise<number>;
+		abort(storageKey: string, uploadId: string): Promise<void>;
+	};
+	// Server-side copy, streamed. False when the source is gone.
+	copy?(from: string, to: string): Promise<boolean>;
 	// Bulk delete for the account wipe: R2 takes up to 1,000 keys in one call,
 	// and each call is a subrequest (50 per invocation on Workers Free), so
 	// deleting one at a time cannot finish a library of any size. Optional:

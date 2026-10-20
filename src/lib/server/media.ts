@@ -1,14 +1,61 @@
 import { randomHex } from '#lib/domain/bytes.js';
 import { decodeImageDimensions } from './image-dimensions';
 import { validateImageUpload, validateVideoUpload } from '#lib/domain/media-limits.js';
+import { probeMp4, probeMp4Bytes, type Mp4Facts } from '#lib/domain/mp4-probe.js';
 import type { MediaStore } from './providers/types';
 
 export type { MediaStore };
 
+async function streamBytes(body: ReadableStream | Uint8Array): Promise<Uint8Array> {
+	if (body instanceof Uint8Array) return body;
+	return new Uint8Array(await new Response(body).arrayBuffer());
+}
+
 export function memoryMediaStore(
 	map = new Map<string, { bytes: Uint8Array; mime: string }>()
 ): MediaStore {
+	const uploads = new Map<string, { key: string; mime: string; parts: Map<number, Uint8Array> }>();
 	return {
+		multipart: {
+			async create(key, mime) {
+				const uploadId = randomHex(8);
+				uploads.set(uploadId, { key, mime, parts: new Map() });
+				return uploadId;
+			},
+			async uploadPart(key, uploadId, partNumber, body) {
+				const upload = uploads.get(uploadId);
+				if (!upload || upload.key !== key) throw new Error('No such upload');
+				upload.parts.set(partNumber, await streamBytes(body));
+				return { partNumber, etag: `etag-${partNumber}` };
+			},
+			async complete(key, uploadId, parts) {
+				const upload = uploads.get(uploadId);
+				if (!upload || upload.key !== key) throw new Error('No such upload');
+				const chunks = parts.map((p) => {
+					const chunk = upload.parts.get(p.partNumber);
+					if (!chunk || p.etag !== `etag-${p.partNumber}`) throw new Error('Bad part');
+					return chunk;
+				});
+				const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+				let at = 0;
+				for (const c of chunks) {
+					bytes.set(c, at);
+					at += c.length;
+				}
+				map.set(key, { bytes, mime: upload.mime });
+				uploads.delete(uploadId);
+				return bytes.length;
+			},
+			async abort(_key, uploadId) {
+				uploads.delete(uploadId);
+			}
+		},
+		async copy(from, to) {
+			const found = map.get(from);
+			if (!found) return false;
+			map.set(to, { bytes: found.bytes.slice(), mime: found.mime });
+			return true;
+		},
 		async get(key) {
 			return map.get(key)?.bytes ?? null;
 		},
@@ -19,6 +66,12 @@ export function memoryMediaStore(
 		},
 		async size(key) {
 			return map.get(key)?.bytes.length ?? null;
+		},
+		async open(key, range) {
+			const bytes = map.get(key)?.bytes;
+			if (!bytes) return null;
+			const slice = range ? bytes.slice(range.start, range.end + 1) : bytes.slice();
+			return { body: new Blob([slice]).stream(), size: bytes.length };
 		},
 		async put(key, bytes, mime) {
 			map.set(key, { bytes, mime });
@@ -34,6 +87,32 @@ export function memoryMediaStore(
 
 export function r2MediaStore(bucket: R2Bucket): MediaStore {
 	return {
+		multipart: {
+			async create(key, mime) {
+				const upload = await bucket.createMultipartUpload(key, {
+					httpMetadata: { contentType: mime }
+				});
+				return upload.uploadId;
+			},
+			async uploadPart(key, uploadId, partNumber, body) {
+				const part = await bucket.resumeMultipartUpload(key, uploadId).uploadPart(partNumber, body);
+				return { partNumber: part.partNumber, etag: part.etag };
+			},
+			async complete(key, uploadId, parts) {
+				const done = await bucket.resumeMultipartUpload(key, uploadId).complete(parts);
+				return done.size;
+			},
+			async abort(key, uploadId) {
+				await bucket.resumeMultipartUpload(key, uploadId).abort();
+			}
+		},
+		// An R2 body knows its length, so put() streams it without buffering.
+		async copy(from, to) {
+			const obj = await bucket.get(from);
+			if (!obj) return false;
+			await bucket.put(to, obj.body, { httpMetadata: obj.httpMetadata });
+			return true;
+		},
 		async get(key) {
 			const obj = await bucket.get(key);
 			if (!obj) return null;
@@ -75,6 +154,51 @@ export function r2MediaStore(bucket: R2Bucket): MediaStore {
 	};
 }
 
+/** What `draft_media.meta_json` holds for a video. */
+export interface StoredVideoMeta {
+	durationMs: number;
+	videoCodec: string | null;
+	audioCodec: string | null;
+	fps: number | null;
+	faststart: boolean;
+	/** Set once a cover is stored at coverKey(): `v` versions its URL, `atMs`
+	 *  is the frame it came from when it is one. */
+	cover?: { v: number; atMs?: number };
+}
+
+export function videoMetaFrom(facts: Mp4Facts): StoredVideoMeta {
+	return {
+		durationMs: facts.durationMs,
+		videoCodec: facts.videoCodec,
+		audioCodec: facts.audioCodec,
+		fps: facts.fps,
+		faststart: facts.faststart
+	};
+}
+
+const UNREADABLE_VIDEO =
+	'Could not read this video. Attach it from the composer, which converts it to MP4';
+
+/** 400 unless the facts describe a playable video. */
+export function requirePlayableVideo(facts: Mp4Facts | null): Mp4Facts {
+	if (!facts || !facts.videoCodec || facts.durationMs <= 0) {
+		throw Object.assign(new Error(UNREADABLE_VIDEO), { status: 400 });
+	}
+	return facts;
+}
+
+/** Probe an object already in storage, reading only its index. */
+export async function probeStoredVideo(
+	store: MediaStore,
+	key: string,
+	size: number
+): Promise<Mp4Facts | null> {
+	const read = store.getRange
+		? (start: number, end: number) => store.getRange!(key, start, end)
+		: async (start: number, end: number) => (await store.get(key))?.slice(start, end + 1) ?? null;
+	return probeMp4(read, size);
+}
+
 export async function saveMediaBytes(
 	store: MediaStore,
 	file: { bytes: Uint8Array; mime: string }
@@ -84,6 +208,7 @@ export async function saveMediaBytes(
 	mime: string;
 	width: number | null;
 	height: number | null;
+	video: StoredVideoMeta | null;
 }> {
 	const isVideo = (file.mime || '').toLowerCase().split(';')[0].trim().startsWith('video/');
 	const check = isVideo
@@ -96,6 +221,7 @@ export async function saveMediaBytes(
 	// 400, not 500: validation failure is a client error. Plain Error would
 	// mis-classify as a server error and pollute 500 alerting.
 	if (!check.ok) throw Object.assign(new Error(check.message), { status: 400 });
+	const facts = isVideo ? requirePlayableVideo(await probeMp4Bytes(file.bytes)) : null;
 	const ext =
 		check.mime === 'video/mp4'
 			? 'mp4'
@@ -110,8 +236,8 @@ export async function saveMediaBytes(
 	await store.put(storageKey, file.bytes, check.mime);
 	// Decode dims for Bluesky aspectRatio (layout hint). Null when unknown —
 	// callers omit aspectRatio instead of guessing (per Bluesky docs).
-	let width: number | null = null;
-	let height: number | null = null;
+	let width: number | null = facts?.width ?? null;
+	let height: number | null = facts?.height ?? null;
 	if (!isVideo) {
 		try {
 			const dims = decodeImageDimensions(file.bytes);
@@ -123,7 +249,14 @@ export async function saveMediaBytes(
 			/* omit on failure */
 		}
 	}
-	return { storageKey, size: file.bytes.length, mime: check.mime, width, height };
+	return {
+		storageKey,
+		size: file.bytes.length,
+		mime: check.mime,
+		width,
+		height,
+		video: facts ? videoMetaFrom(facts) : null
+	};
 }
 
 // Keys are always minted by saveMediaBytes (`<ms>-<16 hex>.<ext>`): enforce
@@ -145,6 +278,11 @@ export const THUMB_EDGE = 160;
 
 export function thumbCacheKey(storageKey: string): string {
 	return `thumb/${storageKey}`;
+}
+
+/** A video's cover image, kept beside it so every cleanup path removes both. */
+export function coverKey(storageKey: string): string {
+	return `cover/${storageKey}`;
 }
 
 /**
@@ -216,7 +354,9 @@ export function jpegResponse(bytes: Uint8Array, cacheControl: string): Response 
 
 /** Drop an object and any cached thumbnail. Missing keys are fine. */
 export async function deleteMediaObjects(store: MediaStore, keys: string[]): Promise<void> {
-	const all = keys.flatMap((key) => [key, thumbCacheKey(key)]);
+	const all = keys.flatMap((key) =>
+		key.endsWith('.mp4') ? [key, thumbCacheKey(key), coverKey(key)] : [key, thumbCacheKey(key)]
+	);
 	if (!all.length) return;
 	if (store.deleteMany) {
 		await store.deleteMany(all);

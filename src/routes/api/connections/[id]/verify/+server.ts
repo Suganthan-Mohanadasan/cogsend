@@ -14,7 +14,10 @@ import {
 	xVerify,
 	type ConnectionCredentials
 } from '#lib/server/providers/index.js';
-import { mastodonVerifyCredentials } from '#lib/server/providers/mastodon.js';
+import {
+	mastodonInstanceLimits,
+	mastodonVerifyCredentials
+} from '#lib/server/providers/mastodon.js';
 import { isLocalAppUrl } from '#lib/domain/app-url.js';
 import { xLimitFor, type XLimitMeta } from '#lib/domain/x-limits.js';
 import { requireSession } from '#lib/server/require.js';
@@ -302,9 +305,22 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 				// does not flap a healthy connection to `expired`.
 				return fail('Mastodon verify temporarily unavailable', 502);
 			}
+			// The instance's limits can change under the account (an admin raises
+			// the video size), and the composer checks against what is stored.
+			const limits = await mastodonInstanceLimits(
+				creds.instanceUrl,
+				undefined,
+				isLocalAppUrl(locals.env.APP_URL)
+			).catch(() => null);
 			await locals.db
 				.update(connections)
-				.set({ status: 'active', updatedAt: new Date() })
+				.set({
+					status: 'active',
+					...(limits
+						? { metaJson: JSON.stringify({ ...parseJson(conn.metaJson, {}), ...limits }) }
+						: {}),
+					updatedAt: new Date()
+				})
 				.where(owned);
 		}
 		return ok({ ok: true, status: 'active' });

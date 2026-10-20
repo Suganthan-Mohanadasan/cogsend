@@ -1,83 +1,35 @@
-import { and, eq, inArray, ne } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
-import { canAttachMoreImages, MAX_IMAGES_PER_SEGMENT } from '#lib/domain/media-limits.js';
-import { chunkIds, first, newId } from '#lib/server/db/client.js';
-import { draftMedia, draftVariants, drafts, publishTargets } from '#lib/server/db/schema.js';
+import {
+	canAttachMoreImages,
+	MAX_IMAGES_PER_SEGMENT,
+	videoMixProblem
+} from '#lib/domain/media-limits.js';
+import { first, newId } from '#lib/server/db/client.js';
+import { draftMedia } from '#lib/server/db/schema.js';
+import {
+	cleanAltText,
+	MAX_FILES_PER_DRAFT,
+	MAX_FILES_PER_USER,
+	overUserFileCap,
+	ownDraft,
+	parseSegmentIndex,
+	rejectIfNotEditable,
+	segmentProblem
+} from '#lib/server/draft-media.js';
 import { fail, handleError, ok } from '#lib/server/http.js';
 import { deleteMediaObjects, saveMediaBytes } from '#lib/server/media.js';
-import { draftEditBlock } from '#lib/server/publish-plan.js';
 import { requireScope, requireUser } from '#lib/server/require.js';
+import { serializeMedia } from '#lib/server/serialize.js';
 
-const MAX_SEGMENT_INDEX = 100;
-const MAX_ALT_LENGTH = 1500;
-// No per-draft or per-user cap existed: segment math alone allows
-// ~400 files per draft (100 segments x 4), unbounded R2 cost and
-// Worker-memory pressure at publish (bytes are buffered ~2x).
-const MAX_FILES_PER_DRAFT = 32;
-const MAX_FILES_PER_USER = 1000;
 // A request body ceiling applied before the multipart parse: formData()
 // buffers the whole body in the isolate, and the per-file caps can only run
 // afterwards. Matches the platform's own request-body limit, so anything
 // larger is refused with a clean 413 instead of a parse-then-OOM.
 const MAX_UPLOAD_BYTES = 100_000_000;
-
-function parseSegmentIndex(value: unknown): number {
-	const n = typeof value === 'number' ? value : parseInt(String(value ?? '0'), 10);
-	if (!Number.isFinite(n)) return 0;
-	return Math.min(MAX_SEGMENT_INDEX, Math.max(0, Math.floor(n)));
-}
-
-function cleanAltText(value: unknown): string | null {
-	if (typeof value !== 'string') return null;
-	const trimmed = value.trim();
-	if (!trimmed) return null;
-	return trimmed.slice(0, MAX_ALT_LENGTH);
-}
-
-async function rejectIfNotEditable(db: App.Locals['db'], draftId: string) {
-	const targets = await db.select().from(publishTargets).where(eq(publishTargets.draftId, draftId));
-	const blocked = draftEditBlock(targets);
-	return blocked ? fail(blocked, 409) : null;
-}
-import { splitThreadSegments } from '#lib/domain/thread-segments.js';
-import { serializeMedia } from '#lib/server/serialize.js';
-
-async function ownDraft(locals: App.Locals, id: string, userId: string) {
-	return first(
-		locals.db
-			.select()
-			.from(drafts)
-			.where(and(eq(drafts.id, id), eq(drafts.userId, userId)))
-	);
-}
-
-/**
- * Refuse a media row on a segment the draft does not have. `resolvePublishSegments`
- * walks the same `splitThreadSegments` the composer renders, so a row parked
- * past the last card is never attached to a post — the image is silently
- * dropped at publish, with nothing to see in the editor either. Empty segments
- * count: the composer shows them, and a card with only an image publishes.
- *
- * The bound is the longest body the draft can publish, not the shared one: a
- * per-platform variant may add posts of its own, and media attached to one of
- * those is attached at publish.
- */
-async function segmentProblem(
-	locals: App.Locals,
-	draft: { id: string; baseBody: string | null },
-	segmentIndex: number
-): Promise<string | null> {
-	const variants = await locals.db
-		.select({ body: draftVariants.body })
-		.from(draftVariants)
-		.where(eq(draftVariants.draftId, draft.id));
-	const cards = Math.max(
-		splitThreadSegments(draft.baseBody ?? '').length,
-		...variants.map((v) => splitThreadSegments(v.body ?? '').length)
-	);
-	if (segmentIndex < cards) return null;
-	return `segmentIndex ${segmentIndex} is past the last segment (${cards - 1})`;
-}
+// One file must fit in that body with its multipart framing; the uploads route
+// takes videos up to MAX_VIDEO_BYTES in parts.
+const MAX_FORM_VIDEO_BYTES = 95_000_000;
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {
 	try {
@@ -116,29 +68,19 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		// bounded.
 		for (const f of files) {
 			const isVideo = (f.type || '').toLowerCase().startsWith('video/');
-			const cap = isVideo ? 95_000_000 : 16_000_000;
+			const cap = isVideo ? MAX_FORM_VIDEO_BYTES : 16_000_000;
 			if (f.size > cap) {
-				return fail(isVideo ? 'Video must be 95MB or smaller' : 'Image must be 16MB or smaller');
+				return fail(
+					isVideo
+						? 'Video must be 95MB or smaller here; larger ones go up in parts (POST /api/drafts/:id/media/uploads)'
+						: 'Image must be 16MB or smaller'
+				);
 			}
 		}
 		if (existing.length + files.length > MAX_FILES_PER_DRAFT) {
 			return fail(`Max ${MAX_FILES_PER_DRAFT} files per draft`, 413);
 		}
-		const userDraftIds = await locals.db
-			.select({ id: drafts.id })
-			.from(drafts)
-			.where(eq(drafts.userId, user.id));
-		let userFiles = 0;
-		for (const chunk of chunkIds(userDraftIds.map((d) => d.id))) {
-			if (!chunk.length) break;
-			const rows = await locals.db
-				.select({ id: draftMedia.id })
-				.from(draftMedia)
-				.where(inArray(draftMedia.draftId, chunk));
-			userFiles += rows.length;
-			if (userFiles + files.length > MAX_FILES_PER_USER) break;
-		}
-		if (userFiles + files.length > MAX_FILES_PER_USER) {
+		if (await overUserFileCap(locals.db, user.id, files.length)) {
 			return fail(`Max ${MAX_FILES_PER_USER} files per account`, 413);
 		}
 		const remaining = MAX_IMAGES_PER_SEGMENT - existingOnSegment;
@@ -152,24 +94,15 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		const isVideoRow = (m: { mime: string | null }) =>
 			(m.mime || '').toLowerCase().startsWith('video/');
 		const newVideos = files.filter(isVideoFile).length;
-		// In-progress feature (ENABLE_VIDEO_UPLOAD): without this the route would
-		// happily park up to 95MB in R2 for a draft that cannot publish it.
-		if (newVideos > 0 && !locals.env.videoUploadEnabled) {
-			return fail('Video uploads are not enabled on this instance', 400);
-		}
 		const newImages = files.length - newVideos;
 		const onSegment = existing.filter((m) => (m.segmentIndex ?? 0) === segmentIndex);
 		const existingVideos = onSegment.filter(isVideoRow).length;
 		const existingImages = onSegment.length - existingVideos;
-		if (newVideos + existingVideos > 1) {
-			return fail('Only one video per post, and videos cannot mix with images on LinkedIn');
-		}
-		// The message above promises no mixing, so enforce it here: a count of
-		// one video alone would let 1 image + 1 video through to a late publish
-		// failure.
-		if (newVideos + existingVideos > 0 && newImages + existingImages > 0) {
-			return fail('Videos cannot mix with images on the same post');
-		}
+		const segmentProblemText = videoMixProblem(
+			newVideos + existingVideos,
+			newImages + existingImages
+		);
+		if (segmentProblemText) return fail(segmentProblemText);
 
 		const altText = cleanAltText(form.get('altText'));
 		const created = [];
@@ -189,6 +122,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 						size: saved.size,
 						width: saved.width,
 						height: saved.height,
+						metaJson: saved.video ? JSON.stringify(saved.video) : null,
 						altText: i === 0 ? altText : null,
 						sortOrder: existingOnSegment + i,
 						segmentIndex,

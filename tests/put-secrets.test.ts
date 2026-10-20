@@ -149,15 +149,13 @@ process.stdin.resume();
 			[
 				'RESEND_API_KEY=re_123',
 				'NOTIFY_EMAIL=alerts@example.com',
-				'NOTIFY_FROM=CogSend <sent@example.com>',
-				'ENABLE_VIDEO_UPLOAD=1'
+				'NOTIFY_FROM=CogSend <sent@example.com>'
 			].join('\n')
 		);
 		expect(puts.map((c) => c.args.at(-1))).toEqual([
 			'RESEND_API_KEY',
 			'NOTIFY_EMAIL',
-			'NOTIFY_FROM',
-			'ENABLE_VIDEO_UPLOAD'
+			'NOTIFY_FROM'
 		]);
 	});
 

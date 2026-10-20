@@ -1,7 +1,18 @@
 import { isBlockedInstanceHost } from '#lib/domain/instance-host.js';
 import { validatePollConfig } from '#lib/domain/poll.js';
 import { validateMastodonText } from '#lib/domain/validation/text.js';
-import { mediaByteLength } from './types';
+import { randomHex } from '#lib/domain/bytes.js';
+import { mediaByteLength, processingError, resumedVideoState } from './types';
+import {
+	fixedLengthBody,
+	isVideoAttachment,
+	MISSING_VIDEO_MESSAGE,
+	pollVideo,
+	requireMediaReader,
+	segmentVideo,
+	videoValidation,
+	wrapStream
+} from './video';
 import type {
 	ConnectionCredentials,
 	ConnectionMeta,
@@ -176,6 +187,133 @@ export async function waitForMastodonMedia(
 	throw new Error('Mastodon is still processing the uploaded image — retry in a moment');
 }
 
+type PublishOpts = Parameters<PlatformProvider['publish']>[4];
+
+const VIDEO_STATUS_POLLS = 6;
+const VIDEO_STATUS_POLL_MS = 3000;
+
+/**
+ * A video as multipart/form-data built around the stored file's stream, so the
+ * request has a known length and the file never sits in memory. The cover goes
+ * as `thumbnail`, which Mastodon shows before the video plays.
+ */
+async function videoUploadBody(
+	reader: NonNullable<NonNullable<PublishOpts>['mediaReader']>,
+	media: MediaAttachment
+): Promise<{ body: ReadableStream; length: number; contentType: string }> {
+	const stored = await reader.open(media.storageKey!);
+	if (!stored) throw new Error(MISSING_VIDEO_MESSAGE);
+	let cover: Uint8Array | null = null;
+	if (media.coverKey) {
+		const size = await reader.size(media.coverKey).catch(() => null);
+		cover = size ? await reader.getRange(media.coverKey, 0, size - 1).catch(() => null) : null;
+	}
+	const boundary = `cogsend-${randomHex(12)}`;
+	const enc = new TextEncoder();
+	const field = (name: string, extra = '') =>
+		`--${boundary}\r\nContent-Disposition: form-data; name="${name}"${extra}\r\n`;
+	const parts: Uint8Array[] = [];
+	if (media.alt) parts.push(enc.encode(`${field('description')}\r\n${media.alt}\r\n`));
+	if (cover) {
+		parts.push(
+			enc.encode(`${field('thumbnail', '; filename="cover.jpg"')}Content-Type: image/jpeg\r\n\r\n`),
+			cover,
+			enc.encode('\r\n')
+		);
+	}
+	parts.push(
+		enc.encode(`${field('file', '; filename="video.mp4"')}Content-Type: ${media.mime}\r\n\r\n`)
+	);
+	const before = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+	let at = 0;
+	for (const p of parts) {
+		before.set(p, at);
+		at += p.length;
+	}
+	const after = enc.encode(`\r\n--${boundary}--\r\n`);
+	const length = before.length + stored.size + after.length;
+	return {
+		body: fixedLengthBody(wrapStream(before, stored.body, after), length),
+		length,
+		contentType: `multipart/form-data; boundary=${boundary}`
+	};
+}
+
+/**
+ * Upload a video, or pick up the one a previous run parked, and wait for the
+ * instance to transcode it. Transcoding can take minutes, so the media id is
+ * parked (processingError) rather than polled until the request gives out.
+ */
+async function readyVideo(
+	instanceUrl: string,
+	token: string,
+	media: MediaAttachment,
+	segmentIndex: number,
+	fetchImpl: FetchLike,
+	opts: PublishOpts
+): Promise<string> {
+	if (!media.storageKey) throw new Error('Mastodon video is missing its storage key');
+	const storageKey = media.storageKey;
+	const resumed = resumedVideoState(opts?.resume, segmentIndex, storageKey);
+	let mediaId = typeof resumed?.mediaId === 'string' ? resumed.mediaId : '';
+	if (!mediaId) {
+		const upload = await videoUploadBody(requireMediaReader(opts?.mediaReader), media);
+		const res = await fetchImpl(`${instanceUrl}/api/v2/media`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': upload.contentType,
+				'Content-Length': String(upload.length)
+			},
+			body: upload.body,
+			duplex: 'half'
+		} as RequestInit);
+		if (!res.ok) {
+			throw Object.assign(
+				new Error(
+					`Mastodon media upload failed (${res.status}): ${(await res.text()).slice(0, 300)}`
+				),
+				{ status: res.status }
+			);
+		}
+		const data = (await res.json()) as { id: string };
+		if (res.status !== 202) return data.id;
+		mediaId = data.id;
+	}
+	const id = mediaId;
+	const status = await pollVideo(
+		{
+			polls: VIDEO_STATUS_POLLS,
+			delayMs: VIDEO_STATUS_POLL_MS,
+			reserve: 6,
+			callsLeft: opts?.callsLeft
+		},
+		async () => {
+			const res = await fetchImpl(`${instanceUrl}/api/v1/media/${encodeURIComponent(id)}`, {
+				headers: { Authorization: `Bearer ${token}` }
+			});
+			if (res.status === 206) return null;
+			if (res.status === 200 || (res.status === 404 && resumed)) return res.status;
+			throw Object.assign(
+				new Error(
+					`Mastodon media processing failed (${res.status}): ${(await res.text()).slice(0, 300)}`
+				),
+				{ status: res.status }
+			);
+		}
+	);
+	if (status === 200) return mediaId;
+	// The instance dropped an attachment that waited too long unattached:
+	// upload it again.
+	if (status === 404) {
+		return readyVideo(instanceUrl, token, media, segmentIndex, fetchImpl, {
+			...opts,
+			resume: undefined
+		});
+	}
+	throw processingError('Mastodon', { segment: segmentIndex, storageKey, state: { mediaId } });
+}
+
 async function postStatus(
 	instanceUrl: string,
 	token: string,
@@ -257,13 +395,10 @@ export const mastodonProvider: PlatformProvider = {
 					code: 'max_images'
 				});
 			}
+			issues.push(...videoValidation('mastodon', seg.media, meta, `thread[${i}].media`));
 			for (const m of seg.media ?? []) {
-				if ((m.mime || '').toLowerCase().startsWith('video/')) {
-					issues.push({
-						field: `thread[${i}].media`,
-						message: 'Mastodon video is not supported yet — post it to LinkedIn',
-						code: 'no_video'
-					});
+				if (isVideoAttachment(m)) {
+					continue;
 				} else if (mediaByteLength(m) > 16_000_000) {
 					issues.push({
 						field: `thread[${i}].media`,
@@ -315,11 +450,16 @@ export const mastodonProvider: PlatformProvider = {
 			try {
 				const seg = segments[i];
 				const mediaIds: string[] = [];
-				for (const m of (seg.media ?? []).slice(0, 4)) {
-					if ((m.mime || '').toLowerCase().startsWith('video/')) {
-						throw new Error('Mastodon video is not supported yet — post it to LinkedIn');
+				const video = segmentVideo(seg.media);
+				if (video) {
+					mediaIds.push(await readyVideo(instanceUrl, creds.accessToken, video, i, guarded, opts));
+				} else {
+					for (const m of (seg.media ?? []).slice(0, 4)) {
+						if (isVideoAttachment(m)) {
+							throw new Error('Videos cannot mix with images on the same post');
+						}
+						mediaIds.push(await uploadMedia(instanceUrl, creds.accessToken, m, guarded));
 					}
-					mediaIds.push(await uploadMedia(instanceUrl, creds.accessToken, m, guarded));
 				}
 				const pollOptions = i === 0 ? (seg.options?.poll ?? content.options?.poll) : undefined;
 				const pollCheck = pollOptions ? validatePollConfig(pollOptions) : null;
@@ -373,7 +513,8 @@ export const mastodonProvider: PlatformProvider = {
 				if (segmentIds.length) {
 					throw new PublishPartialError(message, {
 						segmentIds,
-						remoteUrl: firstUrl ?? opts?.resume?.remoteUrl ?? null
+						remoteUrl: firstUrl ?? opts?.resume?.remoteUrl ?? null,
+						cause: err
 					});
 				}
 				throw err;
@@ -505,18 +646,7 @@ export async function mastodonExchangeCode(
 		acct: string;
 	};
 
-	let maxCharacters = 500;
-	try {
-		const inst = await guarded(`${base}/api/v2/instance`);
-		if (inst.ok) {
-			const info = (await inst.json()) as {
-				configuration?: { statuses?: { max_characters?: number } };
-			};
-			maxCharacters = info.configuration?.statuses?.max_characters ?? 500;
-		}
-	} catch {
-		/* fallback 500 */
-	}
+	const limits = { maxCharacters: 500, ...(await readInstanceLimits(base, guarded)) };
 
 	return {
 		accessToken: token.access_token,
@@ -526,6 +656,56 @@ export async function mastodonExchangeCode(
 		handle: me.acct || me.username,
 		displayName: me.display_name || me.username,
 		avatarUrl: me.avatar,
-		maxCharacters
+		...limits
 	};
+}
+
+export type MastodonInstanceLimits = Pick<
+	ConnectionMeta,
+	'maxCharacters' | 'videoSizeLimit' | 'videoMatrixLimit' | 'videoFrameRateLimit'
+>;
+
+/** Null when the instance did not answer: the caller keeps what it knew. */
+async function readInstanceLimits(
+	base: string,
+	guarded: FetchLike
+): Promise<MastodonInstanceLimits | null> {
+	try {
+		const inst = await guarded(`${base}/api/v2/instance`);
+		if (!inst.ok) return null;
+		const info = (await inst.json()) as {
+			configuration?: {
+				statuses?: { max_characters?: number };
+				media_attachments?: {
+					video_size_limit?: number;
+					video_matrix_limit?: number;
+					video_frame_rate_limit?: number;
+				};
+			};
+		};
+		const media = info.configuration?.media_attachments ?? {};
+		const positive = (n: unknown) => (typeof n === 'number' && n > 0 ? n : undefined);
+		const limits: MastodonInstanceLimits = {
+			maxCharacters: positive(info.configuration?.statuses?.max_characters),
+			videoSizeLimit: positive(media.video_size_limit),
+			videoMatrixLimit: positive(media.video_matrix_limit),
+			videoFrameRateLimit: positive(media.video_frame_rate_limit)
+		};
+		// Only what the instance reported, so a merge never erases a stored value.
+		return Object.fromEntries(
+			Object.entries(limits).filter(([, v]) => v !== undefined)
+		) as MastodonInstanceLimits;
+	} catch {
+		return null;
+	}
+}
+
+/** What the instance allows now, or null when it did not say; Check refreshes it, since an admin can change it. */
+export async function mastodonInstanceLimits(
+	instanceUrl: string,
+	fetchImpl: FetchLike = providerFetch,
+	allowLocal = false
+): Promise<MastodonInstanceLimits | null> {
+	const base = normalizeInstance(instanceUrl, allowLocal);
+	return readInstanceLimits(base, guardRedirects(fetchImpl, allowLocal));
 }

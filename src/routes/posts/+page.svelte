@@ -12,7 +12,8 @@
 		RefreshCw,
 		ChevronDown,
 		Check,
-		Users
+		Users,
+		LoaderCircle
 	} from '@lucide/svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import { platformColorClass } from '#lib/components/platform-color.js';
@@ -22,6 +23,7 @@
 	import { safeHttpUrl } from '#lib/domain/links.js';
 	import { parseXPostUrl } from '#lib/domain/x-quote.js';
 	import { humanizeError } from '#lib/domain/human-error.js';
+	import { PROCESSING_MARK } from '#lib/domain/video-rules.js';
 	import { sessionExpiredIfUnauthorized } from '#lib/components/session-expired.js';
 	import { takePostsNotice } from '#lib/components/posts-notice.js';
 	import { menuNav } from '#lib/components/menu-nav.js';
@@ -59,6 +61,7 @@
 		altText: string | null;
 		segmentIndex?: number | null;
 		sortOrder?: number | null;
+		meta?: { cover?: { v?: number } | null } | null;
 	};
 
 	type DraftTarget = {
@@ -362,6 +365,16 @@
 		return (m.mime || '').toLowerCase().startsWith('video/');
 	}
 
+	function postVideoPoster(m: PostMedia): string | undefined {
+		const v = m.meta?.cover?.v;
+		return v ? `/api/media/${encodeURIComponent(m.storageKey)}?cover=${v}` : undefined;
+	}
+
+	/** Waiting on the platform to finish a video, which is not a failure. */
+	function isProcessing(error: string | null | undefined): boolean {
+		return (error ?? '').includes(PROCESSING_MARK);
+	}
+
 	function whenDisplay(when: string | Date | null | undefined): {
 		text: string;
 		title: string;
@@ -449,8 +462,14 @@
 			const hasFailed = group.some((t) => t.status === 'failed');
 			// Scheduled rows keep their errorMessage when a transient failure
 			// backs off: they are auto-retrying, not terminally failed.
-			const hasRetrying = group.some((t) => t.status === 'scheduled' && t.errorMessage);
-			const cardStatus = hasFailed ? 'failed' : hasRetrying ? 'retrying' : primary.status;
+			const waiting = group.filter((t) => t.status === 'scheduled' && t.errorMessage);
+			const cardStatus = hasFailed
+				? 'failed'
+				: waiting.length
+					? waiting.every((t) => isProcessing(t.errorMessage))
+						? 'processing'
+						: 'retrying'
+					: primary.status;
 
 			// Cancelled (discarded) platforms leave the card entirely: the
 			// error rows key off failed rows and the icon row off this list.
@@ -872,6 +891,7 @@
 	function statusBadge(status: string) {
 		if (['scheduled', 'pending', 'publishing'].includes(status)) return 'scheduled';
 		if (status === 'retrying') return 'retrying';
+		if (status === 'processing') return 'processing';
 		if (status === 'published') return 'published';
 		if (status === 'failed') return 'failed';
 		return 'draft';
@@ -1189,6 +1209,14 @@
 							>
 								<XCircle class="h-3 w-3" /> Failed
 							</span>
+						{:else if badge === 'processing'}
+							<span
+								class="inline-flex items-center gap-1.5 rounded bg-sky-50 px-2.5 py-1 text-[10px] font-bold tracking-widest text-sky-700 uppercase"
+								title="The platform is processing the video — it publishes on its own"
+								data-testid="processing-badge"
+							>
+								<LoaderCircle class="h-3 w-3" /> Processing
+							</span>
 						{:else if badge === 'retrying'}
 							<span
 								class="inline-flex items-center gap-1.5 rounded bg-amber-50 px-2.5 py-1 text-[10px] font-bold tracking-widest text-amber-700 uppercase"
@@ -1228,6 +1256,7 @@
 											<!-- svelte-ignore a11y_media_has_caption -->
 											<video
 												src={postMediaSrc(m)}
+												poster={postVideoPoster(m)}
 												controls
 												preload="none"
 												playsinline
@@ -1327,7 +1356,9 @@
 						class="mb-4 flex flex-col gap-2 rounded-2xl border border-amber-100 bg-amber-50/60 p-3"
 					>
 						<p class="text-xs font-bold text-amber-800">
-							Retrying automatically — no action needed, or retry now.
+							{retryingOf(card).every((p) => isProcessing(p.error))
+								? 'Processing the video — it publishes on its own.'
+								: 'Retrying automatically — no action needed, or retry now.'}
 						</p>
 						{#each retryingOf(card) as platform (platform.targetId)}
 							<div class="flex items-start justify-between gap-3">
@@ -1403,7 +1434,7 @@
 							>
 								Remove
 							</button>
-						{:else if (badge === 'scheduled' || badge === 'retrying') && card.targetId}
+						{:else if (badge === 'scheduled' || badge === 'retrying' || badge === 'processing') && card.targetId}
 							<a
 								href="/compose?id={card.draftId}"
 								class="{cardAction} text-stone-500 hover:text-stone-900"

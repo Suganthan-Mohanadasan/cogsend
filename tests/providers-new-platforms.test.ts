@@ -1,3 +1,4 @@
+import { createTestMedia } from '#lib/server/db/test.js';
 import { describe, expect, it } from 'vitest';
 import {
 	escapeLittleText,
@@ -212,6 +213,7 @@ describe('linkedinProvider.publish', () => {
 				});
 				return new Response('', { status: 200 });
 			},
+			'/rest/videos/urn%3Ali%3Avideo%3AVID1': () => Response.json({ status: 'AVAILABLE' }),
 			'/rest/posts': async (req) => {
 				const body = await req.json();
 				expect(body.content.video.id).toBe('urn:li:video:VID1');
@@ -221,16 +223,17 @@ describe('linkedinProvider.publish', () => {
 				});
 			}
 		});
+		const store = createTestMedia();
+		await store.put('v.mp4', new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 'video/mp4');
 		const result = await linkedinProvider.publish(
 			{
 				text: 'watch this',
-				media: [
-					{ bytes: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), mime: 'video/mp4', size: 10 }
-				]
+				media: [{ storageKey: 'v.mp4', mime: 'video/mp4', size: 10 }]
 			},
 			{ accessToken: 'tok', personUrn: 'urn:li:person:abc' },
 			undefined,
-			fetchImpl
+			fetchImpl,
+			{ mediaReader: store as never }
 		);
 		expect(result.remotePostId).toBe('urn:li:share:vid');
 		expect(puts).toHaveLength(2);
