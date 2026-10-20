@@ -1455,8 +1455,17 @@ test('a video attaches in parts, plays only when asked, and comes off again', as
 			{ name: 'clip.mp4', mimeType: 'video/mp4', buffer: Buffer.from(buildMp4()) },
 			strip.locator('[data-testid^="media-play-"]')
 		);
-		// Bluesky takes it, so nothing is said about it.
-		await expect(page.getByTestId('media-fit-0')).toHaveCount(0);
+		// Bluesky takes it, so nothing is said about Bluesky. The clip is under
+		// the 75 KB LinkedIn needs, and the LinkedIn account seeded earlier in
+		// the journey is selected: one line says so, and Uncheck drops it.
+		const fit = page.getByTestId('media-fit-0');
+		await expect(page.getByTestId('media-fit-0-bluesky')).toHaveCount(0);
+		await expect(page.getByTestId('media-fit-0-linkedin')).toHaveAttribute('data-level', 'error');
+		await expect(fit).toContainText('LinkedIn needs a video of at least 75 KB');
+		await expect(page.getByTestId('destinations-fit-dot')).toBeVisible();
+		await fit.getByRole('button', { name: 'Uncheck LinkedIn' }).click();
+		await expect(fit).toHaveCount(0);
+		await expect(page.getByTestId('destinations-fit-dot')).toHaveCount(0);
 		// Nothing is downloaded until someone asks to play it.
 		await expect(strip.locator('video')).toHaveCount(0);
 		await strip.locator('[data-testid^="media-play-"]').click();
