@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { STALE_CLAIM_MS } from '#lib/domain/due-jobs.js';
 import { restorableTargetIds } from '#lib/domain/platform-sync.js';
 import { isTargetSending, selectionDrift, summarizePost } from '#lib/domain/post-state.js';
+import { PROCESSING_MARK } from '#lib/domain/video-rules.js';
 import { schedulePreviewText, scheduleWhenText } from '#lib/domain/schedule-helpers.js';
 import { draftHasInFlightPublish } from '#lib/server/publish-plan.js';
 
@@ -103,11 +104,39 @@ describe('summarizePost', () => {
 		expect(summarizePost([], NOW)).toEqual({
 			published: [],
 			sending: [],
+			processing: [],
 			waiting: [],
 			failed: [],
 			nextAt: null
 		});
 		expect(summarizePost(null, NOW).waiting).toEqual([]);
+	});
+
+	it('keeps a video the platform is processing apart from what waits for a time', () => {
+		const state = summarizePost(
+			[
+				{
+					connectionId: 'threads',
+					id: 't-1',
+					status: 'scheduled',
+					scheduledFor: IN_AN_HOUR,
+					errorMessage: `Threads ${PROCESSING_MARK} — it publishes on its own`
+				},
+				{
+					connectionId: 'masto',
+					id: 't-2',
+					status: 'scheduled',
+					scheduledFor: IN_TWO_HOURS,
+					errorMessage: 'Mastodon returned 503'
+				}
+			],
+			NOW
+		);
+		expect(state.processing).toEqual(['threads']);
+		expect(state.waiting.map((w) => [w.connectionId, w.retrying])).toEqual([['masto', true]]);
+		expect(state.nextAt).toEqual(IN_TWO_HOURS);
+		// Nothing to unschedule or re-time while the platform finishes it.
+		expect(selectionDrift(state, [])).toEqual({ added: [], removed: ['masto'] });
 	});
 });
 

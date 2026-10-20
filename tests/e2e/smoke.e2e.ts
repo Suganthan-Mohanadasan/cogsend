@@ -523,8 +523,8 @@ test('publish asks for confirmation listing destinations', async () => {
 	// Cmd/Ctrl+Enter routes through the same confirmation.
 	await page.getByTestId('segment-input-0').press('Meta+Enter');
 	await expect(dialog).toBeVisible();
-	// Hold the publish request so the flow is observable: confirming must
-	// close the popover, and the main button must own the progress state.
+	// Hold the publish request: confirming must hand the post off and free
+	// the composer without waiting for the platform.
 	await page.route('**/api/drafts/*/publish', async (route) => {
 		await new Promise((resolve) => setTimeout(resolve, 1500));
 		await route.continue();
@@ -532,28 +532,24 @@ test('publish asks for confirmation listing destinations', async () => {
 	// Confirm sends; the firewalled PDS fails deterministically server-side.
 	await page.getByTestId('confirm-dialog-ok').click();
 	await expect(dialog).toBeHidden();
-	await expect(page.getByTestId('publish-now')).toHaveAttribute('aria-busy', 'true');
-	await expect(page.getByTestId('publish-now')).toContainText('Publishing');
-	// A failure reopens the popover with per-destination detail.
-	const progress = page.getByTestId('publish-progress');
-	await expect(progress).toBeVisible({ timeout: 15000 });
-	const destination = page.getByTestId('publish-dest');
-	await expect(destination).toHaveAttribute('data-status', 'failed', { timeout: 30000 });
-	await expect(destination).toContainText(/isn’t allowed|needs reconnect|failed/i);
-	await expect(page.getByText(/isn’t allowed|needs reconnect|failed/i).first()).toBeVisible({
-		timeout: 30000
-	});
-	// Closing the failure view dismisses the popover.
-	await page.getByTestId('publish-progress-close').click();
-	await expect(dialog).toBeHidden();
-	// The failed publish must not wipe the composer: refreshing connections
-	// used to re-trigger the URL watcher against a stale `page.url`.
-	await expect(page.getByTestId('segment-input-0')).toHaveValue('confirm flow probe');
-	await expect(page).toHaveURL(/\?id=/);
+	await expect(page.getByTestId('segment-input-0')).toHaveValue('');
+	await expect(page.getByTestId('publish-toast')).toContainText('Publishing to 1 account');
+	// The failure comes back as a toast that stays, and links to the failures.
+	const toast = page.getByTestId('publish-toast');
+	await expect(toast).toContainText('Failed on Bluesky · test', { timeout: 30000 });
+	await expect(toast).toHaveAttribute('role', 'alert');
+	await expect(toast.getByTestId('toast-action')).toHaveAttribute('href', '/posts?tab=failed');
+	await expect(page.getByTestId('publish-failure-dot')).toBeVisible();
 	await page.unroute('**/api/drafts/*/publish');
+	// Posts holds the post and what went wrong; opening it clears the dot.
+	await toast.getByTestId('toast-action').click();
+	await expect(page).toHaveURL(/\/posts\?tab=failed/);
+	await expect(page.getByText('confirm flow probe').first()).toBeVisible({ timeout: 15000 });
+	await expect(page.getByTestId('publish-failure-dot')).toHaveCount(0);
+	await expect(page.getByTestId('publish-toast')).toHaveCount(0);
 });
 
-test('publishing to two destinations tracks each one', async () => {
+test('publishing to two destinations reports each one', async () => {
 	test.setTimeout(120_000);
 	await seedFirewalledBluesky(page, 'second.bsky.social');
 	await page.goto('/compose');
@@ -568,13 +564,14 @@ test('publishing to two destinations tracks each one', async () => {
 	await expect(dialog.locator('[title="Bluesky: test.bsky.social"]')).toBeVisible();
 	await expect(dialog.locator('[title="Bluesky: second.bsky.social"]')).toBeVisible();
 	await page.getByTestId('confirm-dialog-ok').click();
-	// One progress row per destination, each tracked independently.
-	const rows = page.getByTestId('publish-dest');
-	await expect(rows).toHaveCount(2, { timeout: 15000 });
-	await expect(rows.nth(0)).toHaveAttribute('data-status', 'failed', { timeout: 30000 });
-	await expect(rows.nth(1)).toHaveAttribute('data-status', 'failed', { timeout: 30000 });
-	await page.getByTestId('publish-progress-close').click();
 	await expect(dialog).toBeHidden();
+	// Each destination is sent on its own; the one toast names every failure.
+	const toast = page.getByTestId('publish-toast');
+	await expect(toast).toContainText('Failed on', { timeout: 30000 });
+	await expect(toast).toContainText('Bluesky · test');
+	await expect(toast).toContainText('Bluesky · second');
+	await page.getByTestId('toast-dismiss').click();
+	await expect(page.getByTestId('publish-toast')).toHaveCount(0);
 });
 
 test('a saved draft restores the accounts it was written for', async () => {
@@ -1440,7 +1437,7 @@ test('a retryable publish failure is reported as retrying, not failed', async ()
 	}
 });
 
-test('a video attaches in parts, shows what each platform makes of it, and comes off again', async () => {
+test('a video attaches in parts, plays only when asked, and comes off again', async () => {
 	// The media affordance needs a destination, like every other composer test.
 	const connId = await seedFirewalledBluesky(page, 'video-probe.bsky.social');
 	try {
@@ -1454,9 +1451,14 @@ test('a video attaches in parts, shows what each platform makes of it, and comes
 		await attachUntilAnswered(
 			input,
 			{ name: 'clip.mp4', mimeType: 'video/mp4', buffer: Buffer.from(buildMp4()) },
-			strip.locator('video')
+			strip.locator('[data-testid^="media-play-"]')
 		);
-		await expect(page.getByTestId('video-checklist-0-bluesky')).toHaveAttribute('data-level', 'ok');
+		// Bluesky takes it, so nothing is said about it.
+		await expect(page.getByTestId('media-fit-0')).toHaveCount(0);
+		// Nothing is downloaded until someone asks to play it.
+		await expect(strip.locator('video')).toHaveCount(0);
+		await strip.locator('[data-testid^="media-play-"]').click();
+		await expect(strip.locator('video')).toHaveCount(1);
 
 		await strip.locator('[data-testid^="video-cover-"]').click();
 		await expect(page.getByTestId('video-cover-dialog')).toBeVisible();

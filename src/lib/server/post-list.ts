@@ -43,6 +43,8 @@ export async function loadDraftSummaries(db: AppDb, userId: string, limit = DRAF
 		draftId: string;
 		storageKey: string;
 		mime: string;
+		width: number | null;
+		height: number | null;
 		altText: string | null;
 		sortOrder: number;
 		segmentIndex: number;
@@ -64,6 +66,8 @@ export async function loadDraftSummaries(db: AppDb, userId: string, limit = DRAF
 					draftId: draftMedia.draftId,
 					storageKey: draftMedia.storageKey,
 					mime: draftMedia.mime,
+					width: draftMedia.width,
+					height: draftMedia.height,
 					altText: draftMedia.altText,
 					sortOrder: draftMedia.sortOrder,
 					segmentIndex: draftMedia.segmentIndex,
@@ -254,6 +258,8 @@ export async function loadQueueList(db: AppDb, userId: string, limit = QUEUE_LIS
 			status: t.status,
 			scheduledFor: t.scheduledFor,
 			updatedAt: t.updatedAt,
+			// With updatedAt, tells Posts the row is being sent right now.
+			jobId: t.jobId,
 			remoteUrl: t.remoteUrl,
 			errorMessage: t.errorMessage,
 			draft: {

@@ -1,7 +1,6 @@
 <script lang="ts">
-	import { Calendar, Check, LoaderCircle, RefreshCw, TriangleAlert, X } from '@lucide/svelte';
-	import { humanizeError } from '#lib/domain/human-error.js';
-	import type { PostState, WaitingTarget } from '#lib/domain/post-state.js';
+	import { Calendar, CircleAlert, LoaderCircle, TriangleAlert } from '@lucide/svelte';
+	import type { PostState } from '#lib/domain/post-state.js';
 	import { formatRelativeTime } from '#lib/domain/relative-time.js';
 	import { scheduleWhenText } from '#lib/domain/schedule-helpers.js';
 
@@ -58,19 +57,31 @@
 		return out.sort((a, b) => (a.at?.getTime() ?? 0) - (b.at?.getTime() ?? 0));
 	});
 
-	const retrying = $derived(post.waiting.filter((w) => w.retrying));
+	const retrying = $derived(post.waiting.filter((w) => w.retrying).map((w) => w.connectionId));
+	// How it went on each account is for Posts to show; the composer only says
+	// where to look, so the post being edited is not buried under its history.
+	const summary = $derived.by(() => {
+		const parts: string[] = [];
+		if (post.published.length) parts.push(`Published on ${names(post.published)}.`);
+		if (retrying.length) parts.push(`Retrying on ${names(retrying)}.`);
+		const failed = post.failed.map((f) => f.connectionId);
+		if (failed.length) parts.push(`Failed on ${names(failed)}.`);
+		return parts.join(' ');
+	});
+	const summaryHref = $derived(
+		post.failed.length ? '/posts?tab=failed' : retrying.length ? '/posts' : '/posts?tab=published'
+	);
 	const soon = $derived(
 		!sending &&
 			post.nextAt !== null &&
 			post.nextAt.getTime() > now.getTime() &&
 			post.nextAt.getTime() - now.getTime() <= SOON_MS
 	);
-	const canAct = $derived(post.waiting.length > 0 && !sending);
+	// Only a post waiting for its time can be re-timed or unscheduled here; a
+	// retry or a video being processed is handled from Posts.
+	const canAct = $derived(groups.length > 0 && !sending);
 
-	function retryLine(w: WaitingTarget): string {
-		const when = w.at && w.at.getTime() > now.getTime() ? ` at ${scheduleWhenText(w.at, now)}` : '';
-		return `Retrying on ${nameOf(w.connectionId)}${when}: ${humanizeError(w.error)}`;
-	}
+	const linkClass = 'font-bold whitespace-nowrap underline underline-offset-2 hover:text-stone-950';
 
 	const actionClass =
 		'rounded-full border border-stone-300 bg-white px-4 py-1.5 text-[12px] font-bold text-stone-800 transition-colors hover:bg-stone-100 disabled:opacity-50';
@@ -86,8 +97,20 @@
 			<li class="flex items-start gap-2" data-testid="post-status-sending">
 				<LoaderCircle class="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-stone-500" />
 				<span>
-					{post.sending.length ? `Posting to ${names(post.sending)} now.` : 'Posting now.'}
-					Editing is paused until it's done.{dirty ? " Your last change isn't saved yet." : ''}
+					Sending now. Editing is paused until it's done.{dirty
+						? " Your last change isn't saved yet."
+						: ''}
+					<a href="/posts" class={linkClass}>View in Posts</a>
+				</span>
+			</li>
+		{/if}
+		{#if post.processing.length}
+			<li class="flex items-start gap-2" data-testid="post-status-processing">
+				<LoaderCircle class="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-stone-500" />
+				<span>
+					{names(post.processing)}
+					{post.processing.length === 1 ? 'is' : 'are'} processing the video — it publishes on its own.
+					<a href="/posts" class={linkClass}>View in Posts</a>
 				</span>
 			</li>
 		{/if}
@@ -107,26 +130,18 @@
 				</span>
 			</li>
 		{/each}
-		{#each retrying as w (w.connectionId)}
-			<li class="flex items-start gap-2 text-amber-800" data-testid="post-status-retrying">
-				<RefreshCw class="mt-0.5 h-3.5 w-3.5 shrink-0" />
-				<span class="min-w-0 break-words">{retryLine(w)}</span>
-			</li>
-		{/each}
-		{#if post.published.length}
-			<li class="flex items-start gap-2" data-testid="post-status-published">
-				<Check class="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
-				<span>Published on {names(post.published)}.</span>
+		{#if summary}
+			<li
+				class="flex items-start gap-2 {post.failed.length ? 'text-red-700' : ''}"
+				data-testid="post-status-summary"
+			>
+				<CircleAlert class="mt-0.5 h-3.5 w-3.5 shrink-0 text-stone-500" />
+				<span>
+					{summary}
+					<a href={summaryHref} class={linkClass}>Details in Posts</a>
+				</span>
 			</li>
 		{/if}
-		{#each post.failed as f (f.connectionId)}
-			<li class="flex items-start gap-2 text-red-700" data-testid="post-status-failed">
-				<X class="mt-0.5 h-3.5 w-3.5 shrink-0" />
-				<span class="min-w-0 break-words"
-					>Failed on {nameOf(f.connectionId)}: {humanizeError(f.error ?? 'Publish failed')}</span
-				>
-			</li>
-		{/each}
 	</ul>
 
 	{#if canAct}

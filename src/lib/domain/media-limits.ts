@@ -133,22 +133,34 @@ function imageCap(platform: string, mime: string): number | null {
  * The first attached image a selected platform would refuse for its size, as
  * a message to show before publishing, or null. The providers refuse the same
  * image at publish time; checking here stops a guaranteed failure from being
- * scheduled. Video is left to the providers' own no-video checks.
+ * scheduled. Video has its own rules in `video-rules`.
  */
 export function mediaSizeProblem(
 	platforms: Iterable<string>,
 	media: { mime: string; size?: number }[]
 ): string | null {
 	for (const platform of platforms) {
-		for (const m of media) {
-			const mime = (m.mime || '').toLowerCase();
-			if (mime.startsWith('video/') || m.size === undefined) continue;
-			const cap = imageCap(platform, mime);
-			if (cap !== null && m.size > cap) {
-				const label = PLATFORM_LABEL[platform as keyof typeof PLATFORM_LABEL];
-				const mb = cap / 1_000_000;
-				return `An image is over ${label}'s ${mb}MB limit — remove it or uncheck ${label}`;
-			}
+		const over = imageOverCap(platform, media);
+		if (over) {
+			const label = PLATFORM_LABEL[platform as keyof typeof PLATFORM_LABEL];
+			return `${over} — remove it or uncheck ${label}`;
+		}
+	}
+	return null;
+}
+
+/** The first image `platform` would refuse for its size, said plainly. */
+export function imageOverCap(
+	platform: string,
+	media: { mime: string; size?: number }[]
+): string | null {
+	for (const m of media) {
+		const mime = (m.mime || '').toLowerCase();
+		if (mime.startsWith('video/') || m.size === undefined) continue;
+		const cap = imageCap(platform, mime);
+		if (cap !== null && m.size > cap) {
+			const label = PLATFORM_LABEL[platform as keyof typeof PLATFORM_LABEL];
+			return `An image is over ${label}'s ${cap / 1_000_000}MB limit`;
 		}
 	}
 	return null;

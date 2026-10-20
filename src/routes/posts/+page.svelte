@@ -16,6 +16,8 @@
 		LoaderCircle
 	} from '@lucide/svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
+	import MediaPreview from '#lib/components/MediaPreview.svelte';
+	import { markPublishSeen, publishActivity } from '#lib/components/publish-tracker.svelte.js';
 	import { platformColorClass } from '#lib/components/platform-color.js';
 	import SocialIcon from '#lib/components/SocialIcon.svelte';
 	import { displayHandle, platformName, platformRank } from '#lib/domain/platforms.js';
@@ -23,6 +25,7 @@
 	import { safeHttpUrl } from '#lib/domain/links.js';
 	import { parseXPostUrl } from '#lib/domain/x-quote.js';
 	import { humanizeError } from '#lib/domain/human-error.js';
+	import { isTargetSending } from '#lib/domain/post-state.js';
 	import { PROCESSING_MARK } from '#lib/domain/video-rules.js';
 	import { sessionExpiredIfUnauthorized } from '#lib/components/session-expired.js';
 	import { takePostsNotice } from '#lib/components/posts-notice.js';
@@ -61,7 +64,9 @@
 		altText: string | null;
 		segmentIndex?: number | null;
 		sortOrder?: number | null;
-		meta?: { cover?: { v?: number } | null } | null;
+		width?: number | null;
+		height?: number | null;
+		meta?: { cover?: { v?: number } | null; durationMs?: number | null } | null;
 	};
 
 	type DraftTarget = {
@@ -90,6 +95,7 @@
 		status: string;
 		scheduledFor: string | Date | null;
 		updatedAt?: string | Date | null;
+		jobId?: string | null;
 		remoteUrl: string | null;
 		errorMessage: string | null;
 		draft: {
@@ -356,20 +362,6 @@
 		);
 	}
 
-	function postMediaSrc(m: PostMedia): string {
-		const src = `/api/media/${encodeURIComponent(m.storageKey)}`;
-		return isPostVideo(m) ? src : `${src}?thumb=1`;
-	}
-
-	function isPostVideo(m: PostMedia): boolean {
-		return (m.mime || '').toLowerCase().startsWith('video/');
-	}
-
-	function postVideoPoster(m: PostMedia): string | undefined {
-		const v = m.meta?.cover?.v;
-		return v ? `/api/media/${encodeURIComponent(m.storageKey)}?cover=${v}` : undefined;
-	}
-
 	/** Waiting on the platform to finish a video, which is not a failure. */
 	function isProcessing(error: string | null | undefined): boolean {
 		return (error ?? '').includes(PROCESSING_MARK);
@@ -463,13 +455,23 @@
 			// Scheduled rows keep their errorMessage when a transient failure
 			// backs off: they are auto-retrying, not terminally failed.
 			const waiting = group.filter((t) => t.status === 'scheduled' && t.errorMessage);
-			const cardStatus = hasFailed
-				? 'failed'
-				: waiting.length
-					? waiting.every((t) => isProcessing(t.errorMessage))
-						? 'processing'
-						: 'retrying'
-					: primary.status;
+			// Being sent right now outranks the rest: it settles in moments, and
+			// nothing on the card can be changed until it has.
+			const sending = group.some(
+				(t) =>
+					t.status !== 'published' &&
+					t.status !== 'failed' &&
+					isTargetSending({ status: t.status, jobId: t.jobId, updatedAt: t.updatedAt })
+			);
+			const cardStatus = sending
+				? 'sending'
+				: hasFailed
+					? 'failed'
+					: waiting.length
+						? waiting.every((t) => isProcessing(t.errorMessage))
+							? 'processing'
+							: 'retrying'
+						: primary.status;
 
 			// Cancelled (discarded) platforms leave the card entirely: the
 			// error rows key off failed rows and the icon row off this list.
@@ -540,6 +542,40 @@
 	// Failed is a slice of history, not a separate source: a card with any
 	// failed platform carries status 'failed' even when a sibling is retrying.
 	const failedCards = $derived(historyCards.filter((c) => c.status === 'failed'));
+
+	// While anything is on its way out, Posts follows it without a reload:
+	// quickly while a send is in flight, slowly while a platform processes a
+	// video, which only moves on with the scheduler's next run.
+	const refreshEvery = $derived.by((): number | null => {
+		if (publishActivity.inFlight > 0 || upcomingCards.some((c) => c.status === 'sending')) {
+			return 5_000;
+		}
+		return upcomingCards.some((c) => c.status === 'processing') ? 30_000 : null;
+	});
+	$effect(() => {
+		const every = refreshEvery;
+		if (every === null) return;
+		// One read at a time: a slow answer must not land after a newer one.
+		let reading = false;
+		const timer = setInterval(() => {
+			if (reading || document.visibilityState !== 'visible') return;
+			reading = true;
+			void load({ keepError: true }).finally(() => (reading = false));
+		}, every);
+		return () => clearInterval(timer);
+	});
+	// A handed-off publish just settled: show how it went straight away.
+	let settledSeen = publishActivity.version;
+	$effect(() => {
+		const version = publishActivity.version;
+		if (version === settledSeen) return;
+		settledSeen = version;
+		void load({ keepError: true });
+	});
+	// Posts is where a failure is read, so being here is seeing it.
+	$effect(() => {
+		if (publishActivity.unseenFailure) markPublishSeen();
+	});
 
 	type AccountOption = {
 		id: string;
@@ -890,6 +926,7 @@
 
 	function statusBadge(status: string) {
 		if (['scheduled', 'pending', 'publishing'].includes(status)) return 'scheduled';
+		if (status === 'sending') return 'sending';
 		if (status === 'retrying') return 'retrying';
 		if (status === 'processing') return 'processing';
 		if (status === 'published') return 'published';
@@ -1142,6 +1179,8 @@
 			{@const badge = statusBadge(card.status)}
 			<div
 				class="flex flex-col rounded-[2rem] border border-stone-200/80 bg-white p-5 shadow-[0_8px_30px_-12px_rgb(28_25_23/0.06)] transition-all hover:border-stone-300 hover:shadow-[0_8px_30px_-12px_rgb(28_25_23/0.1)] sm:p-6"
+				data-testid="post-card"
+				data-status={card.status}
 			>
 				<!-- Post Header -->
 				<div class="mb-4 flex items-start justify-between">
@@ -1209,6 +1248,13 @@
 							>
 								<XCircle class="h-3 w-3" /> Failed
 							</span>
+						{:else if badge === 'sending'}
+							<span
+								class="inline-flex items-center gap-1.5 rounded bg-sky-50 px-2.5 py-1 text-[10px] font-bold tracking-widest text-sky-700 uppercase"
+								data-testid="sending-badge"
+							>
+								<LoaderCircle class="h-3 w-3 animate-spin" /> Sending
+							</span>
 						{:else if badge === 'processing'}
 							<span
 								class="inline-flex items-center gap-1.5 rounded bg-sky-50 px-2.5 py-1 text-[10px] font-bold tracking-widest text-sky-700 uppercase"
@@ -1243,51 +1289,13 @@
 
 				{#if card.media.length > 0}
 					{@const allValid = card.media.filter((m) => m.storageKey)}
-					{@const preview = allValid.slice(0, 4)}
-					{@const extraCount = allValid.length - preview.length}
-					{#if preview.length > 0}
+					{#if allValid.length > 0}
 						<div class="mb-5" data-testid="post-media-{card.key}">
-							<div class="flex flex-wrap gap-2">
-								{#each preview as m, i (m.id)}
-									<div
-										class="relative h-20 w-20 overflow-hidden rounded-xl border border-stone-200/80 bg-white"
-									>
-										{#if isPostVideo(m)}
-											<!-- svelte-ignore a11y_media_has_caption -->
-											<video
-												src={postMediaSrc(m)}
-												poster={postVideoPoster(m)}
-												controls
-												preload="none"
-												playsinline
-												width="80"
-												height="80"
-												aria-label={m.altText || `Attached video ${i + 1}`}
-												class="h-20 w-20 bg-black object-cover"
-											></video>
-										{:else}
-											<img
-												src={postMediaSrc(m)}
-												alt={m.altText || `Attached image ${i + 1}`}
-												loading="lazy"
-												decoding="async"
-												width="80"
-												height="80"
-												class="h-20 w-20 object-cover"
-											/>
-										{/if}
-										{#if i === preview.length - 1 && extraCount > 0}
-											<div
-												class="pointer-events-none absolute inset-0 flex items-center justify-center bg-stone-900/60 text-sm font-extrabold text-white"
-												role="img"
-												aria-label={`${extraCount} more attachment${extraCount === 1 ? '' : 's'}`}
-											>
-												+{extraCount}
-											</div>
-										{/if}
-									</div>
-								{/each}
-							</div>
+							<MediaPreview
+								items={allValid}
+								maxHeight={280}
+								extra={Math.max(0, allValid.length - 4)}
+							/>
 							{#if card.segmentCount > 1}
 								<p class="mt-2 text-[11px] font-bold text-stone-500">
 									Thread · {card.segmentCount} posts · images combined
@@ -1366,7 +1374,7 @@
 									<span class="font-bold">{platformName(platform.name)}</span>
 									<span class="font-medium"> — {humanizeError(platform.error)}</span>
 								</p>
-								{#if platform.targetId}
+								{#if platform.targetId && !isProcessing(platform.error)}
 									<div class="flex shrink-0 items-center gap-3">
 										<button
 											type="button"
@@ -1441,46 +1449,49 @@
 							>
 								Edit Post
 							</a>
-							<button
-								type="button"
-								onclick={() => {
-									rescheduleId = card.targetId;
-									rescheduleMode = 'relative';
+							<!-- A video the platform is processing publishes on its own: nothing to re-time or cancel. -->
+							{#if badge !== 'processing'}
+								<button
+									type="button"
+									onclick={() => {
+										rescheduleId = card.targetId;
+										rescheduleMode = 'relative';
 
-									let defaultUnit: 'hours' | 'days' | 'mins';
-									let defaultValue: string;
-									if (DEFAULT_SCHEDULE_OFFSET.days > 0) {
-										defaultUnit = 'days';
-										defaultValue = String(DEFAULT_SCHEDULE_OFFSET.days);
-									} else if (DEFAULT_SCHEDULE_OFFSET.hours > 0) {
-										defaultUnit = 'hours';
-										defaultValue = String(DEFAULT_SCHEDULE_OFFSET.hours);
-									} else {
-										defaultUnit = 'mins';
-										defaultValue = String(DEFAULT_SCHEDULE_OFFSET.mins || 1);
-									}
-									rescheduleRelativeUnit = defaultUnit;
-									rescheduleRelativeValue = defaultValue;
+										let defaultUnit: 'hours' | 'days' | 'mins';
+										let defaultValue: string;
+										if (DEFAULT_SCHEDULE_OFFSET.days > 0) {
+											defaultUnit = 'days';
+											defaultValue = String(DEFAULT_SCHEDULE_OFFSET.days);
+										} else if (DEFAULT_SCHEDULE_OFFSET.hours > 0) {
+											defaultUnit = 'hours';
+											defaultValue = String(DEFAULT_SCHEDULE_OFFSET.hours);
+										} else {
+											defaultUnit = 'mins';
+											defaultValue = String(DEFAULT_SCHEDULE_OFFSET.mins || 1);
+										}
+										rescheduleRelativeUnit = defaultUnit;
+										rescheduleRelativeValue = defaultValue;
 
-									applyRelativeReschedule();
-								}}
-								class="{cardAction} text-stone-500 hover:text-stone-900"
-							>
-								Reschedule
-							</button>
-							<button
-								type="button"
-								disabled={busy === card.key}
-								onclick={() =>
-									(pendingCancel = {
-										ids: cancelTargetIds(card.platforms),
-										label: draftExcerpt(card.body, 60) || 'post',
-										cardKey: card.key
-									})}
-								class="{cardAction} text-red-500 hover:text-red-700"
-							>
-								{busy === card.key ? 'Cancelling…' : 'Cancel'}
-							</button>
+										applyRelativeReschedule();
+									}}
+									class="{cardAction} text-stone-500 hover:text-stone-900"
+								>
+									Reschedule
+								</button>
+								<button
+									type="button"
+									disabled={busy === card.key}
+									onclick={() =>
+										(pendingCancel = {
+											ids: cancelTargetIds(card.platforms),
+											label: draftExcerpt(card.body, 60) || 'post',
+											cardKey: card.key
+										})}
+									class="{cardAction} text-red-500 hover:text-red-700"
+								>
+									{busy === card.key ? 'Cancelling…' : 'Cancel'}
+								</button>
+							{/if}
 						{:else if badge === 'failed' && card.targetId}
 							{@const failedIds = retryTargetIds(card.platforms)}
 							{@const cardBusy =

@@ -102,17 +102,23 @@ test('scheduling a new post clears the composer and links to it', async ({ page 
 	await expect(page.getByTestId('segment-input-0')).toHaveValue('');
 });
 
-test('publishing a new post clears the composer and links to it', async ({ page }) => {
+test('publishing hands the post off, clears the composer at once, and reports back', async ({
+	page
+}) => {
 	const { connId } = await seedAccount(page);
-	await page.route('**/api/drafts/*/publish', (route) =>
-		route.fulfill({
+	// The platform's answer is held back: the composer must not wait for it.
+	let answer: () => void = () => {};
+	const answered = new Promise<void>((resolve) => (answer = resolve));
+	await page.route('**/api/drafts/*/publish', async (route) => {
+		await answered;
+		await route.fulfill({
 			status: 200,
 			contentType: 'application/json',
 			body: JSON.stringify({
 				results: [{ connectionId: connId, status: 'published', skipped: false }]
 			})
-		})
-	);
+		});
+	});
 	await page.goto('/compose');
 	await fillUntilKept(page.getByTestId('segment-input-0'), `${PREFIX} new published`);
 	await clickUntilVisible(
@@ -123,10 +129,17 @@ test('publishing a new post clears the composer and links to it', async ({ page 
 	await expect(page.getByTestId('confirm-dialog-ok')).toBeEnabled({ timeout: 20000 });
 	await page.getByTestId('confirm-dialog-ok').click();
 
-	await expect(page.getByTestId('publish-toast')).toContainText('Published to 1 destination');
-	await expect(page.getByTestId('toast-action')).toHaveAttribute('href', '/posts?tab=published');
+	await expect(page.getByTestId('publish-confirm-destinations')).toBeHidden();
 	await expect(page.getByTestId('segment-input-0')).toHaveValue('');
 	await expect(page).toHaveURL(/\/compose$/);
+	await expect(page.getByTestId('publish-toast')).toContainText('Publishing to 1 account');
+	// The next post can be written while the last one is still going out.
+	await fillUntilKept(page.getByTestId('segment-input-0'), `${PREFIX} the next one`);
+
+	answer();
+	await expect(page.getByTestId('publish-toast')).toContainText('Published to 1 destination');
+	await expect(page.getByTestId('toast-action')).toHaveAttribute('href', '/posts?tab=published');
+	await expect(page.getByTestId('segment-input-0')).toHaveValue(`${PREFIX} the next one`);
 });
 
 test('a post opened from Posts goes back there once scheduled', async ({ page }) => {

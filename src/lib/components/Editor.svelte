@@ -9,13 +9,11 @@
 		Send,
 		Check,
 		X,
-		TriangleAlert,
 		ChevronUp,
 		Plus,
 		Link2Off,
 		Settings,
 		LoaderCircle,
-		RefreshCw,
 		User,
 		Quote
 	} from '@lucide/svelte';
@@ -38,18 +36,21 @@
 		X_MAX_GIF_BYTES,
 		X_MAX_IMAGE_BYTES,
 		groupMediaBySegment,
+		imageOverCap,
 		mediaSizeProblem,
 		remapSegmentIndexAfterRemoval
 	} from '#lib/domain/media-limits.js';
 	import {
 		factsOfMedia,
 		firstVideoError,
-		PROCESSING_MARK,
+		fitByPlatform,
+		type PlatformFit,
 		type VideoRuleMeta
 	} from '#lib/domain/video-rules.js';
 	import { prepareVideo, VideoPrepareError } from '#lib/components/video/prepare.js';
 	import { uploadVideo } from '#lib/components/video/upload.js';
-	import VideoChecklist from './video/VideoChecklist.svelte';
+	import MediaFit from './video/MediaFit.svelte';
+	import MediaPreview from './MediaPreview.svelte';
 	import VideoCover from './video/VideoCover.svelte';
 	import { shrinkToFit } from '#lib/components/shrink-image.js';
 	import { persistMediaLayout, type MediaMove } from '#lib/domain/media-sync.js';
@@ -118,6 +119,8 @@
 	} from '#lib/domain/published-lock.js';
 	import { selectionDrift, summarizePost, type TargetSnapshot } from '#lib/domain/post-state.js';
 	import { setPostsNotice } from '#lib/components/posts-notice.js';
+	import { cancelWaitingExcept, handOff } from '#lib/components/publish-tracker.svelte.js';
+	import { showToast } from '#lib/components/toast.svelte.js';
 	import { composeSession } from '#lib/components/compose-session.svelte.js';
 	import {
 		attachXQuote,
@@ -178,18 +181,6 @@
 	};
 
 	type ActiveTab = 'global' | PlatformId;
-
-	// One row per destination while a publish runs (and afterwards, when some
-	// destination failed, so the popover can keep showing the error).
-	type DestinationProgress = {
-		connectionId: string;
-		// `retrying` = a retryable failure the scheduler will attempt again
-		// automatically; the target is `scheduled` with an error, not failed.
-		status: 'pending' | 'published' | 'failed' | 'publishing' | 'retrying';
-		error?: string | null;
-		// Published before this attempt: the server skipped it, nothing was sent.
-		already?: boolean;
-	};
 
 	type EditorDraft = {
 		id: string;
@@ -282,12 +273,6 @@
 	let media = $state<MediaItem[]>(seededMedia);
 	let saving = $state(false);
 	let publishing = $state(false);
-	// Single toast. Success auto-dismisses; problems stay until
-	// replaced so failures are never missed.
-	let toastMessage = $state('');
-	let toastTone = $state<'success' | 'error' | 'warn'>('success');
-	let toastAction = $state<{ label: string; href: string } | null>(null);
-	let toastTimer: ReturnType<typeof setTimeout> | null = null;
 	let scheduleOpen = $state(false);
 	let schedDate = $state('');
 	let schedTime = $state('');
@@ -354,16 +339,10 @@
 	let saveFailed = $state(false);
 	// What the split Publish button is busy with (drives its label + spinner).
 	let busyAction = $state<'publish' | 'schedule' | null>(null);
-	// Per-destination publish progress shown inside the confirm popover.
-	let publishProgress = $state<DestinationProgress[] | null>(null);
 	// Quick publishes should not flash "Publishing…": the button only turns
 	// busy after a short delay, once the work is actually slow.
 	let publishBusyVisible = $state(false);
 	let publishBusyTimer: ReturnType<typeof setTimeout> | null = null;
-	// The popover closes while publishing, so completion is announced to
-	// screen readers through this live region.
-	let publishAnnouncement = $state('');
-	let announceTimer: ReturnType<typeof setTimeout> | null = null;
 	// Platforms with a persisted variant row. A save only DELETEs rows that
 	// exist instead of firing a DELETE for every platform on every save.
 	let storedVariants = new Set<PlatformId>(
@@ -408,39 +387,6 @@
 		} catch {
 			// prefs are cosmetic
 		}
-	}
-
-	function showToast(
-		message: string,
-		tone: 'success' | 'error' | 'warn' = 'success',
-		action?: { label: string; href: string } | null
-	) {
-		if (toastTimer) {
-			clearTimeout(toastTimer);
-			toastTimer = null;
-		}
-		toastMessage = message;
-		toastTone = tone;
-		toastAction = action ?? null;
-		// Success and warning nudges dismiss themselves; real failures stick
-		// around with a close button so they are never missed.
-		const dismissMs = tone === 'success' ? 5000 : tone === 'warn' ? 5000 : 0;
-		if (dismissMs > 0) {
-			toastTimer = setTimeout(() => {
-				toastMessage = '';
-				toastAction = null;
-				toastTimer = null;
-			}, dismissMs);
-		}
-	}
-
-	function dismissToast() {
-		if (toastTimer) {
-			clearTimeout(toastTimer);
-			toastTimer = null;
-		}
-		toastMessage = '';
-		toastAction = null;
 	}
 
 	/**
@@ -821,7 +767,6 @@
 		scheduleTouched = false;
 		isPostConfirmOpen = false;
 		pendingPublish = null;
-		publishProgress = null;
 		busyAction = null;
 		dirty = false;
 		saveFailed = false;
@@ -1356,7 +1301,7 @@
 				}
 				pendingPublish = null;
 				isPostConfirmOpen = false;
-				await publishToDestinations(id, connectionIds);
+				handOffPublish(id, connectionIds);
 			} catch (e) {
 				showToast(humanizeError(e instanceof Error ? e.message : 'Publish failed'), 'error');
 			} finally {
@@ -1372,8 +1317,6 @@
 		// A clean, already-saved draft skips the persist entirely.
 		const requestId = ++publishRequestSeq;
 		const ready = draftId !== null && !dirty && !saving && Object.keys(altPending).length === 0;
-		// Fresh dialog: never show a previous attempt's progress/failure list.
-		publishProgress = null;
 		pendingPublish = { draftId, connectionIds, saving: !ready };
 		isPostConfirmOpen = true;
 		if (ready) return;
@@ -1423,179 +1366,50 @@
 		return `${platformName(c.platform)} · ${displayHandle(c.handle)}`;
 	};
 
-	function setDestinationProgress(connectionId: string, patch: Partial<DestinationProgress>) {
-		publishProgress = publishProgress
-			? publishProgress.map((d) => (d.connectionId === connectionId ? { ...d, ...patch } : d))
-			: publishProgress;
-	}
-
 	/**
-	 * Publish to every destination in parallel, one request each. Per-destination
-	 * requests let the confirm popover show live progress and keep each publish
-	 * inside its own Worker subrequest budget. An already-published target comes
-	 * back `skipped` and still counts as success.
+	 * Hand the publish to the tracker and let go of the post: the composer is
+	 * free for the next one at once, and the outcome comes back as a toast
+	 * wherever the person is by then.
 	 */
-	async function publishToDestinations(draftId: string, connectionIds: string[]) {
-		publishProgress = connectionIds.map((connectionId) => ({
-			connectionId,
-			status: 'pending' as const,
-			error: null
-		}));
-		announcePublish(
-			`Publishing to ${connectionIds.length} ${connectionIds.length === 1 ? 'destination' : 'destinations'}.`
-		);
-		// Destinations the server skipped because the post was already there:
-		// published, but nothing was sent this time.
-		const alreadyIds = new Set<string>();
-		const settled = await Promise.all(
-			connectionIds.map(async (connectionId) => {
-				try {
-					const res = await fetch(`/api/drafts/${draftId}/publish`, {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ connectionIds: [connectionId] })
-					});
-					const data = await res.json().catch(() => ({}));
-					if (!res.ok) throw new Error(data.error || 'Publish failed');
-					const row = (data.results || [])[0] as
-						| { status?: string; error?: string | null; deferred?: boolean; skipped?: boolean }
-						| undefined;
-					if (!row) throw new Error('Publish failed');
-					if (row.status === 'published') {
-						const already = row.skipped === true;
-						if (already) alreadyIds.add(connectionId);
-						setDestinationProgress(connectionId, { status: 'published', error: null, already });
-						return { connectionId, status: 'published' as const, error: null };
-					}
-					if (row.status === 'publishing') {
-						setDestinationProgress(connectionId, { status: 'publishing', error: null });
-						return { connectionId, status: 'publishing' as const, error: null };
-					}
-					if (row.deferred) {
-						// Left for the scheduler's next tick (the request's call
-						// budget ran short): it is on its way, not failed.
-						const message = 'Queued — goes out on the next scheduler tick';
-						setDestinationProgress(connectionId, { status: 'retrying', error: message });
-						return { connectionId, status: 'retrying' as const, error: message };
-					}
-					if (row.status === 'scheduled') {
-						// Retryable failure: the scheduler retries with backoff. A
-						// video the platform is still processing parks the same way.
-						const processing = (row.error ?? '').includes(PROCESSING_MARK);
-						const message = processing
-							? (row.error ?? '')
-							: humanizeError(row.error ?? 'Retrying automatically');
-						setDestinationProgress(connectionId, {
-							status: 'retrying',
-							error: message
-						});
-						return { connectionId, status: 'retrying' as const, error: message, processing };
-					}
-					const message = humanizeError(row.error ?? 'Publish failed');
-					setDestinationProgress(connectionId, { status: 'failed', error: message });
-					return { connectionId, status: 'failed' as const, error: message };
-				} catch (e) {
-					const message = humanizeError(e instanceof Error ? e.message : 'Publish failed');
-					setDestinationProgress(connectionId, { status: 'failed', error: message });
-					return { connectionId, status: 'failed' as const, error: message };
-				}
-			})
-		);
-
-		const failed = settled.filter((s) => s.status === 'failed');
-		const published = settled.filter((s) => s.status === 'published');
-		const inFlight = settled.filter((s) => s.status === 'publishing');
-		const retrying = settled.filter((s) => s.status === 'retrying');
-		// Publishing now replaces the schedule: accounts left unticked must not
-		// still post later. Only once the post is on its way everywhere it was
-		// sent, so a failed publish never also loses the other schedule.
-		let unscheduledNote = '';
-		let unscheduleKept = false;
-		const leftOut = postState.waiting.some((w) => !connectionIds.includes(w.connectionId));
-		if (leftOut && !failed.length && !inFlight.length) {
-			const { cancelled, kept } = await cancelWaitingExcept(draftId, connectionIds);
-			unscheduleKept = kept.length > 0;
-			unscheduledNote =
-				(cancelled.length ? ` · unscheduled on ${cancelled.map(destinationName).join(', ')}` : '') +
-				(kept.length ? ` · ${kept.map(destinationName).join(', ')} still scheduled` : '');
+	function handOffPublish(id: string, connectionIds: string[]) {
+		const names = new Map<string, string>();
+		for (const c of connections) names.set(c.id, destinationName(c.id));
+		for (const t of targets) {
+			if (t.connectionId && !names.has(t.connectionId)) {
+				names.set(t.connectionId, destinationName(t.connectionId));
+			}
 		}
-		if (failed.length) {
-			showToast(
-				humanizeError(
-					failed
-						.map((f) => f.error)
-						.filter(Boolean)
-						.join('; ') || 'Publish failed'
-				),
-				'error',
-				{ label: 'View posts', href: '/posts' }
-			);
-			announcePublish(
-				(published.length ? `Published to ${published.length}. ` : '') +
-					`Failed for ${failed.map((f) => destinationName(f.connectionId)).join(', ')}.`
-			);
-		} else if (retrying.length && retrying.every((r) => r.processing)) {
-			const names = retrying.map((r) => destinationName(r.connectionId)).join(', ');
-			showToast(
-				`${names} ${retrying.length === 1 ? 'is' : 'are'} processing the video — it publishes on its own in a minute or two` +
-					(published.length ? ` · already published to ${published.length}` : '') +
-					unscheduledNote,
-				'success',
-				{ label: 'View posts', href: '/posts' }
-			);
-			announcePublish(`${names} ${retrying.length === 1 ? 'is' : 'are'} processing the video.`);
-		} else if (retrying.length) {
-			// Retryable failures are rescheduled server-side; report them as a
-			// warning with a link instead of a red failure.
-			showToast(
-				`Retrying automatically for ${retrying.map((r) => destinationName(r.connectionId)).join(', ')}` +
-					(published.length ? ` — already published to ${published.length}` : '') +
-					unscheduledNote,
-				'warn',
-				{ label: 'View posts', href: '/posts' }
-			);
-			announcePublish(
-				`Retrying automatically for ${retrying.map((r) => destinationName(r.connectionId)).join(', ')}.`
-			);
-		} else if (inFlight.length) {
-			showToast('One of these destinations is already publishing', 'warn');
-		} else if (published.length) {
-			// Every destination has the post: this one is done.
-			const sent = published.filter((p) => !alreadyIds.has(p.connectionId)).length;
-			const already = published.length - sent;
-			const message =
-				(sent
-					? `Published to ${sent} ${sent === 1 ? 'destination' : 'destinations'}` +
-						(already ? ` · already on ${already}` : '')
-					: `Already published to ${already} ${already === 1 ? 'destination' : 'destinations'} — nothing new was sent`) +
-				unscheduledNote;
-			announcePublish(`${message}.`);
-			clearPostConfirm();
-			finishPosted('published', message, sent && !unscheduleKept ? 'success' : 'warn');
+		void handOff({
+			draftId: id,
+			connectionIds,
+			nameOf: (connectionId) => names.get(connectionId) ?? 'Destination',
+			unscheduleOthers: postState.waiting.some((w) => !connectionIds.includes(w.connectionId)),
+			targets: $state.snapshot(targets) as TargetSnapshot[]
+		});
+		clearPostConfirm();
+		const message = `Publishing to ${connectionIds.length} ${connectionIds.length === 1 ? 'account' : 'accounts'}`;
+		// Text typed while the save ran is not part of what goes out. Keep it
+		// on screen: the sending lock says it waits, and the autosave stores it.
+		if (dirty) {
+			showToast(message, 'success', { label: 'View in Posts', href: '/posts' });
+			void refreshTargets();
 			return;
 		}
-		// The popover closed when the publish started. Reopen it only when a
-		// destination failed, so the per-destination errors are visible; a
-		// clean publish just closes out (success is reported by the toast).
-		if (failed.length) {
-			if (pendingPublish) isPostConfirmOpen = true;
-		} else {
-			clearPostConfirm();
+		if (returnToPosts) {
+			setPostsNotice(message, 'success');
+			void goto('/posts');
+			return;
 		}
-		void refreshTargets();
-		try {
-			await loadConnections();
-		} catch {
-			// Connection refresh is best-effort; the toast already reported.
-		}
+		clearComposer();
+		showToast(message, 'success', { label: 'View in Posts', href: '/posts' });
 	}
 
 	/**
-	 * Close out a post that is now scheduled, or published everywhere: back to
+	 * Close out a post that is now scheduled: back to
 	 * Posts when it was opened from there, otherwise an empty composer for the
 	 * next one, with a link to where the post went.
 	 */
-	function finishPosted(tab: 'scheduled' | 'published', message: string, tone: 'success' | 'warn') {
+	function finishPosted(tab: 'scheduled', message: string, tone: 'success' | 'warn') {
 		const href = `/posts?tab=${tab}`;
 		// Text typed while the request ran was not part of what went out. Keep
 		// it on screen: the autosave stores it, or the lock says it was refused.
@@ -1668,46 +1482,6 @@
 	 * fresh read, not the editor's copy, so an account scheduled from another
 	 * tab is not missed. The server refuses any that started sending meanwhile.
 	 */
-	async function cancelWaitingExcept(
-		id: string,
-		keep: string[]
-	): Promise<{ cancelled: string[]; kept: string[] }> {
-		let list: TargetSnapshot[] = targets;
-		try {
-			const res = await fetch(`/api/drafts/${encodeURIComponent(id)}`);
-			const data = res.ok ? await res.json().catch(() => null) : null;
-			if (Array.isArray(data?.draft?.targets)) list = data.draft.targets;
-		} catch {
-			// Fall back to the editor's copy of the targets.
-		}
-		const waiting = summarizePost(list)
-			.waiting.filter((w) => !keep.includes(w.connectionId) && w.targetId)
-			.map((w) => ({ targetId: w.targetId as string, connectionId: w.connectionId }));
-		const cancelled: string[] = [];
-		const kept: string[] = [];
-		// The bulk route takes ten ids per request.
-		for (let i = 0; i < waiting.length; i += 10) {
-			const chunk = waiting.slice(i, i + 10);
-			let results: Array<{ id: string; ok: boolean }> = [];
-			try {
-				const res = await fetch('/api/targets/bulk', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ op: 'cancel', ids: chunk.map((w) => w.targetId) })
-				});
-				const data = await res.json().catch(() => ({}));
-				if (res.ok && Array.isArray(data.results)) results = data.results;
-			} catch {
-				// Reported below as still scheduled.
-			}
-			for (const w of chunk) {
-				if (results.some((r) => r.id === w.targetId && r.ok)) cancelled.push(w.connectionId);
-				else kept.push(w.connectionId);
-			}
-		}
-		return { cancelled, kept };
-	}
-
 	let unscheduling = $state(false);
 
 	/** Take the post off the schedule and keep it open as a draft. */
@@ -1717,7 +1491,7 @@
 		unscheduling = true;
 		scheduleOpen = false;
 		try {
-			const { cancelled, kept } = await cancelWaitingExcept(id, []);
+			const { cancelled, kept } = await cancelWaitingExcept(id, [], targets);
 			await refreshTargets();
 			if (draftId !== id) return;
 			if (kept.length) {
@@ -1744,6 +1518,8 @@
 	const watchDelay = $derived.by((): number | null => {
 		if (!draftId || publishedLock) return null;
 		if (sendingNow) return 10_000;
+		// The platform finishes a video on its own; this only notices when.
+		if (postState.processing.length) return 30_000;
 		if (!postState.nextAt) return null;
 		const until = postState.nextAt.getTime() - clock;
 		if (until > 2 * 60_000) return null;
@@ -1752,7 +1528,7 @@
 
 	$effect(() => {
 		if (!draftId || publishedLock) return;
-		if (!postState.waiting.length && !sendingNow) return;
+		if (!postState.waiting.length && !postState.processing.length && !sendingNow) return;
 		const timer = setInterval(() => (clock = Date.now()), 30_000);
 		return () => clearInterval(timer);
 	});
@@ -1770,7 +1546,9 @@
 		const onVisible = () => {
 			if (document.visibilityState !== 'visible') return;
 			clock = Date.now();
-			if (postState.waiting.length > 0 || sendingNow) void refreshTargets();
+			if (postState.waiting.length > 0 || postState.processing.length > 0 || sendingNow) {
+				void refreshTargets();
+			}
 		};
 		document.addEventListener('visibilitychange', onVisible);
 		return () => document.removeEventListener('visibilitychange', onVisible);
@@ -1867,24 +1645,10 @@
 		}
 	}
 
-	async function confirmPublish() {
+	function confirmPublish() {
 		const pending = pendingPublish;
 		if (!pending || publishing || pending.saving || !pending.draftId) return;
-		// Close the popover now: the main button owns progress from here, and
-		// the popover only comes back when a destination fails. pendingPublish
-		// stays set so the failure view can still render the destinations.
-		publishRequestSeq++;
-		isPostConfirmOpen = false;
-		publishing = true;
-		busyAction = 'publish';
-		startPublishBusy();
-		try {
-			await publishToDestinations(pending.draftId, pending.connectionIds);
-		} finally {
-			publishing = false;
-			busyAction = null;
-			stopPublishBusy();
-		}
+		handOffPublish(pending.draftId, pending.connectionIds);
 	}
 
 	async function verifyConnection(connectionId: string) {
@@ -2306,10 +2070,6 @@
 	const isVideoItem = (m: { mime?: string | null }) => (m.mime || '').startsWith('video/');
 	const mediaSrc = (m: MediaItem) =>
 		m.previewUrl || `/api/media/${encodeURIComponent(m.storageKey)}`;
-	const coverSrc = (m: MediaItem) =>
-		m.meta?.cover
-			? `/api/media/${encodeURIComponent(m.storageKey)}?cover=${m.meta.cover.v}`
-			: undefined;
 	/** Each selected account with the limits it is held to. */
 	const selectedVideoAccounts = $derived(
 		connections
@@ -2328,6 +2088,56 @@
 		}
 		return null;
 	});
+
+	/**
+	 * Every platform that would refuse what is attached to `list`, one row
+	 * each, for the line under the media. `withLinkedIn` adds LinkedIn's
+	 * thread-wide rule, shown once, under the first card that has media.
+	 */
+	function fitProblems(list: MediaItem[], withLinkedIn: boolean): PlatformFit[] {
+		const rows = new Map<string, PlatformFit>();
+		for (const m of list) {
+			if (!isVideoItem(m)) continue;
+			for (const row of fitByPlatform(selectedVideoAccounts, factsOfMedia(m))) {
+				if (!rows.has(row.platform)) rows.set(row.platform, row);
+			}
+		}
+		const images = list.filter((m) => !isVideoItem(m));
+		for (const platform of selectedPlatforms) {
+			const over = imageOverCap(platform, images);
+			if (over && !rows.has(platform))
+				rows.set(platform, { platform, level: 'error', message: over });
+		}
+		if (withLinkedIn && linkedinMediaProblem && !rows.has('linkedin')) {
+			rows.set('linkedin', { platform: 'linkedin', level: 'error', message: linkedinMediaProblem });
+		}
+		return [...rows.values()];
+	}
+
+	const firstMediaCard = $derived(Math.min(...mediaBySegment.keys()));
+
+	function cardFit(index: number): PlatformFit[] {
+		const list = cardMedia(index);
+		const flattened = activeTab !== 'global' && !supportsThreads(activeTab);
+		return fitProblems(list, flattened || index === firstMediaCard);
+	}
+
+	// Platforms some attachment would be refused by, marked on their accounts.
+	const fitErrorPlatforms = $derived(
+		new Set(
+			fitProblems(media, true)
+				.filter((r) => r.level === 'error')
+				.map((r) => r.platform)
+		)
+	);
+
+	function uncheckPlatform(platform: string) {
+		const next = new Set([...selected].filter((id) => platformOf(id) !== platform));
+		if (next.size === selected.size) return;
+		selected = next;
+		selectionTouched = true;
+		markDirty();
+	}
 
 	const altTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 	const altPending: Record<string, string> = {};
@@ -2908,12 +2718,11 @@
 		publishRequestSeq++;
 		pendingPublish = null;
 		isPostConfirmOpen = false;
-		publishProgress = null;
 	}
 
 	function dismissPostConfirm() {
-		// User close attempts (Keep editing, outside click) are ignored while a
-		// publish is in flight so the progress view stays until it settles.
+		// User close attempts (Keep editing, outside click) are ignored while
+		// the skip-ask path is saving before it hands the publish off.
 		if (publishing) return;
 		clearPostConfirm();
 	}
@@ -2935,23 +2744,6 @@
 		publishBusyVisible = false;
 	}
 
-	function announcePublish(message: string) {
-		if (announceTimer) clearTimeout(announceTimer);
-		// Clear first so a repeated message (same count, same platform names)
-		// is still announced by screen readers.
-		publishAnnouncement = '';
-		announceTimer = setTimeout(() => {
-			publishAnnouncement = message;
-			announceTimer = null;
-		}, 30);
-	}
-
-	const publishBusyLabel = $derived.by(() => {
-		const list = publishProgress ?? [];
-		const settled = list.filter((d) => d.status === 'published' || d.status === 'failed').length;
-		return settled > 0 && list.length > 1 ? `Publishing ${settled}/${list.length}…` : 'Publishing…';
-	});
-
 	const publishButtonBusy = $derived(
 		publishing && (saving || busyAction === 'schedule' || publishBusyVisible)
 	);
@@ -2965,6 +2757,7 @@
 			Boolean(draftId) &&
 			(sendingNow ||
 				postState.waiting.length > 0 ||
+				postState.processing.length > 0 ||
 				postState.published.length > 0 ||
 				postState.failed.length > 0)
 	);
@@ -2988,7 +2781,7 @@
 				: busyAction === 'schedule'
 					? 'Scheduling…'
 					: publishBusyVisible
-						? publishBusyLabel
+						? 'Publishing…'
 						: publishIdleLabel
 			: publishIdleLabel
 	);
@@ -3536,111 +3329,70 @@
 							rows="1"></textarea>
 
 						{#if segMedia.length > 0 || jobsFor(index).length > 0}
-							<div class="mt-3 flex flex-wrap gap-2" data-testid="segment-media-{index}">
-								{#each jobsFor(index) as job (job.id)}
-									<div
-										class="flex h-20 w-20 flex-col items-center justify-center gap-1 rounded-xl border border-stone-200/80 bg-stone-50 px-1 text-center"
-										data-testid="video-progress-{index}"
-										role="status"
-										aria-live="polite"
-									>
-										<LoaderCircle class="h-4 w-4 animate-spin text-stone-500" aria-hidden="true" />
-										<span class="text-[10px] leading-tight font-bold text-stone-700">
-											{job.phase === 'uploading'
-												? 'Uploading'
-												: job.phase === 'converting'
-													? 'Converting'
-													: 'Reading'}
-											{Math.round(job.progress * 100)}%
-										</span>
-										<button
-											type="button"
-											data-testid="video-cancel-{index}"
-											onclick={() => job.controller.abort()}
-											class="text-[10px] font-bold text-stone-500 underline-offset-2 hover:text-stone-900 hover:underline"
-											aria-label={`Cancel the video for post ${index + 1}`}
-										>
-											Cancel
-										</button>
-									</div>
-								{/each}
-								{#each segMedia as m (m.id)}
-									{@const hasAlt = Boolean((m.altText || '').trim())}
-									<div class="group/media relative">
-										{#if isVideoItem(m)}
-											<!-- svelte-ignore a11y_media_has_caption -->
-											<video
-												src={mediaSrc(m)}
-												poster={coverSrc(m)}
-												controls
-												preload="none"
-												width="80"
-												height="80"
-												aria-label={`Attached video ${index + 1} (no captions)`}
-												class="h-20 w-20 rounded-xl border border-stone-200/80 bg-black object-cover"
-											></video>
-											{#if !editLocked}
-												<button
-													type="button"
-													data-testid="video-cover-{m.id}"
-													onclick={() => (coverFor = m.id)}
-													class="absolute -bottom-1.5 -left-1.5 z-10 min-h-6 rounded-md bg-black/60 px-1.5 py-px text-[9px] font-bold tracking-wide text-white shadow-sm"
-													title="Choose the cover"
-													aria-label={`Choose the cover for video ${index + 1}`}
-												>
-													COVER
-												</button>
-											{/if}
-										{:else}
-											<img
-												src={m.previewUrl || `/api/media/${encodeURIComponent(m.storageKey)}`}
-												alt={m.altText || ''}
-												loading="lazy"
-												decoding="async"
-												width="80"
-												height="80"
-												class="h-20 w-20 rounded-xl border border-stone-200/80 object-cover"
-											/>
-										{/if}
+							{@const job = jobsFor(index)[0]}
+							<div class="mt-3" data-testid="segment-media-{index}">
+								<MediaPreview
+									items={segMedia}
+									maxHeight={400}
+									extra={Math.max(0, segMedia.length - 4)}
+									progress={job && !segMedia.length
+										? {
+												label: `${
+													job.phase === 'uploading'
+														? 'Uploading'
+														: job.phase === 'converting'
+															? 'Converting'
+															: 'Reading'
+												} ${Math.round(job.progress * 100)}%`,
+												fraction: job.progress,
+												onCancel: () => job.controller.abort(),
+												cancelLabel: `Cancel the video for post ${index + 1}`,
+												testId: `video-progress-${index}`,
+												cancelTestId: `video-cancel-${index}`
+											}
+										: null}
+								>
+									{#snippet toolbar(m)}
+										{@const hasAlt = Boolean((m.altText || '').trim())}
+										{@const kind = isVideoItem(m) ? 'video' : 'image'}
 										<button
 											type="button"
 											data-testid="alt-toggle-{m.id}"
 											onclick={() => toggleAlt(m.id)}
-											class="absolute -top-1.5 -right-1.5 z-10 min-h-6 min-w-6 rounded-md px-1 py-px text-[9px] font-bold tracking-wide shadow-sm {hasAlt
-												? 'bg-black/60 text-white'
-												: 'bg-amber-400 text-black'}"
+											class="min-h-7 rounded-full px-2.5 text-[11px] font-bold tracking-wide shadow-sm backdrop-blur-sm {hasAlt
+												? 'bg-black/60 text-white hover:bg-black/75'
+												: 'bg-amber-400 text-black hover:bg-amber-300'}"
 											title={hasAlt ? 'Edit alt text' : 'Add alt text (accessibility)'}
-											aria-label={`${hasAlt ? 'Edit' : 'Add'} alt text for ${isVideoItem(m) ? 'video' : 'image'} ${index + 1}`}
+											aria-label={`${hasAlt ? 'Edit' : 'Add'} alt text for ${kind} ${index + 1}`}
 										>
 											ALT
 										</button>
+										{#if !editLocked && isVideoItem(m)}
+											<button
+												type="button"
+												data-testid="video-cover-{m.id}"
+												onclick={() => (coverFor = m.id)}
+												class="min-h-7 rounded-full bg-black/60 px-2.5 text-[11px] font-bold tracking-wide text-white shadow-sm backdrop-blur-sm hover:bg-black/75"
+												title="Choose the cover"
+												aria-label={`Choose the cover for video ${index + 1}`}
+											>
+												COVER
+											</button>
+										{/if}
 										{#if !editLocked}
 											<button
 												type="button"
 												data-testid="remove-media-{m.id}"
 												onclick={() => requestRemoveMedia(m.id)}
-												class="absolute -right-1.5 -bottom-1.5 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-focus-within/media:opacity-100 group-hover/media:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100"
-												title={`Remove ${(m.mime || '').startsWith('video/') ? 'video' : 'image'} ${index + 1}`}
-												aria-label={`Remove ${(m.mime || '').startsWith('video/') ? 'video' : 'image'} ${index + 1}`}
+												class="flex h-7 w-7 items-center justify-center rounded-full bg-black/60 text-white shadow-sm backdrop-blur-sm hover:bg-black/75"
+												title={`Remove ${kind} ${index + 1}`}
+												aria-label={`Remove ${kind} ${index + 1}`}
 											>
-												<svg
-													width="8"
-													height="8"
-													viewBox="0 0 12 12"
-													fill="none"
-													aria-hidden="true"
-												>
-													<path
-														d="M2 2l8 8M10 2l-8 8"
-														stroke="currentColor"
-														stroke-width="1.6"
-														stroke-linecap="round"
-													/>
-												</svg>
+												<X class="h-3.5 w-3.5" />
 											</button>
 										{/if}
-									</div>
-								{/each}
+									{/snippet}
+								</MediaPreview>
 							</div>
 						{/if}
 
@@ -3671,13 +3423,11 @@
 							{/if}
 						{/each}
 
-						{#each segMedia.filter(isVideoItem) as m (m.id)}
-							<VideoChecklist
-								facts={factsOfMedia(m)}
-								accounts={selectedVideoAccounts}
-								testId="video-checklist-{index}"
-							/>
-						{/each}
+						<MediaFit
+							problems={cardFit(index)}
+							onUncheck={editLocked ? undefined : uncheckPlatform}
+							testId="media-fit-{index}"
+						/>
 
 						{#if quote}
 							<XQuoteCard
@@ -3924,6 +3674,14 @@
 							>{selectedAccounts.length}
 							<span class="hidden sm:inline">selected</span></span
 						>
+						{#if fitErrorPlatforms.size}
+							<span
+								class="h-2 w-2 rounded-full bg-red-500"
+								data-testid="destinations-fit-dot"
+								aria-hidden="true"
+							></span>
+							<span class="sr-only">— an account can't take this media</span>
+						{/if}
 						<ChevronUp
 							class="ml-1 h-3.5 w-3.5 text-stone-500 transition-transform {isAccountsPopoverOpen
 								? 'rotate-180'
@@ -3971,14 +3729,24 @@
 											aria-pressed={isSelected}
 											title={`${platformName(account.platform)}: ${account.displayName || account.handle || ''}`}
 										>
-											<AccountAvatar
-												platform={account.platform}
-												handle={account.handle}
-												displayName={account.displayName}
-												avatarUrl={account.avatarUrl}
-												size={24}
-												title={accountLabel(account.displayName, account.handle) || undefined}
-											/>
+											<span class="relative shrink-0">
+												<AccountAvatar
+													platform={account.platform}
+													handle={account.handle}
+													displayName={account.displayName}
+													avatarUrl={account.avatarUrl}
+													size={24}
+													title={accountLabel(account.displayName, account.handle) || undefined}
+												/>
+												{#if isSelected && fitErrorPlatforms.has(account.platform)}
+													<span
+														class="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-red-500 ring-2 ring-white"
+														data-fit="error"
+														aria-hidden="true"
+													></span>
+													<span class="sr-only">(can't take this media)</span>
+												{/if}
+											</span>
 											<span
 												class="min-w-0 flex-1 truncate text-[13px] font-bold {isSelected
 													? 'text-stone-900'
@@ -4084,9 +3852,7 @@
 							class="absolute right-0 bottom-full z-40 mb-3 w-64 origin-bottom-right rounded-[1.5rem] border border-stone-200/80 bg-white/95 p-3 text-stone-900 shadow-[0_12px_40px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl"
 							transition:fly={{ y: 10, duration: 250, opacity: 0 }}
 							role="dialog"
-							aria-label={publishProgress?.some((d) => d.status === 'failed')
-								? 'Publish results'
-								: 'Confirm post'}
+							aria-label="Confirm post"
 							use:dialogFocus={{
 								onEscape: () => dismissPostConfirm(),
 								// Publishing is not destructive — the draft is saved — so
@@ -4097,33 +3863,24 @@
 							}}
 						>
 							<div class="px-2 pt-2 pb-4 text-center">
-								{#if publishProgress?.some((d) => d.status === 'failed')}
-									<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">
-										Couldn’t publish everywhere
-									</h4>
-									<p class="text-[12px] font-medium text-stone-500">
-										Fix the problems below, then retry from Posts.
+								<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">Confirm Post</h4>
+								<p class="text-[12px] font-medium text-stone-500">
+									Publishing to {pendingAccounts.length}
+									{pendingAccounts.length === 1
+										? 'destination'
+										: 'destinations'}{publishReplacesSchedule
+										? ' now instead of at the scheduled time'
+										: ''}.
+								</p>
+								{#if unscheduledByPublish.length}
+									<p
+										data-testid="publish-unschedules"
+										class="mt-1 text-[12px] font-medium text-amber-700"
+									>
+										{unscheduledByPublish.map(destinationName).join(', ')}
+										{unscheduledByPublish.length === 1 ? 'is' : 'are'} unticked, so
+										{unscheduledByPublish.length === 1 ? 'it' : 'they'} will be unscheduled.
 									</p>
-								{:else}
-									<h4 class="mb-1 text-[14px] font-extrabold text-stone-900">Confirm Post</h4>
-									<p class="text-[12px] font-medium text-stone-500">
-										Publishing to {pendingAccounts.length}
-										{pendingAccounts.length === 1
-											? 'destination'
-											: 'destinations'}{publishReplacesSchedule
-											? ' now instead of at the scheduled time'
-											: ''}.
-									</p>
-									{#if unscheduledByPublish.length}
-										<p
-											data-testid="publish-unschedules"
-											class="mt-1 text-[12px] font-medium text-amber-700"
-										>
-											{unscheduledByPublish.map(destinationName).join(', ')}
-											{unscheduledByPublish.length === 1 ? 'is' : 'are'} unticked, so
-											{unscheduledByPublish.length === 1 ? 'it' : 'they'} will be unscheduled.
-										</p>
-									{/if}
 								{/if}
 							</div>
 
@@ -4132,7 +3889,6 @@
 								data-testid="publish-confirm-destinations"
 							>
 								{#each pendingAccounts as account (account.id)}
-									{@const state = publishProgress?.find((d) => d.connectionId === account.id)}
 									<div
 										class="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-stone-50 shadow-sm"
 										title="{platformName(account.platform)}: {account.displayName ||
@@ -4142,109 +3898,41 @@
 											platform={account.platform}
 											className={`h-3.5 w-3.5 ${platformColorClass(account.platform)}`}
 										/>
-										{#if state?.status === 'published'}
-											<span
-												class="absolute -right-1 -bottom-1 flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white"
-											>
-												<Check class="h-2.5 w-2.5" />
-											</span>
-										{:else if state?.status === 'failed'}
-											<span
-												class="absolute -right-1 -bottom-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-white"
-											>
-												<X class="h-2.5 w-2.5" />
-											</span>
-										{/if}
 									</div>
 								{/each}
 							</div>
 
-							{#if publishProgress?.some((d) => d.status === 'failed')}
-								<ul class="mb-3 space-y-1.5" data-testid="publish-progress">
-									{#each publishProgress ?? [] as dest (dest.connectionId)}
-										<li
-											class="flex items-start gap-2 rounded-xl bg-stone-50 px-2.5 py-2"
-											data-testid="publish-dest"
-											data-status={dest.status}
-										>
-											{#if dest.status === 'pending' || dest.status === 'publishing'}
-												<LoaderCircle
-													class="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-stone-500"
-												/>
-												<span class="text-[11px] font-bold text-stone-600">
-													{destinationName(dest.connectionId)} — publishing…
-												</span>
-											{:else if dest.status === 'published'}
-												<Check class="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
-												<span class="text-[11px] font-bold text-stone-700">
-													{destinationName(dest.connectionId)} — {dest.already
-														? 'already published'
-														: 'published'}
-												</span>
-											{:else if dest.status === 'retrying'}
-												<RefreshCw class="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
-												<span
-													class="min-w-0 flex-1 text-[11px] font-medium break-words text-amber-700"
-												>
-													{destinationName(dest.connectionId)}: {dest.error ||
-														'retrying automatically'}
-													— retrying automatically
-												</span>
-											{:else}
-												<X class="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-500" />
-												<span
-													class="min-w-0 flex-1 text-[11px] font-medium break-words text-red-600"
-												>
-													{destinationName(dest.connectionId)}: {dest.error || 'Publish failed'}
-												</span>
-											{/if}
-										</li>
-									{/each}
-								</ul>
-							{/if}
-
-							{#if publishProgress?.some((d) => d.status === 'failed')}
-								<button
-									type="button"
-									data-testid="publish-progress-close"
-									class="w-full cursor-pointer rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800"
-									onclick={() => dismissPostConfirm()}
-								>
-									Close
-								</button>
-							{:else}
-								<button
-									type="button"
-									bind:this={publishNowBtn}
-									data-testid="confirm-dialog-ok"
-									class="flex w-full cursor-pointer items-center justify-center gap-2 rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
-									disabled={pendingPublish?.saving || !pendingPublish?.draftId}
-									onclick={() => void confirmPublish()}
-								>
-									{pendingPublish?.saving ? 'Saving…' : 'Publish Now'}
-									<Send class="h-3.5 w-3.5" />
-								</button>
-								<button
-									type="button"
-									class="mt-1 w-full rounded-full py-1.5 text-[12px] font-bold text-stone-500 transition-colors hover:text-stone-900"
-									onclick={() => dismissPostConfirm()}
-								>
-									Keep editing
-								</button>
-								<label
-									class="mt-1 flex items-center justify-center gap-1.5 text-[11px] font-medium text-stone-500"
-								>
-									<input
-										type="checkbox"
-										checked={skipAsk}
-										onchange={(e) => {
-											skipAsk = e.currentTarget.checked;
-											setLocalFlag(SKIP_ASK_KEY, skipAsk);
-										}}
-									/>
-									Publish without asking next time
-								</label>
-							{/if}
+							<button
+								type="button"
+								bind:this={publishNowBtn}
+								data-testid="confirm-dialog-ok"
+								class="flex w-full cursor-pointer items-center justify-center gap-2 rounded-full bg-stone-900 py-2.5 text-[13px] font-bold text-white shadow-sm transition-all hover:bg-stone-800 disabled:opacity-60"
+								disabled={pendingPublish?.saving || !pendingPublish?.draftId}
+								onclick={confirmPublish}
+							>
+								{pendingPublish?.saving ? 'Saving…' : 'Publish Now'}
+								<Send class="h-3.5 w-3.5" />
+							</button>
+							<button
+								type="button"
+								class="mt-1 w-full rounded-full py-1.5 text-[12px] font-bold text-stone-500 transition-colors hover:text-stone-900"
+								onclick={() => dismissPostConfirm()}
+							>
+								Keep editing
+							</button>
+							<label
+								class="mt-1 flex items-center justify-center gap-1.5 text-[11px] font-medium text-stone-500"
+							>
+								<input
+									type="checkbox"
+									checked={skipAsk}
+									onchange={(e) => {
+										skipAsk = e.currentTarget.checked;
+										setLocalFlag(SKIP_ASK_KEY, skipAsk);
+									}}
+								/>
+								Publish without asking next time
+							</label>
 						</div>
 					{/if}
 
@@ -4387,63 +4075,6 @@
 
 	<!-- Toast -->
 	<!-- Publishing progress/results for screen readers (the popover closes while publishing). -->
-	<!-- The live region repeats the toast's wording, so it has its own test id: a
-	     `getByText` for a publish message matches both once the announcement
-	     lands (30 ms later), which is a strict-mode violation rather than a
-	     passing assertion. -->
-	<div class="sr-only" role="status" aria-live="polite" data-testid="publish-announcement">
-		{publishAnnouncement}
-	</div>
-	{#if toastMessage}
-		{@const tone = toastTone}
-		<div
-			class="pointer-events-none fixed bottom-[calc(6rem+env(safe-area-inset-bottom))] left-1/2 z-50 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2.5 rounded-full border border-stone-200/80 bg-white/95 px-4 py-2.5 shadow-[0_8px_30px_-12px_rgb(28_25_23/0.15)] backdrop-blur-xl"
-			transition:fly={{ y: 20, duration: 300, opacity: 0 }}
-			role={tone === 'error' ? 'alert' : 'status'}
-			data-testid="publish-toast"
-		>
-			<div
-				class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-white {tone ===
-				'success'
-					? 'bg-emerald-500'
-					: tone === 'warn'
-						? 'bg-amber-500'
-						: 'bg-red-500'}"
-			>
-				{#if tone === 'success'}
-					<Check class="h-3.5 w-3.5" strokeWidth={3} />
-				{:else if tone === 'warn'}
-					<TriangleAlert class="h-3.5 w-3.5" strokeWidth={2.5} />
-				{:else}
-					<X class="h-3.5 w-3.5" strokeWidth={3} />
-				{/if}
-			</div>
-			<span
-				class="max-w-64 truncate text-[13px] font-bold tracking-tight text-stone-700 sm:max-w-96"
-				title={toastMessage}>{toastMessage}</span
-			>
-			{#if toastAction}
-				<a
-					href={toastAction.href}
-					data-testid="toast-action"
-					class="pointer-events-auto shrink-0 rounded-full bg-stone-900 px-3 py-1 text-[12px] font-bold text-white transition-colors hover:bg-stone-700"
-				>
-					{toastAction.label}
-				</a>
-			{/if}
-			{#if tone === 'error'}
-				<button
-					type="button"
-					data-testid="toast-dismiss"
-					onclick={dismissToast}
-					aria-label="Dismiss error"
-					class="pointer-events-auto -mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-900"
-				>
-					<X class="h-3.5 w-3.5" />
-				</button>
-			{/if}
-		</div>
-	{/if}
 </div>
 
 {#if coverFor}

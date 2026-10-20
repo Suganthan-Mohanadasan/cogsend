@@ -1,0 +1,149 @@
+import { humanizeError } from './human-error';
+import { PROCESSING_MARK } from './video-rules';
+
+/** How one destination's publish request came back. */
+export type DestinationOutcome = {
+	connectionId: string;
+	/**
+	 * `retrying` = left for the scheduler: a retryable failure backing off, a
+	 * video the platform is still processing, or work deferred to the next tick.
+	 */
+	status: 'published' | 'publishing' | 'retrying' | 'failed';
+	error: string | null;
+	processing?: boolean;
+	/** Published before this attempt: the server skipped it, nothing was sent. */
+	already?: boolean;
+};
+
+export type PublishRow = {
+	status?: string;
+	error?: string | null;
+	deferred?: boolean;
+	skipped?: boolean;
+};
+
+/** One row of `POST /api/drafts/:id/publish`, as the composer reports it. */
+export function outcomeOfRow(
+	connectionId: string,
+	row: PublishRow | undefined
+): DestinationOutcome {
+	if (!row) return { connectionId, status: 'failed', error: 'Publish failed' };
+	if (row.status === 'published') {
+		return { connectionId, status: 'published', error: null, already: row.skipped === true };
+	}
+	if (row.status === 'publishing') return { connectionId, status: 'publishing', error: null };
+	if (row.deferred) {
+		// The request's call budget ran short: it is on its way, not failed.
+		return {
+			connectionId,
+			status: 'retrying',
+			error: 'Queued — goes out on the next scheduler tick'
+		};
+	}
+	if (row.status === 'scheduled') {
+		const processing = (row.error ?? '').includes(PROCESSING_MARK);
+		return {
+			connectionId,
+			status: 'retrying',
+			error: processing ? (row.error ?? '') : humanizeError(row.error ?? 'Retrying automatically'),
+			processing
+		};
+	}
+	return { connectionId, status: 'failed', error: humanizeError(row.error ?? 'Publish failed') };
+}
+
+export type PublishSummary = {
+	message: string;
+	tone: 'success' | 'warn' | 'error';
+	action: { label: string; href: string } | null;
+	/** The same news for screen readers. */
+	announcement: string;
+};
+
+/**
+ * Publishing now replaces the schedule, so accounts left unticked must not
+ * still post later; but only once the post is on its way everywhere it was
+ * sent, so a failed publish never also loses the rest of the schedule.
+ */
+export function mayUnscheduleOthers(outcomes: DestinationOutcome[]): boolean {
+	return !outcomes.some((o) => o.status === 'failed' || o.status === 'publishing');
+}
+
+/**
+ * The one toast a publish ends with. `note` is what unscheduling the accounts
+ * left unticked did (`· unscheduled on …`); `noteKept` is true when one of
+ * them could not be unscheduled.
+ */
+export function summarizePublish(
+	outcomes: DestinationOutcome[],
+	nameOf: (connectionId: string) => string,
+	opts: { note?: string; noteKept?: boolean } = {}
+): PublishSummary {
+	const note = opts.note ?? '';
+	const failed = outcomes.filter((o) => o.status === 'failed');
+	const published = outcomes.filter((o) => o.status === 'published');
+	const inFlight = outcomes.filter((o) => o.status === 'publishing');
+	const retrying = outcomes.filter((o) => o.status === 'retrying');
+	const names = (list: DestinationOutcome[]) => list.map((o) => nameOf(o.connectionId)).join(', ');
+	const posts = { label: 'View posts', href: '/posts' };
+
+	if (failed.length) {
+		const where = names(failed);
+		const detail =
+			failed.length === 1 && failed[0].error ? `: ${humanizeError(failed[0].error)}` : '';
+		return {
+			message:
+				(published.length ? `Published to ${published.length} · ` : '') +
+				`Failed on ${where}${detail}`,
+			tone: 'error',
+			action: { label: 'View', href: '/posts?tab=failed' },
+			announcement:
+				(published.length ? `Published to ${published.length}. ` : '') + `Failed for ${where}.`
+		};
+	}
+	if (retrying.length && retrying.every((r) => r.processing)) {
+		const verb = retrying.length === 1 ? 'is' : 'are';
+		return {
+			message:
+				`${names(retrying)} ${verb} processing the video — it publishes on its own in a minute or two` +
+				(published.length ? ` · already published to ${published.length}` : '') +
+				note,
+			tone: 'success',
+			action: posts,
+			announcement: `${names(retrying)} ${verb} processing the video.`
+		};
+	}
+	if (retrying.length) {
+		return {
+			message:
+				`Retrying automatically for ${names(retrying)}` +
+				(published.length ? ` — already published to ${published.length}` : '') +
+				note,
+			tone: 'warn',
+			action: posts,
+			announcement: `Retrying automatically for ${names(retrying)}.`
+		};
+	}
+	if (inFlight.length) {
+		return {
+			message: 'One of these destinations is already publishing',
+			tone: 'warn',
+			action: posts,
+			announcement: 'One of these destinations is already publishing.'
+		};
+	}
+	const sent = published.filter((p) => !p.already).length;
+	const already = published.length - sent;
+	const message =
+		(sent
+			? `Published to ${sent} ${sent === 1 ? 'destination' : 'destinations'}` +
+				(already ? ` · already on ${already}` : '')
+			: `Already published to ${already} ${already === 1 ? 'destination' : 'destinations'} — nothing new was sent`) +
+		note;
+	return {
+		message,
+		tone: sent && !opts.noteKept ? 'success' : 'warn',
+		action: { label: 'View', href: '/posts?tab=published' },
+		announcement: `${message}.`
+	};
+}

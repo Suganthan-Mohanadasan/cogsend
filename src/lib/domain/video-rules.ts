@@ -228,3 +228,35 @@ export function firstVideoError(
 ): string | null {
 	return videoIssues(platform, facts, meta).find((i) => i.level === 'error')?.message ?? null;
 }
+
+export interface PlatformFit {
+	platform: string;
+	level: 'error' | 'warn';
+	/** The worst problem, in the words the composer shows. */
+	message: string;
+}
+
+/**
+ * The platforms among `accounts` that would refuse or alter this video, one
+ * row each. Two accounts on one platform can differ (X Premium and a free
+ * account), so the stricter answer wins. Empty when every platform takes it.
+ */
+export function fitByPlatform(
+	accounts: Iterable<{ platform: string; meta?: VideoRuleMeta | null }>,
+	facts: VideoFacts
+): PlatformFit[] {
+	const worst = new Map<string, VideoIssue[]>();
+	const weight = (list: VideoIssue[]) =>
+		list.filter((i) => i.level === 'error').length * 100 + list.length;
+	for (const account of accounts) {
+		const issues = videoIssues(account.platform, facts, account.meta);
+		const seen = worst.get(account.platform);
+		if (!seen || weight(issues) > weight(seen)) worst.set(account.platform, issues);
+	}
+	const rows: PlatformFit[] = [];
+	for (const [platform, issues] of worst) {
+		const first = issues.find((i) => i.level === 'error') ?? issues[0];
+		if (first) rows.push({ platform, level: first.level, message: first.message });
+	}
+	return rows;
+}

@@ -19,6 +19,8 @@
 	import { composeSession } from '#lib/components/compose-session.svelte.js';
 	import { initialsOf } from '#lib/components/initials.js';
 	import { menuNav } from '#lib/components/menu-nav.js';
+	import { publishActivity } from '#lib/components/publish-tracker.svelte.js';
+	import Toast from '#lib/components/Toast.svelte';
 	import {
 		markUpdateSeen,
 		noteRelease,
@@ -174,7 +176,9 @@
 					aria-haspopup="menu"
 					aria-expanded={showWorkspaceDropdown}
 					aria-controls="workspace-menu"
-					aria-label="Workspace menu"
+					aria-label={publishActivity.unseenFailure
+						? 'Workspace menu — a post failed to publish'
+						: 'Workspace menu'}
 				>
 					<img src={logoGlyph} alt="" class="h-7 w-7 p-1" aria-hidden="true" />
 					<span class="text-[14px] font-extrabold tracking-tight text-stone-900"
@@ -186,6 +190,13 @@
 							: ''}"
 					/>
 				</button>
+				{#if publishActivity.unseenFailure}
+					<span
+						class="pointer-events-none absolute top-0 right-0 h-3 w-3 rounded-full bg-red-500 ring-2 ring-white"
+						aria-hidden="true"
+						data-testid="publish-failure-dot"
+					></span>
+				{/if}
 
 				<!-- NAVIGATION DROPDOWN -->
 				{#if showWorkspaceDropdown}
@@ -227,6 +238,10 @@
 							<Calendar
 								class="h-4 w-4 {page.url.pathname === '/posts' ? 'text-white' : 'text-stone-500'}"
 							/> Posts
+							{#if publishActivity.unseenFailure}
+								<span class="ml-auto h-2 w-2 rounded-full bg-red-500" aria-hidden="true"></span>
+								<span class="sr-only">— a post failed to publish</span>
+							{/if}
 						</a>
 						<a
 							href="/insights"
@@ -439,3 +454,4 @@
 		</main>
 	</div>
 {/if}
+<Toast />

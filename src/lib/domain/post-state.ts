@@ -1,4 +1,5 @@
 import { isFreshPublishing } from './due-jobs';
+import { PROCESSING_MARK } from './video-rules';
 
 /**
  * A publish target as the composer receives it. Loose on purpose: the page
@@ -32,6 +33,11 @@ export type WaitingTarget = {
 export type PostState = {
 	published: string[];
 	sending: string[];
+	/**
+	 * Parked while the platform processes a video. It publishes on its own, so
+	 * it is neither waiting for a time nor something to change or unschedule.
+	 */
+	processing: string[];
 	waiting: WaitingTarget[];
 	failed: Array<{ connectionId: string; error: string | null }>;
 	/** Earliest waiting time; a queued target counts as now. */
@@ -79,7 +85,14 @@ export function summarizePost(
 		if (rows) rows.push(t);
 		else byConnection.set(t.connectionId, [t]);
 	}
-	const state: PostState = { published: [], sending: [], waiting: [], failed: [], nextAt: null };
+	const state: PostState = {
+		published: [],
+		sending: [],
+		processing: [],
+		waiting: [],
+		failed: [],
+		nextAt: null
+	};
 	for (const [connectionId, rows] of byConnection) {
 		if (rows.some(isPublished)) {
 			state.published.push(connectionId);
@@ -93,6 +106,10 @@ export function summarizePost(
 		const waiting = rows.find(
 			(t) => t.status === 'scheduled' || t.status === 'pending' || t.status === 'publishing'
 		);
+		if (waiting?.status === 'scheduled' && (waiting.errorMessage ?? '').includes(PROCESSING_MARK)) {
+			state.processing.push(connectionId);
+			continue;
+		}
 		if (waiting) {
 			const queued = waiting.status !== 'scheduled';
 			const at = queued ? null : toDate(waiting.scheduledFor);

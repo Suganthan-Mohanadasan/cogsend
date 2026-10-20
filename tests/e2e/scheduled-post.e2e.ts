@@ -238,16 +238,60 @@ test('a post being sent pauses editing, then shows how it went', async ({ page }
 	await expect(page.getByTestId('post-status')).toHaveCount(0);
 });
 
-test('a partly published post shows each account’s result', async ({ page }) => {
+test('Posts follows a post being sent, without a reload', async ({ page }) => {
+	const { draftId, body } = await seedPost(page, [{ status: 'scheduled', jobId: 'e2e-claim' }]);
+	await page.goto('/posts');
+	const card = page.getByTestId('post-card').filter({ hasText: body });
+	await expect(card.getByTestId('sending-badge')).toBeVisible({ timeout: 20000 });
+	// Nothing on it can change until it has gone.
+	await expect(card.getByRole('button', { name: 'Reschedule' })).toHaveCount(0);
+	await expect(card.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+
+	d1(
+		`UPDATE publish_targets SET status='published', remote_post_id='remote-sent', job_id=NULL, scheduled_for=NULL WHERE draft_id='${draftId}'; ` +
+			`UPDATE drafts SET status='published' WHERE id='${draftId}'`
+	);
+	await expect(card).toHaveAttribute('data-status', 'published', { timeout: 30000 });
+	await expect(card.getByTestId('sending-badge')).toHaveCount(0);
+});
+
+test('a video the platform is processing is left to finish, in the composer and on Posts', async ({
+	page
+}) => {
+	const { draftId, body, accounts } = await seedPost(page, [
+		{ status: 'scheduled', error: 'Bluesky is processing the video' }
+	]);
+	await openPost(page, draftId, body);
+	await expect(page.getByTestId('post-status-processing')).toContainText(
+		`Bluesky · ${accounts[0].short} is processing the video`
+	);
+	await expect(page.getByTestId('post-status-retrying')).toHaveCount(0);
+	await expect(page.getByTestId('post-status-change-time')).toHaveCount(0);
+	await expect(page.getByTestId('unschedule-post')).toHaveCount(0);
+
+	await page.goto('/posts');
+	const card = page.getByTestId('post-card').filter({ hasText: body });
+	await expect(card.getByTestId('processing-badge')).toBeVisible({ timeout: 20000 });
+	await expect(card.getByRole('button', { name: 'Reschedule' })).toHaveCount(0);
+	await expect(card.getByRole('button', { name: 'Retry now' })).toHaveCount(0);
+	await expect(card.getByRole('button', { name: 'Discard' })).toHaveCount(0);
+});
+
+test('a partly published post says where it went and points to Posts', async ({ page }) => {
 	const { draftId, body, accounts } = await seedPost(page, [
 		{ status: 'published' },
 		{ status: 'failed', error: 'The account was suspended' }
 	]);
 	await openPost(page, draftId, body);
 
-	await expect(page.getByTestId('post-status-published')).toContainText(accounts[0].short);
-	await expect(page.getByTestId('post-status-failed')).toContainText(
-		`Failed on Bluesky · ${accounts[1].short}`
+	// Where it went, in one line; the error itself is read on Posts.
+	const summary = page.getByTestId('post-status-summary');
+	await expect(summary).toContainText(`Published on Bluesky · ${accounts[0].short}.`);
+	await expect(summary).toContainText(`Failed on Bluesky · ${accounts[1].short}.`);
+	await expect(summary).not.toContainText('suspended');
+	await expect(summary.getByRole('link', { name: 'Details in Posts' })).toHaveAttribute(
+		'href',
+		'/posts?tab=failed'
 	);
 	await expect(page.getByTestId('unschedule-post')).toHaveCount(0);
 	// Still editable, so it can be fixed and sent again.
