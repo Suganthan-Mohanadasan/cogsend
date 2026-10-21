@@ -97,13 +97,13 @@ cannot succeed. Mastodon and Bluesky keep working either way.
 
 ## Platforms
 
-| Platform | Auth                                                                     | Text                                         | Images                                 | Threads                      |
-| -------- | ------------------------------------------------------------------------ | -------------------------------------------- | -------------------------------------- | ---------------------------- |
-| Mastodon | OAuth (per instance)                                                     | instance max (default 500)                   | 4, 16MB                                | yes                          |
-| Bluesky  | handle + app password                                                    | 300                                          | 4, 2MB                                 | yes                          |
-| LinkedIn | OAuth (`openid profile email w_member_social`)                           | 3000                                         | 4, 8MB (no WebP)                       | no — flattened into one post |
-| Threads  | OAuth (`threads_basic threads_content_publish` `threads_manage_replies`) | 500, max 5 links                             | 4 uploadable, 10 allowed, 8MB JPEG/PNG | yes                          |
-| X        | OAuth 2.0 + PKCE                                                         | 280 (25,000 with a paid plan), max 1 cashtag | 4, 5MB (15MB GIF)                      | yes                          |
+| Platform | Auth                                                                     | Text                                         | Images                                 | Video                                        | Threads                      |
+| -------- | ------------------------------------------------------------------------ | -------------------------------------------- | -------------------------------------- | -------------------------------------------- | ---------------------------- |
+| Mastodon | OAuth (per instance)                                                     | instance max (default 500)                   | 4, 16MB                                | instance max (default 99MB)                  | yes                          |
+| Bluesky  | handle + app password                                                    | 300                                          | 4, 2MB                                 | up to 10 min, 300MB                          | yes                          |
+| LinkedIn | OAuth (`openid profile email w_member_social`)                           | 3000                                         | 4, 8MB (no WebP)                       | 3 s to 30 min, 500MB                         | no — flattened into one post |
+| Threads  | OAuth (`threads_basic threads_content_publish` `threads_manage_replies`) | 500, max 5 links                             | 4 uploadable, 10 allowed, 8MB JPEG/PNG | up to 5 min, 1GB                             | yes                          |
+| X        | OAuth 2.0 + PKCE                                                         | 280 (25,000 with a paid plan), max 1 cashtag | 4, 5MB (15MB GIF)                      | 0.5 s to 2:20 (longer with X Premium), 512MB | yes                          |
 
 LinkedIn rejects WebP at publish time — upload JPEG, PNG or GIF.
 
@@ -117,8 +117,4 @@ those URLs are not signed and never expire, protected only by the randomness in
 the object key, so keep the origin unlisted and treat a leaked URL as permanent.
 Remove the variable to go back to signed URLs.
 
-Video is off unless you set `ENABLE_VIDEO_UPLOAD=1` as a Worker secret or var.
-LinkedIn takes one MP4 per post, with no images mixed in. The upload path is
-wired but has not been verified end to end against LinkedIn's live API, which is
-why it ships disabled — the file picker hides video until it is on, and the API
-refuses video files.
+Every platform takes one video per post, with no images beside it; on LinkedIn, which joins a thread into one post, that means one video for the whole thread. CogSend stores videos up to 300MB, whatever a platform allows. A Mastodon server reports its own video limits, which CogSend reads when you connect the account. Threads fetches the video from the same signed URLs as images.

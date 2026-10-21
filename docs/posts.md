@@ -10,9 +10,11 @@ and **Drafts** — each with its count. **All accounts** narrows the list to one
 account, and the search box matches the post text. The tab and account stay in
 the address, so reloading or sharing the link keeps them, and coming back from
 editing a post returns you to the same tab, account and search. Every card shows
-the accounts it goes to, the text, and when: **Will publish** with the time in
-your own timezone and how far away it is, or **Published**, or when a draft was
-last edited.
+the accounts it goes to, the text, its images or video, and when: **Will publish** with the time in
+your own timezone and how far away it is, **Due** once that time has passed, **Started** while it is being sent, or **Published**, or when a draft was
+last edited. A video shows its cover and loads only when you press play.
+
+A post being sent right now is marked **Sending** and offers nothing to press until it is done; the list refreshes on its own every few seconds while anything is sending, and every half minute while a platform is processing a video. A send that stops answering — Cloudflare cut it off — is given up on after 7 minutes: the card leaves **Sending** with **Reschedule** and **Cancel** again, and the next tick retries it.
 
 What a card offers depends on its state:
 
@@ -33,7 +35,7 @@ A post that published to every account can't be edited, since changing it would 
 
 A scheduled post that fails with something retryable — a rate limit, a platform
 timeout — is not failed yet: it backs off and tries again on its own, up to five
-attempts, and only then lands in **Failed**. **Retry** and **Reschedule** start the five attempts afresh; publishing or scheduling the same post to the same account again does not. The dashboard shows a banner when
+attempts, and only then lands in **Failed**. A post whose video a platform is still processing is marked **Processing** instead: it publishes on its own once the platform is done, without spending any of the five attempts ([Video](composer.md#video)). **Retry** and **Reschedule** start the five attempts afresh; publishing or scheduling the same post to the same account again does not. The dashboard shows a banner when
 something has failed, and [failure emails](scheduling.md#failure-alerts-optional)
 can tell you the next morning.
 

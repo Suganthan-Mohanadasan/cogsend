@@ -71,6 +71,20 @@ curl -s -X POST "$APP_URL/api/drafts/DRAFT_ID/publish" \
   -d '{"connectionIds":["CONN_ID"]}'
 ```
 
+## Media
+
+`POST /api/drafts/:id/media` takes a `multipart/form-data` body with one or more `files`, the card's `segmentIndex` (0 for the first) and an optional `altText`. Images go up to 16 MB, an MP4 to 95 MB.
+
+A larger video goes up in parts, up to 300 MB:
+
+1. `POST /api/drafts/:id/media/uploads` with `{"size": <bytes>, "mime": "video/mp4", "segmentIndex": 0}`. Every check that can refuse the video runs here, before any bytes move. The answer carries `key`, `uploadId`, `size`, `segmentIndex` and `token`, which the next calls send back unchanged, plus `partSize` and `parts`.
+2. `PUT /api/drafts/:id/media/uploads/part` for each part `n` from 1 to `parts`, with those five values and `n` in the query string and the bytes as the body. Every part is exactly `partSize` bytes except the last. Each answers `{ "partNumber": n, "etag": "…" }`.
+3. `POST /api/drafts/:id/media/uploads/complete` with the five values, `parts` (every answer from step 2, in order) and an optional `altText`. It answers `201` with the stored `media`.
+
+`DELETE /api/drafts/:id/media/uploads` with the five values abandons an upload. The server converts nothing: it takes an MP4 it can read and refuses anything else, and a video must be the only media on its card.
+
+A video's `meta` holds what the server read from it (`durationMs`, `videoCodec`, `audioCodec`, `fps`, and `faststart`, whether its index comes first) and its `cover` once one is set. `PUT /api/drafts/:id/media/cover?mediaId=…` with a JPEG body of at most 8 MB sets the cover, and `DELETE` with the same query removes it.
+
 ## Limits
 
 - A body is capped at 100,000 characters, and a variant may carry at most 100 explicit `threadSegments`.
@@ -83,7 +97,7 @@ curl -s -X POST "$APP_URL/api/drafts/DRAFT_ID/publish" \
 - A retried segment carries the same platform-side id as its first attempt, so a thread that failed half-way does not double-post what already went out (Mastodon remembers the id for an hour, Bluesky refuses to overwrite the record).
 - X, LinkedIn and Threads take no such id. When one of them gets the request that creates a post but no answer comes back, the target fails with an error saying the post "may have been published" and is never retried automatically: check the platform first, and only then retry.
 - Sending several connection ids in one request publishes them in order. The first always runs; each further one runs only if it fits in what is left of the request's Cloudflare call budget (50 on Workers Free, see `SUBREQUEST_LIMIT` in [Configuration](configuration.md#secrets)). The ones that don't fit come back with `status: "pending"` and `deferred: true`. They are already due and go out on the next scheduler tick, so don't send them again. For the fastest results, send one connection id per request. If a request still runs out, it answers `200` with `stopped: true`, `stoppedError`, and the results it did get — the accounts after the last entry were not completed and are still due (a target the failure interrupted is left retryable, never `publishing`), so send those ids again. A `500` means nothing was recorded; check the draft before retrying.
-- Do not call `/api/targets/:id/retry` unless the row is `failed` (or a stuck `publishing` older than 15 minutes).
+- Do not call `/api/targets/:id/retry` unless the row is `failed` (or a stuck `publishing` older than 7 minutes).
 - Schedule returns **409** if that account is already published or still publishing. Check `error`, `alreadyPublished`, and `inFlight` instead of treating HTTP 200 as "it was scheduled".
 - Schedule adds the accounts it is sent and leaves the draft's other accounts as they are. Send `"cancelOthers": true` to make the list the whole set: the draft's other accounts that are still waiting (`scheduled` or `pending`, not yet being sent) are cancelled, and the response lists their connection ids in `cancelled`.
 - Once every account of a draft is published (cancelled ones aside), changing its text, variants or media answers **409** with `Already published — duplicate it to post again`. `POST /api/drafts/:id/duplicate` copies it into a new draft. A draft that failed on some accounts stays editable.
