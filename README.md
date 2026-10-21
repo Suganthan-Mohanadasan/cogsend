@@ -42,6 +42,7 @@ Hosted schedulers usually charge per channel and keep your posts and tokens on t
 ## Features
 
 - **Thread editor**: one card per post, images with alt text, and a tab per platform for tailored versions
+- **Video**: one per post on every platform, converted in your browser when a platform needs it, with a cover you pick
 - **Auto-split**: paste a long draft and it becomes a thread that fits every platform you picked
 - **Publish or schedule**: see results per account, then cancel, reschedule or retry from Posts
 - **Automatic retries**: temporary failures retry on their own, up to five attempts
@@ -110,7 +111,7 @@ Also published, with search, at [cogsend.com/docs](https://cogsend.com/docs/).
 
 **Use it**
 
-- [Writing and publishing](docs/composer.md): threads, per-platform overrides, images and alt text, scheduling
+- [Writing and publishing](docs/composer.md): threads, per-platform overrides, images, video and alt text, scheduling
 - [Posts and Insights](docs/posts.md): the queue, what each post can do, and the delivery stats
 - [API](docs/api.md): personal API keys, the MCP server, and worked examples (the full reference is in-app at `/api`)
 
