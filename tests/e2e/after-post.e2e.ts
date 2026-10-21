@@ -146,6 +146,16 @@ test('a post opened from Posts goes back there once scheduled', async ({ page })
 	const { draftId, connId } = await seedPost(page, 'scheduled');
 	const sent = await answerSchedule(page);
 	await page.goto('/posts?tab=scheduled');
+	// Posts is server-rendered, so the link can be clicked before hydration: a
+	// full page load then, which has no Posts to go back to. Opening the menu
+	// proves the app is live.
+	await clickUntilVisible(
+		page,
+		page.getByRole('button', { name: 'Workspace menu' }),
+		page.getByRole('menu').first()
+	);
+	await page.keyboard.press('Escape');
+	await expect(page.getByRole('menu')).toHaveCount(0);
 	await page.locator(`a[href="/compose?id=${draftId}"]`, { hasText: 'Edit Post' }).click();
 	await expect(page).toHaveURL(new RegExp(`/compose\\?id=${draftId}$`), { timeout: 20000 });
 	await expect(page.getByTestId('segment-input-0')).toHaveValue(/scheduled/, { timeout: 20000 });
