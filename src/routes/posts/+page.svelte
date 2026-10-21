@@ -124,6 +124,7 @@
 		/** Epoch ms used for newest-first ordering. */
 		sortKey: number;
 		whenLabel: 'scheduled' | 'published' | 'updated';
+		overdue?: boolean;
 		platforms: {
 			name: string;
 			connectionId?: string;
@@ -509,6 +510,7 @@
 				whenLabel: ['scheduled', 'pending', 'publishing'].includes(primary.status)
 					? ('scheduled' as const)
 					: ('published' as const),
+				overdue: when != null && toTime(when) <= Date.now(),
 				platforms,
 				// Fallbacks in case we need a general error
 				remoteUrl: safeHttpUrl(primary.remoteUrl),
@@ -1407,7 +1409,13 @@
 					class="mt-auto flex flex-col gap-3 border-t border-stone-100 pt-4 sm:flex-row sm:items-center sm:justify-between"
 				>
 					<p class="text-[12px] font-bold text-stone-500">
-						{#if card.whenLabel === 'scheduled' && card.when}
+						{#if card.status === 'sending' && card.when}
+							Started
+							<span class="text-stone-900" title={card.whenTitle}>{card.whenText}</span>
+						{:else if card.whenLabel === 'scheduled' && card.when && card.overdue}
+							Due
+							<span class="text-stone-900" title={card.whenTitle}>{card.whenText}</span>
+						{:else if card.whenLabel === 'scheduled' && card.when}
 							Will publish
 							<span class="text-stone-900" title={card.whenTitle}>{card.whenText}</span>
 						{:else if card.whenLabel === 'published' && card.when}
