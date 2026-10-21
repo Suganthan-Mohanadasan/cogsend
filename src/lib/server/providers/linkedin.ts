@@ -21,6 +21,7 @@ import {
 	unconfirmedPostError
 } from './types';
 import {
+	PART_UPLOAD_MS,
 	pollVideo,
 	readVideoSlice,
 	requireMediaReader,
@@ -364,6 +365,7 @@ async function readyVideo(
 	const storageKey = video.storageKey;
 	const reader = requireMediaReader(opts?.mediaReader);
 	const callsLeft = opts?.callsLeft ?? (() => Infinity);
+	const timeLeft = opts?.timeLeft ?? (() => Infinity);
 	let state = videoUploadState(resumedVideoState(opts?.resume, 0, storageKey));
 	const park = (current: VideoUploadState, retryAfterMs: number): never => {
 		throw processingError(
@@ -378,7 +380,7 @@ async function readyVideo(
 	}
 	while (state.etags.length < state.instructions.length) {
 		// A part is a storage read and an upload.
-		if (callsLeft() < VIDEO_RESERVE_CALLS + 2) park(state, 15_000);
+		if (callsLeft() < VIDEO_RESERVE_CALLS + 2 || timeLeft() < PART_UPLOAD_MS) park(state, 15_000);
 		const inst = state.instructions[state.etags.length];
 		const slice = await readVideoSlice(reader, storageKey, inst.firstByte, inst.lastByte);
 		const etag = await uploadVideoPart(slice, inst.url, video.mime, fetchImpl);
@@ -414,7 +416,8 @@ async function readyVideo(
 			polls: VIDEO_STATUS_POLLS,
 			delayMs: VIDEO_STATUS_POLL_MS,
 			reserve: VIDEO_RESERVE_CALLS,
-			callsLeft
+			callsLeft,
+			timeLeft
 		},
 		async () => {
 			const status = await videoStatus(token, videoUrn, fetchImpl);
@@ -618,7 +621,7 @@ export const linkedinProvider: PlatformProvider = {
 			isReshareDisabledByAuthor: false
 		};
 		if (videoUrn) {
-			body.content = { video: { id: videoUrn, title: text || undefined } };
+			body.content = { media: { id: videoUrn } };
 		} else if (imageUrns.length === 1) {
 			body.content = { media: { id: imageUrns[0], altText: linkedinAltText(images[0]) } };
 		} else if (imageUrns.length > 1) {

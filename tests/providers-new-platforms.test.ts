@@ -216,7 +216,7 @@ describe('linkedinProvider.publish', () => {
 			'/rest/videos/urn%3Ali%3Avideo%3AVID1': () => Response.json({ status: 'AVAILABLE' }),
 			'/rest/posts': async (req) => {
 				const body = await req.json();
-				expect(body.content.video.id).toBe('urn:li:video:VID1');
+				expect(body.content).toEqual({ media: { id: 'urn:li:video:VID1' } });
 				return new Response(JSON.stringify({ id: 'urn:li:share:vid' }), {
 					status: 201,
 					headers: { 'x-restli-id': 'urn:li:share:vid', 'Content-Type': 'application/json' }
