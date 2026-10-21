@@ -3,6 +3,7 @@ import { storedXLimit, xLimitFor } from '#lib/domain/x-limits.js';
 import { mediaByteLength, processingError, resumedVideoState } from './types';
 import {
 	isVideoAttachment,
+	PART_UPLOAD_MS,
 	readVideoSlice,
 	requireMediaReader,
 	segmentVideo,
@@ -572,6 +573,7 @@ async function uploadVideo(
 	const storageKey = m.storageKey;
 	const reader = requireMediaReader(opts?.mediaReader);
 	const callsLeft = opts?.callsLeft ?? (() => Infinity);
+	const timeLeft = opts?.timeLeft ?? (() => Infinity);
 	let state = xVideoState(resumedVideoState(opts?.resume, segmentIndex, storageKey));
 	const park = (current: XVideoState, retryAfterMs: number): never => {
 		throw processingError(
@@ -600,7 +602,7 @@ async function uploadVideo(
 	const totalChunks = Math.max(1, Math.ceil(state.size / X_UPLOAD_CHUNK_BYTES));
 	while (state.next < totalChunks) {
 		// A segment is a storage read and an APPEND.
-		if (callsLeft() < X_VIDEO_RESERVE_CALLS + 2) park(state, 15_000);
+		if (callsLeft() < X_VIDEO_RESERVE_CALLS + 2 || timeLeft() < PART_UPLOAD_MS) park(state, 15_000);
 		const start = state.next * X_UPLOAD_CHUNK_BYTES;
 		const end = Math.min(state.size, start + X_UPLOAD_CHUNK_BYTES) - 1;
 		const slice = await readVideoSlice(reader, storageKey, start, end);
@@ -638,6 +640,7 @@ async function uploadVideo(
 		}
 		if (callsLeft() < X_VIDEO_RESERVE_CALLS) break;
 		const wait = Math.min((proc.checkAfterSecs ?? 1) * 1000, X_MEDIA_POLL_MAX_WAIT_MS);
+		if (timeLeft() <= wait) break;
 		if (wait > 0) await sleep(wait);
 		const stRes = await fetchImpl(
 			`${X_API}/2/media/upload?command=STATUS&media_id=${encodeURIComponent(state.mediaId)}`,

@@ -797,7 +797,8 @@ export const threadsProvider: PlatformProvider = {
 					polls: CONTAINER_STATUS_ATTEMPTS,
 					delayMs: CONTAINER_STATUS_POLL_MS,
 					reserve: 6,
-					callsLeft: opts?.callsLeft
+					callsLeft: opts?.callsLeft,
+					timeLeft: opts?.timeLeft
 				},
 				async () => {
 					const state = await readContainerStatus(id);

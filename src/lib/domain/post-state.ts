@@ -1,4 +1,4 @@
-import { isFreshPublishing } from './due-jobs';
+import { STALE_CLAIM_MS, isFreshPublishing } from './due-jobs';
 import { PROCESSING_MARK } from './video-rules';
 
 /**
@@ -61,8 +61,10 @@ function isPublished(t: TargetSnapshot): boolean {
  * fresh `publishing` row. While any target matches, the server refuses edits.
  */
 export function isTargetSending(t: TargetSnapshot, now: Date = new Date()): boolean {
-	if (t.jobId) return true;
 	const updated = toDate(t.updatedAt);
+	// A queue tag whose consumer never ran is re-tagged after STALE_CLAIM_MS;
+	// until then it is sending, after that it is waiting like any other row.
+	if (t.jobId) return !updated || now.getTime() - updated.getTime() < STALE_CLAIM_MS;
 	return isFreshPublishing(
 		{ status: t.status ?? '', updatedAt: updated, remotePostId: t.remotePostId ?? null },
 		now

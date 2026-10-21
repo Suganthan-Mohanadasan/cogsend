@@ -9,7 +9,12 @@ import {
 import { chunkIds, first } from '#lib/server/db/client.js';
 import { connections, drafts, publishTargets } from '#lib/server/db/schema.js';
 import { fail, handleError, ok } from '#lib/server/http.js';
-import { PUBLISH_RESERVE_CALLS, publishTarget, refreshDraftStatus } from '#lib/server/publish.js';
+import {
+	INLINE_PUBLISH_MS,
+	PUBLISH_RESERVE_CALLS,
+	publishTarget,
+	refreshDraftStatus
+} from '#lib/server/publish.js';
 import { refuseInFlightOrPublished } from '#lib/server/publish-plan.js';
 import { requireScope, requireUser } from '#lib/server/require.js';
 
@@ -254,7 +259,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				const task = publishTarget(locals.db, locals.env, locals.media, id, {
 					now,
 					budget: locals.budget,
-					mustTry: retriesStarted === 0
+					mustTry: retriesStarted === 0,
+					deadline: now.getTime() + INLINE_PUBLISH_MS
 				});
 				locals.waitUntil(task.then(() => undefined).catch(() => undefined));
 				const outcome = await task;

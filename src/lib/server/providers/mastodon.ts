@@ -286,7 +286,8 @@ async function readyVideo(
 			polls: VIDEO_STATUS_POLLS,
 			delayMs: VIDEO_STATUS_POLL_MS,
 			reserve: 6,
-			callsLeft: opts?.callsLeft
+			callsLeft: opts?.callsLeft,
+			timeLeft: opts?.timeLeft
 		},
 		async () => {
 			const res = await fetchImpl(`${instanceUrl}/api/v1/media/${encodeURIComponent(id)}`, {

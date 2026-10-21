@@ -1,12 +1,16 @@
-/** Dead-isolate TTL. Not a request timeout. Slow live publishes must finish under this. */
-export const STALE_CLAIM_MS = 15 * 60_000;
 /**
- * How often a live publish refreshes its claim. Comfortably inside
- * STALE_CLAIM_MS, so an overlapping tick can never reclaim a publish that is
- * still running, while a genuinely slow one costs at most one extra write
- * every five minutes.
+ * Dead-isolate TTL, not a request timeout: a claim nobody has renewed for this
+ * long belongs to a run Cloudflare cut off, and until it passes the post shows
+ * as Sending with nothing to press. Live runs renew well inside it.
  */
-export const LEASE_REFRESH_MS = 5 * 60_000;
+export const STALE_CLAIM_MS = 7 * 60_000;
+/**
+ * How often a live publish refreshes its claim. The heartbeat checks every
+ * half of this, so renewals land at most 1.5× apart, comfortably inside
+ * STALE_CLAIM_MS: an overlapping tick can never reclaim a publish that is
+ * still running, and a slow one costs one extra write every few minutes.
+ */
+export const LEASE_REFRESH_MS = 2 * 60_000;
 
 export type SchedulableTarget = {
 	id: string;

@@ -48,7 +48,7 @@ import {
 	draftEditBlock,
 	draftHasInFlightPublish
 } from '#lib/server/publish-plan.js';
-import { refreshDraftStatus, publishTarget } from '#lib/server/publish.js';
+import { INLINE_PUBLISH_MS, refreshDraftStatus, publishTarget } from '#lib/server/publish.js';
 import { humanizedCause } from '#lib/domain/human-error.js';
 import type { SubrequestBudget } from '#lib/server/budget.js';
 import { randomHex } from '#lib/domain/bytes.js';
@@ -315,7 +315,8 @@ export async function retryDelivery(ctx: OperationContext, userId: string, id: s
 	const task = publishTarget(ctx.db, ctx.env, ctx.media, id, {
 		now,
 		budget: ctx.budget,
-		mustTry: true
+		mustTry: true,
+		deadline: now.getTime() + INLINE_PUBLISH_MS
 	});
 	ctx.waitUntil?.(task.then(() => undefined).catch(() => undefined));
 	return task;
@@ -797,6 +798,7 @@ export async function publishDraft(
 	draftId: string,
 	requestBody: unknown
 ) {
+	const deadline = Date.now() + INLINE_PUBLISH_MS;
 	const draft = await first(
 		ctx.db
 			.select()
@@ -873,7 +875,8 @@ export async function publishDraft(
 		try {
 			const task = publishTarget(ctx.db, ctx.env, ctx.media, item.target.id, {
 				budget: ctx.budget,
-				mustTry: attempted === 0
+				mustTry: attempted === 0,
+				deadline
 			});
 			// Keeps the publish running if the client disconnects mid-request.
 			ctx.waitUntil?.(task.then(() => undefined).catch(() => undefined));

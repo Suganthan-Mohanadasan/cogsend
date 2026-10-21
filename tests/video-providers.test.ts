@@ -5,6 +5,7 @@ import { linkedinProvider } from '#lib/server/providers/linkedin.js';
 import { mastodonInstanceLimits, mastodonProvider } from '#lib/server/providers/mastodon.js';
 import { threadsProvider } from '#lib/server/providers/threads.js';
 import { xProvider } from '#lib/server/providers/x.js';
+import { pollVideo } from '#lib/server/providers/video.js';
 import {
 	ProviderError,
 	PROCESSING_MARK,
@@ -129,6 +130,24 @@ describe('Threads video', () => {
 		);
 		expect(result.remotePostId).toBe('post-1');
 		expect(n.created).toHaveLength(1);
+	});
+
+	it('parks instead of waiting when the run is out of time', async () => {
+		const { video } = await storedVideo(1000);
+		const n = threadsNetwork(['IN_PROGRESS', 'IN_PROGRESS', 'IN_PROGRESS']);
+		const started = Date.now();
+		const err = await parked(
+			threadsProvider.publish(
+				{ text: 'watch', media: [video] },
+				creds,
+				undefined,
+				n.fetchImpl,
+				opts({ timeLeft: () => 1000 })
+			)
+		);
+		expect(err.pending?.state).toEqual({ containerId: 'c-1' });
+		expect(n.net.calls.filter((url) => url.includes('fields=status'))).toHaveLength(1);
+		expect(Date.now() - started).toBeLessThan(1000);
 	});
 
 	it('makes a fresh container when the parked one expired', async () => {
@@ -637,5 +656,31 @@ describe('X video', () => {
 		expect((err as ProviderError).message).toBe(
 			'X refused the video as too long for this account. Videos over 2:20 need X Premium.'
 		);
+	});
+});
+
+describe('pollVideo', () => {
+	it('asks once more only while there is time for another wait', async () => {
+		let asked = 0;
+		let left = 250;
+		const result = await pollVideo(
+			{ polls: 10, delayMs: 100, reserve: 0, timeLeft: () => left },
+			async () => {
+				asked += 1;
+				left -= 100;
+				return null;
+			}
+		);
+		expect(result).toBeNull();
+		expect(asked).toBe(2);
+	});
+
+	it('keeps asking until it answers when time is not limited', async () => {
+		let asked = 0;
+		const result = await pollVideo({ polls: 5, delayMs: 0, reserve: 0 }, async () =>
+			++asked === 3 ? 'ready' : null
+		);
+		expect(result).toBe('ready');
+		expect(asked).toBe(3);
 	});
 });

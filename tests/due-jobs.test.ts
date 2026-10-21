@@ -57,7 +57,7 @@ describe('selectDueScheduledTargets', () => {
 					id: 'fresh',
 					status: 'publishing',
 					scheduledFor: new Date('2026-08-17T11:00:00Z'),
-					updatedAt: new Date('2026-08-17T11:50:00Z')
+					updatedAt: new Date('2026-08-17T11:57:00Z')
 				}
 			],
 			now
@@ -78,7 +78,7 @@ describe('selectDueScheduledTargets', () => {
 					id: 'fresh-now',
 					status: 'publishing',
 					scheduledFor: null,
-					updatedAt: new Date('2026-08-17T11:50:00Z')
+					updatedAt: new Date('2026-08-17T11:57:00Z')
 				}
 			],
 			now
@@ -135,7 +135,7 @@ describe('isFreshPublishing', () => {
 
 	it('is true only for a recent publishing row without a remote id', () => {
 		expect(
-			isFreshPublishing({ status: 'publishing', updatedAt: new Date('2026-08-17T11:50:00Z') }, now)
+			isFreshPublishing({ status: 'publishing', updatedAt: new Date('2026-08-17T11:57:00Z') }, now)
 		).toBe(true);
 		expect(
 			isFreshPublishing(

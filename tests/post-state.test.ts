@@ -173,6 +173,16 @@ describe('isTargetSending', () => {
 			)
 		).toBe(true);
 	});
+	it('stops counting a queue tag as sending once its claim is stale', () => {
+		const fresh = new Date(NOW.getTime() - 1000);
+		const stale = new Date(NOW.getTime() - STALE_CLAIM_MS - 1000);
+		expect(isTargetSending({ status: 'scheduled', jobId: 'job', updatedAt: fresh }, NOW)).toBe(
+			true
+		);
+		expect(isTargetSending({ status: 'scheduled', jobId: 'job', updatedAt: stale }, NOW)).toBe(
+			false
+		);
+	});
 });
 
 describe('selectionDrift', () => {

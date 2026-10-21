@@ -341,6 +341,15 @@ export function publishCallEstimate(platform: string, content: NormalizedPost): 
 /** Platform calls and slice reads a video needs before it can park. */
 const VIDEO_START_CALLS = 12;
 
+/**
+ * How long a publish started by a browser request may spend on video uploads
+ * and waits before it parks for the scheduler to finish. Closing or reloading
+ * the tab ends the request, and Cloudflare cuts its work off 30s later; a run
+ * cut off between writes leaves the post showing as Sending until its claim
+ * goes stale. Parking well inside that hands the rest to the next tick.
+ */
+export const INLINE_PUBLISH_MS = 20_000;
+
 /** Calls the caller still needs after a publish returns (reads for the
  *  response, the draft status, the failure digest on a tick). */
 export const PUBLISH_RESERVE_CALLS = 6;
@@ -358,6 +367,8 @@ export async function publishTarget(
 		/** The first target of a request always runs, whatever the budget says:
 		 *  deferring it would only defer it again on every tick. */
 		mustTry?: boolean;
+		/** Epoch ms after which a video stops waiting and parks; see INLINE_PUBLISH_MS. */
+		deadline?: number;
 	} = {}
 ): Promise<{
 	status: string;
@@ -654,6 +665,8 @@ export async function publishTarget(
 					mediaUrlFor: (storageKey: string) => publicMediaUrlFor(env, storageKey),
 					mediaReader: mediaReaderFor(store),
 					callsLeft: () => options.budget?.remaining ?? Infinity,
+					timeLeft: () =>
+						options.deadline === undefined ? Infinity : options.deadline - Date.now(),
 					checkpoint,
 					// Deliberately not attempt-scoped: the whole point is that a
 					// retry of the same target and segment carries the same key, so

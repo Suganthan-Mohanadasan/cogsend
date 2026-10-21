@@ -108,21 +108,34 @@ export function wrapStream(
 }
 
 /**
+ * Below this much time a run parks instead of sending another part: a part
+ * cut off half-way is sent again, but a run cut off between writes leaves the
+ * post stuck as Sending until its claim goes stale.
+ */
+export const PART_UPLOAD_MS = 10_000;
+
+/**
  * Ask `check` until it answers, at most `polls` times and only while the
- * request has `reserve` calls left, sleeping between asks but never before
+ * request has `reserve` calls and the time for another wait left, sleeping between asks but never before
  * giving up. Null means "not ready": the caller parks the video.
  */
 export async function pollVideo<T>(
-	opts: { polls: number; delayMs: number; reserve: number; callsLeft?: () => number },
+	opts: {
+		polls: number;
+		delayMs: number;
+		reserve: number;
+		callsLeft?: () => number;
+		timeLeft?: () => number;
+	},
 	check: () => Promise<T | null>
 ): Promise<T | null> {
 	const callsLeft = opts.callsLeft ?? (() => Infinity);
+	const timeLeft = opts.timeLeft ?? (() => Infinity);
 	for (let poll = 0; poll < opts.polls && callsLeft() >= opts.reserve; poll++) {
 		const done = await check();
 		if (done !== null) return done;
-		if (poll + 1 < opts.polls && callsLeft() >= opts.reserve) {
-			await new Promise((resolve) => setTimeout(resolve, opts.delayMs));
-		}
+		if (poll + 1 >= opts.polls || callsLeft() < opts.reserve || timeLeft() <= opts.delayMs) break;
+		await new Promise((resolve) => setTimeout(resolve, opts.delayMs));
 	}
 	return null;
 }

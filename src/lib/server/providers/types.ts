@@ -370,6 +370,10 @@ export interface PlatformProvider {
 			/** Calls left in this request, so a long upload parks before it runs
 			 *  out instead of failing half-way. Infinity without a budget. */
 			callsLeft?: () => number;
+			/** Milliseconds this run may still spend on uploads and waits before
+			 *  it must park. A run started by a browser request is cut off 30s
+			 *  after the tab goes away; Infinity in the scheduler. */
+			timeLeft?: () => number;
 			/** A stable key for (target, segment), so a retry after a lost
 			 *  response is recognised by the platform instead of posting twice.
 			 *  Providers that support it use it; the rest ignore it. */

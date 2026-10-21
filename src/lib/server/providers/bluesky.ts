@@ -466,7 +466,13 @@ async function uploadVideo(
 	}
 	const job = jobId;
 	const blob = await pollVideo(
-		{ polls: VIDEO_JOB_POLLS, delayMs: VIDEO_JOB_POLL_MS, reserve: 6, callsLeft },
+		{
+			polls: VIDEO_JOB_POLLS,
+			delayMs: VIDEO_JOB_POLL_MS,
+			reserve: 6,
+			callsLeft,
+			timeLeft: opts?.timeLeft
+		},
 		async () => {
 			const res = await fetchImpl(
 				`${VIDEO_SERVICE}/xrpc/app.bsky.video.getJobStatus?jobId=${encodeURIComponent(job)}`
