@@ -3,6 +3,10 @@
 	"name": "cogsend",
 	"compatibility_date": "2026-08-17",
 	"compatibility_flags": ["nodejs_als"],
+	// Wrangler uploads source maps unless told not to, and the signed update
+	// bundle carries none: a deploy from here and an in-app update must upload
+	// the same Worker (scripts/check-release-parity.mjs).
+	"upload_source_maps": false,
 	"main": ".svelte-kit/cloudflare/_worker.js",
 	"assets": {
 		"binding": "ASSETS",
