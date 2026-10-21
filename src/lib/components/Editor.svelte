@@ -52,7 +52,7 @@
 	import MediaFit from './video/MediaFit.svelte';
 	import MediaPreview from './MediaPreview.svelte';
 	import VideoCover from './video/VideoCover.svelte';
-	import { shrinkToFit } from '#lib/components/shrink-image.js';
+	import { makePreview, shrinkToFit } from '#lib/components/shrink-image.js';
 	import { persistMediaLayout, type MediaMove } from '#lib/domain/media-sync.js';
 	import {
 		customizePlatformBody,
@@ -1925,7 +1925,11 @@
 			if (!id) throw new Error('Could not create draft for upload');
 			const form = new FormData();
 			form.set('segmentIndex', String(segmentIndex));
-			for (const f of images) form.append('files', f);
+			for (const [n, f] of images.entries()) {
+				form.append('files', f);
+				const preview = await makePreview(f);
+				if (preview) form.append(`preview-${n}`, preview, 'preview.jpg');
+			}
 			const res = await fetch(`/api/drafts/${id}/media`, { method: 'POST', body: form });
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.error || 'Upload failed');

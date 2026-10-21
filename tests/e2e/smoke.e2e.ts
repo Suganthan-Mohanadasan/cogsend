@@ -565,9 +565,11 @@ test('publishing to two destinations reports each one', async () => {
 	await expect(dialog.locator('[title="Bluesky: second.bsky.social"]')).toBeVisible();
 	await page.getByTestId('confirm-dialog-ok').click();
 	await expect(dialog).toBeHidden();
-	// Each destination is sent on its own; the one toast names every failure.
+	// Each destination is sent on its own and reported as it lands; once the
+	// last one is in, the one toast names every failure.
 	const toast = page.getByTestId('publish-toast');
 	await expect(toast).toContainText('Failed on', { timeout: 30000 });
+	await expect(toast).not.toContainText('still sending', { timeout: 30000 });
 	await expect(toast).toContainText('Bluesky · test');
 	await expect(toast).toContainText('Bluesky · second');
 	await page.getByTestId('toast-dismiss').click();
@@ -638,6 +640,7 @@ test('publish without asking hands off at once and still reports failures', asyn
 	// The failure still comes back, as a toast that stays until dismissed.
 	const toast = page.getByTestId('publish-toast');
 	await expect(toast).toContainText('Failed on', { timeout: 30000 });
+	await expect(toast).not.toContainText('still sending', { timeout: 30000 });
 	await expect(toast).toHaveAttribute('role', 'alert');
 	await page.getByTestId('toast-dismiss').click();
 	await page.evaluate(() => localStorage.removeItem('cogsend-skip-publish-confirm'));

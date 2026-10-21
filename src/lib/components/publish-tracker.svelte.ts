@@ -3,6 +3,7 @@ import { summarizePost, type TargetSnapshot } from '#lib/domain/post-state.js';
 import {
 	mayUnscheduleOthers,
 	outcomeOfRow,
+	summarizeProgress,
 	summarizePublish,
 	type DestinationOutcome,
 	type PublishRow
@@ -107,7 +108,24 @@ export function handOff(opts: {
 	);
 	return (async () => {
 		try {
-			const outcomes = await Promise.all(connectionIds.map((id) => publishOne(draftId, id)));
+			const settled: DestinationOutcome[] = [];
+			const outcomes = await Promise.all(
+				connectionIds.map((id) =>
+					publishOne(draftId, id).then((outcome) => {
+						settled.push(outcome);
+						if (outcome.status === 'failed') publishActivity.unseenFailure = true;
+						// Posts shows each account's result as it lands, not after the slowest.
+						publishActivity.version++;
+						const waiting = connectionIds.filter((c) => !settled.some((o) => o.connectionId === c));
+						const progress = summarizeProgress(settled, waiting, nameOf);
+						if (progress) {
+							showToast(progress.message, progress.tone, progress.action);
+							announce(progress.announcement);
+						}
+						return outcome;
+					})
+				)
+			);
 			let note = '';
 			let noteKept = false;
 			if (opts.unscheduleOthers && mayUnscheduleOthers(outcomes)) {

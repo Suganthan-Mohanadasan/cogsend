@@ -124,3 +124,41 @@ export async function shrinkToFit(
 		return file;
 	}
 }
+
+/** Long edge of the copy shown in the composer and on Posts: a full card on a 2x screen. */
+export const PREVIEW_EDGE = 1280;
+// Below this an image is already light enough to show as it is.
+const PREVIEW_MIN_BYTES = 300_000;
+
+/**
+ * A smaller JPEG of an image, for showing it; the original is what gets
+ * published. Null when the image is already small, is animated (a still copy
+ * would freeze it), or the browser cannot make a smaller one.
+ */
+export async function makePreview(
+	file: File,
+	codec: ImageCodec = canvasCodec
+): Promise<Blob | null> {
+	const type = file.type.toLowerCase();
+	if (type !== 'image/png' && type !== 'image/jpeg' && type !== 'image/webp') return null;
+	if (file.size <= PREVIEW_MIN_BYTES) return null;
+	try {
+		if (type === 'image/webp' && (await isAnimatedWebp(file))) return null;
+		const image = await codec.decode(file);
+		if (!image) return null;
+		try {
+			const scale = Math.min(1, PREVIEW_EDGE / Math.max(image.width, image.height));
+			const blob = await codec.encode(image, {
+				width: Math.max(1, Math.round(image.width * scale)),
+				height: Math.max(1, Math.round(image.height * scale)),
+				type: 'image/jpeg',
+				quality: 0.8
+			});
+			return blob && blob.size > 0 && blob.size < file.size ? blob : null;
+		} finally {
+			image.close();
+		}
+	} catch {
+		return null;
+	}
+}

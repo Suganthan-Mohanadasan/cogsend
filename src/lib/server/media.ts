@@ -286,6 +286,23 @@ export function coverKey(storageKey: string): string {
 }
 
 /**
+ * A smaller copy of an image for the composer and Posts, which the browser
+ * makes when it uploads one. Publishing always sends the original.
+ */
+export function previewKey(storageKey: string): string {
+	return `preview/${storageKey}`;
+}
+
+/** A browser preview is a JPEG of at most 1280 px; anything larger is not one. */
+export const MAX_PREVIEW_BYTES = 1_000_000;
+
+/** What `draft_media.meta_json` holds for an image. */
+export interface StoredImageMeta {
+	/** Set once a preview is stored at previewKey(); `v` versions its URL. */
+	preview?: { v: number };
+}
+
+/**
  * Still images larger than the grid. GIF stays original so animation survives,
  * and an image that is already small is not worth a second encode.
  */
@@ -352,10 +369,12 @@ export function jpegResponse(bytes: Uint8Array, cacheControl: string): Response 
 	});
 }
 
-/** Drop an object and any cached thumbnail. Missing keys are fine. */
+/** Drop an object and what is kept beside it. Missing keys are fine. */
 export async function deleteMediaObjects(store: MediaStore, keys: string[]): Promise<void> {
 	const all = keys.flatMap((key) =>
-		key.endsWith('.mp4') ? [key, thumbCacheKey(key), coverKey(key)] : [key, thumbCacheKey(key)]
+		key.endsWith('.mp4')
+			? [key, thumbCacheKey(key), coverKey(key)]
+			: [key, thumbCacheKey(key), previewKey(key)]
 	);
 	if (!all.length) return;
 	if (store.deleteMany) {

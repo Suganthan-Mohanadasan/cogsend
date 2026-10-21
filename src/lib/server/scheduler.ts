@@ -14,11 +14,12 @@ import {
 	notExists,
 	or
 } from 'drizzle-orm';
+import { isLocalAppUrl } from '#lib/domain/app-url.js';
 import { STALE_CLAIM_MS, selectDueScheduledTargets } from '#lib/domain/due-jobs.js';
 import { draftExcerpt } from '#lib/domain/excerpt.js';
 import { humanizeError } from '#lib/domain/human-error.js';
 import { displayHandle, platformName } from '#lib/domain/platforms.js';
-import { batchQueries, first, newId, type AppDb } from './db/client';
+import { batchQueries, first, newId, parseJson, type AppDb } from './db/client';
 import {
 	connections,
 	drafts,
@@ -30,7 +31,10 @@ import {
 import type { AppEnv } from './env';
 import type { MediaStore } from './media';
 import { PUBLISH_RESERVE_CALLS, publishTarget } from './publish';
-import type { SubrequestBudget } from './budget';
+import { countingFetch, type SubrequestBudget } from './budget';
+import { mastodonInstanceLimits } from './providers/mastodon';
+import { providerFetch } from './providers/timed-fetch';
+import type { FetchLike } from './providers/types';
 import { purgeExpiredMfaChallenges } from './totp';
 import { purgeExpiredSessions } from './auth';
 import { readAppSetting, writeAppSetting } from './app-settings';
@@ -398,6 +402,72 @@ export async function runJanitorsIfDue(db: AppDb, now = new Date()): Promise<boo
 	return true;
 }
 
+/** How long a Mastodon server's reported limits are trusted before they are read again. */
+export const MASTODON_LIMITS_TTL_MS = 24 * 60 * 60_000;
+/** Servers read per hourly run, so a large account list spreads over the day. */
+const MASTODON_LIMITS_PER_RUN = 3;
+
+/**
+ * Read again what each Mastodon server allows: the composer checks a video
+ * and the character count against what is stored, an admin can raise the
+ * limits at any time, and accounts connected before CogSend 1.20 never had
+ * the video limits read. A server that does not answer keeps what was known
+ * and is asked again a day later. Returns how many servers were asked.
+ */
+export async function refreshMastodonLimits(
+	db: AppDb,
+	env: AppEnv,
+	opts: { fetchImpl?: FetchLike; budget?: SubrequestBudget | null; now?: Date } = {}
+): Promise<number> {
+	const now = opts.now ?? new Date();
+	const rows = await db
+		.select({
+			id: connections.id,
+			instanceUrl: connections.instanceUrl,
+			metaJson: connections.metaJson
+		})
+		.from(connections)
+		.where(
+			and(
+				eq(connections.platform, 'mastodon'),
+				eq(connections.status, 'active'),
+				isNotNull(connections.instanceUrl)
+			)
+		);
+	const stale = rows
+		.map((row) => ({ ...row, meta: parseJson<Record<string, unknown>>(row.metaJson, {}) }))
+		.filter((row) => {
+			const at = Number(row.meta.limitsReadAt);
+			return (
+				!Number.isFinite(at) || now.getTime() - at >= MASTODON_LIMITS_TTL_MS || at > now.getTime()
+			);
+		})
+		.sort((a, b) => (Number(a.meta.limitsReadAt) || 0) - (Number(b.meta.limitsReadAt) || 0))
+		.slice(0, MASTODON_LIMITS_PER_RUN);
+	const base = opts.fetchImpl ?? providerFetch;
+	const fetchImpl = opts.budget ? countingFetch(base, opts.budget) : base;
+	let asked = 0;
+	for (const row of stale) {
+		// A read and a write each; what the tick still owes comes first.
+		if (opts.budget && opts.budget.remaining < 2 + PUBLISH_RESERVE_CALLS) break;
+		const limits = await mastodonInstanceLimits(
+			row.instanceUrl ?? '',
+			fetchImpl,
+			isLocalAppUrl(env.APP_URL)
+		).catch(() => null);
+		asked += 1;
+		// Only over the meta it read: a reconnect or a Check in the meantime
+		// wrote newer limits, and this account is asked again next hour.
+		await db
+			.update(connections)
+			.set({
+				metaJson: JSON.stringify({ ...row.meta, ...(limits ?? {}), limitsReadAt: now.getTime() })
+			})
+			.where(and(eq(connections.id, row.id), eq(connections.metaJson, row.metaJson)));
+	}
+	return asked;
+}
+
 export async function runSchedulerTick(
 	db: AppDb,
 	env: AppEnv,
@@ -411,7 +481,7 @@ export async function runSchedulerTick(
 	}
 ) {
 	await writeHeartbeat(db);
-	await runJanitorsIfDue(db);
+	const janitorsRan = await runJanitorsIfDue(db);
 	// Before the scan, so a row a dead consumer left behind is queued (or
 	// published inline) by this same tick instead of being scanned and skipped.
 	await recoverStalePublishing(db);
@@ -486,6 +556,15 @@ export async function runSchedulerTick(
 			console.error('[scheduler] publish aborted', t.id, err);
 			results.push({ id: t.id, status: 'error' });
 			break;
+		}
+	}
+	// Hourly with the janitors, and after the publish pass, so it only ever
+	// spends calls the posts did not need.
+	if (janitorsRan) {
+		try {
+			await refreshMastodonLimits(db, env, { fetchImpl: opts.fetchImpl, budget });
+		} catch (err) {
+			console.error('[scheduler] mastodon limits refresh failed', err);
 		}
 	}
 	// After the publish pass so failures from this tick are included. No-op

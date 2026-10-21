@@ -147,3 +147,46 @@ export function summarizePublish(
 		announcement: `${message}.`
 	};
 }
+
+/**
+ * What a publish to several accounts has done so far, shown as each one lands
+ * so a slow platform does not hold back the news from the quick ones. Null
+ * when there is nothing to add: no result yet, or none still waiting, which
+ * is when summarizePublish takes over.
+ */
+export function summarizeProgress(
+	settled: DestinationOutcome[],
+	waiting: string[],
+	nameOf: (connectionId: string) => string
+): PublishSummary | null {
+	if (!settled.length || !waiting.length) return null;
+	const names = (list: DestinationOutcome[]) => list.map((o) => nameOf(o.connectionId)).join(', ');
+	const failed = settled.filter((o) => o.status === 'failed');
+	const sent = settled.filter((o) => o.status === 'published' && !o.already);
+	const already = settled.filter((o) => o.status === 'published' && o.already);
+	const processing = settled.filter((o) => o.status === 'retrying' && o.processing);
+	const retrying = settled.filter((o) => o.status === 'retrying' && !o.processing);
+	const inFlight = settled.filter((o) => o.status === 'publishing');
+	const parts: string[] = [];
+	if (sent.length) parts.push(`Published to ${names(sent)}`);
+	if (already.length) parts.push(`already on ${names(already)}`);
+	if (processing.length) parts.push(`${names(processing)} processing the video`);
+	if (retrying.length) parts.push(`retrying ${names(retrying)}`);
+	if (inFlight.length) parts.push(`${names(inFlight)} already publishing`);
+	if (failed.length) {
+		const detail =
+			failed.length === 1 && failed[0].error ? `: ${humanizeError(failed[0].error)}` : '';
+		parts.push(`failed on ${names(failed)}${detail}`);
+	}
+	const head = parts.join(' · ');
+	const still = `still sending to ${waiting.map(nameOf).join(', ')}`;
+	const message = `${head.charAt(0).toUpperCase()}${head.slice(1)} · ${still}`;
+	return {
+		message,
+		tone: failed.length ? 'error' : 'success',
+		action: failed.length
+			? { label: 'View', href: '/posts?tab=failed' }
+			: { label: 'View posts', href: '/posts' },
+		announcement: `${message}.`
+	};
+}

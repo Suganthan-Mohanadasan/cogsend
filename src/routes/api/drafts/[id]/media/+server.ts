@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types';
 import {
 	canAttachMoreImages,
 	MAX_IMAGES_PER_SEGMENT,
+	validateImageUpload,
 	videoMixProblem
 } from '#lib/domain/media-limits.js';
 import { first, newId } from '#lib/server/db/client.js';
@@ -18,7 +19,13 @@ import {
 	segmentProblem
 } from '#lib/server/draft-media.js';
 import { fail, handleError, ok } from '#lib/server/http.js';
-import { deleteMediaObjects, saveMediaBytes } from '#lib/server/media.js';
+import {
+	deleteMediaObjects,
+	MAX_PREVIEW_BYTES,
+	previewKey,
+	saveMediaBytes,
+	type StoredImageMeta
+} from '#lib/server/media.js';
 import { requireScope, requireUser } from '#lib/server/require.js';
 import { serializeMedia } from '#lib/server/serialize.js';
 
@@ -30,6 +37,33 @@ const MAX_UPLOAD_BYTES = 100_000_000;
 // One file must fit in that body with its multipart framing; the uploads route
 // takes videos up to MAX_VIDEO_BYTES in parts.
 const MAX_FORM_VIDEO_BYTES = 95_000_000;
+
+/**
+ * Keep the composer's smaller copy of an image, for showing it. A preview that
+ * is missing or not a small JPEG is dropped: the original is shown instead,
+ * and the upload never fails over it.
+ */
+async function savePreview(
+	locals: App.Locals,
+	storageKey: string,
+	file: File | null
+): Promise<boolean> {
+	if (!file || file.size > MAX_PREVIEW_BYTES) return false;
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	const check = validateImageUpload({
+		mime: 'image/jpeg',
+		size: bytes.length,
+		maxBytes: MAX_PREVIEW_BYTES,
+		bytes
+	});
+	if (!check.ok || check.mime !== 'image/jpeg') return false;
+	try {
+		await locals.media.put(previewKey(storageKey), bytes, 'image/jpeg');
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {
 	try {
@@ -57,9 +91,14 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		const existingOnSegment = existing.filter((m) => (m.segmentIndex ?? 0) === segmentIndex).length;
 
 		const files: File[] = [];
-		for (const entry of [...form.getAll('files'), ...form.getAll('file')]) {
-			if (entry instanceof File && entry.size > 0 && !files.includes(entry)) files.push(entry);
-		}
+		// `preview-<n>` is the composer's smaller copy of the n-th file entry.
+		const previews: Array<File | null> = [];
+		[...form.getAll('files'), ...form.getAll('file')].forEach((entry, n) => {
+			if (!(entry instanceof File) || entry.size <= 0 || files.includes(entry)) return;
+			files.push(entry);
+			const preview = form.get(`preview-${n}`);
+			previews.push(preview instanceof File && preview.size > 0 ? preview : null);
+		});
 		if (!files.length) return fail('file required');
 		// Per-file caps, ahead of the ArrayBuffer copy below: formData() already
 		// materialised the body once, and arrayBuffer() would hold a second
@@ -110,6 +149,10 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			const file = files[i];
 			const bytes = new Uint8Array(await file.arrayBuffer());
 			const saved = await saveMediaBytes(locals.media, { bytes, mime: file.type || 'image/jpeg' });
+			const preview = saved.video
+				? false
+				: await savePreview(locals, saved.storageKey, previews[i]);
+			const imageMeta: StoredImageMeta | null = preview ? { preview: { v: Date.now() } } : null;
 			let media;
 			try {
 				[media] = await locals.db
@@ -122,7 +165,11 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 						size: saved.size,
 						width: saved.width,
 						height: saved.height,
-						metaJson: saved.video ? JSON.stringify(saved.video) : null,
+						metaJson: saved.video
+							? JSON.stringify(saved.video)
+							: imageMeta
+								? JSON.stringify(imageMeta)
+								: null,
 						altText: i === 0 ? altText : null,
 						sortOrder: existingOnSegment + i,
 						segmentIndex,
@@ -132,7 +179,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			} catch (err) {
 				// put-before-insert leaks the object when the DB write fails:
 				// compensate so a failed upload never orphans R2 bytes.
-				await locals.media.delete(saved.storageKey).catch(() => {});
+				await deleteMediaObjects(locals.media, [saved.storageKey]).catch(() => {});
 				throw err;
 			}
 			created.push(serializeMedia(media));

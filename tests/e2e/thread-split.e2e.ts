@@ -26,7 +26,11 @@ async function storedDraft(page: Page) {
 		const res = await page.request.get(`/api/drafts/${id}`);
 		return (await res.json()).draft as {
 			baseBody: string;
-			media: Array<{ segmentIndex: number }>;
+			media: Array<{
+				segmentIndex: number;
+				storageKey: string;
+				meta: { preview?: { v: number } } | null;
+			}>;
 		};
 	};
 }
@@ -72,4 +76,59 @@ test('an image stays with its post when an earlier card is split', async ({ page
 		.toEqual([2]);
 	expect((await draft()).baseBody).toBe('first\n---\nsplit\n---\nsecond');
 	await expect(page.getByText('Couldn’t save the image layout')).toHaveCount(0);
+});
+
+test('a large image is shown from a lighter copy and published from the original', async ({
+	page
+}) => {
+	await page.goto('/compose');
+	await waitForLiveComposer(page);
+	await page.getByTestId('segment-input-0').fill('preview probe');
+	const draft = await storedDraft(page);
+	await expect.poll(async () => (await draft()).baseBody, { timeout: 30000 }).toBe('preview probe');
+
+	// A photo-like PNG, too big to show as it is: a gradient with grain.
+	const base64 = await page.evaluate(async () => {
+		const canvas = document.createElement('canvas');
+		canvas.width = 2000;
+		canvas.height = 1500;
+		const ctx = canvas.getContext('2d')!;
+		const pixels = ctx.createImageData(canvas.width, canvas.height);
+		for (let i = 0; i < pixels.data.length; i += 4) {
+			const p = i / 4;
+			const grain = Math.random() * 8;
+			pixels.data[i] = ((p % 2000) / 8 + grain) | 0;
+			pixels.data[i + 1] = (Math.floor(p / 2000) / 6 + grain) | 0;
+			pixels.data[i + 2] = (128 + grain) | 0;
+			pixels.data[i + 3] = 255;
+		}
+		ctx.putImageData(pixels, 0, 0);
+		const blob = await new Promise<Blob>((resolve) =>
+			canvas.toBlob((b) => resolve(b!), 'image/png')
+		);
+		const url = await new Promise<string>((resolve) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result));
+			reader.readAsDataURL(blob);
+		});
+		return url.slice(url.indexOf(',') + 1);
+	});
+	await page.getByTestId('file-input-0').setInputFiles({
+		name: 'photo.png',
+		mimeType: 'image/png',
+		buffer: Buffer.from(base64, 'base64')
+	});
+
+	await expect
+		.poll(async () => (await draft()).media[0]?.meta?.preview?.v ?? null, { timeout: 30000 })
+		.not.toBeNull();
+	const [item] = (await draft()).media;
+	const shown = page.getByTestId('segment-media-0').locator('img').first();
+	await expect(shown).toHaveAttribute('src', new RegExp(`\\?preview=${item.meta!.preview!.v}$`));
+	await expect.poll(() => shown.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(1280);
+
+	const preview = await page.request.get(`/api/media/${item.storageKey}?preview=1`);
+	const original = await page.request.get(`/api/media/${item.storageKey}`);
+	expect(preview.headers()['content-type']).toBe('image/jpeg');
+	expect((await preview.body()).length).toBeLessThan((await original.body()).length);
 });

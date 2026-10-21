@@ -59,8 +59,10 @@ import {
 	assertSafeStorageKey,
 	coverKey,
 	deleteMediaObjects,
+	previewKey,
 	probeStoredVideo,
 	videoMetaFrom,
+	type StoredImageMeta,
 	type StoredVideoMeta
 } from '#lib/server/media.js';
 import { STALE_CLAIM_MS } from '#lib/domain/due-jobs.js';
@@ -416,6 +418,21 @@ async function copyVideo(
 	}
 }
 
+/** An image's preview comes along when the store can copy it; otherwise the copy shows the original. */
+async function copyPreview(
+	store: OperationContext['media'],
+	item: { storageKey: string; metaJson: string | null },
+	storageKey: string
+): Promise<StoredImageMeta['preview'] | null> {
+	const preview = parseJson<StoredImageMeta>(item.metaJson, {}).preview;
+	if (!preview || !store.copy) return null;
+	try {
+		return (await store.copy(previewKey(item.storageKey), previewKey(storageKey))) ? preview : null;
+	} catch {
+		return null;
+	}
+}
+
 export async function listDrafts(ctx: OperationContext, userId: string, requestedLimit?: number) {
 	const limit = Number.isFinite(requestedLimit)
 		? Math.min(DRAFTS_LIST_MAX_LIMIT, Math.max(1, Math.floor(requestedLimit!)))
@@ -610,6 +627,7 @@ export async function duplicateDraft(ctx: OperationContext, userId: string, draf
 			if (!validated.ok) continue;
 			await ctx.media.put(storageKey, bytes, validated.mime);
 			savedKeys.push(storageKey);
+			const preview = await copyPreview(ctx.media, item, storageKey);
 			mediaValues.push({
 				id: newId(),
 				draftId: newDraftId,
@@ -618,6 +636,7 @@ export async function duplicateDraft(ctx: OperationContext, userId: string, draf
 				size: bytes.length,
 				width: item.width,
 				height: item.height,
+				metaJson: preview ? JSON.stringify({ preview } satisfies StoredImageMeta) : null,
 				altText: item.altText,
 				sortOrder: item.sortOrder,
 				segmentIndex: item.segmentIndex,

@@ -42,6 +42,8 @@ this image…"); fill it in and it goes out with the image on platforms that
 support it. The × removes the image. Size and format limits differ per platform — Bluesky takes 2 MB, X 5
 MB, and LinkedIn rejects WebP — and are checked again when the post is published.
 
+A larger image is shown from a lighter 1280 px copy your browser makes when you attach it, in the composer and in **Posts**; the original is what gets published.
+
 An image over 2 MB is shrunk in your browser before it uploads, so a pasted
 screenshot fits every platform: it is scaled down to 2560 px on the long edge,
 kept as PNG when that is enough and re-encoded as JPEG when it is not. GIFs and
@@ -56,7 +58,7 @@ A URL in a card shows the link preview it will produce, while you write.
 
 A card takes one video (MP4, MOV or WebM) and nothing else beside it; a thread can have a video on each card. Your browser prepares it before it uploads: a file every platform already takes goes up as it is, and anything else, such as a phone's HEVC video, a 4K clip or a frame rate over 60, is converted to MP4 (H.264 with AAC sound) at most 1920 pixels on the long edge. The card shows the video at its own shape, with **Reading**, **Converting** and **Uploading** and the progress along its bottom edge, and **Cancel** stops it. Once it is up, the video shows its cover with a play button and its length, and loads only when you press play. Videos up to 300 MB go up in parts, so a slow connection only resends the part that failed. Leave the page while a video is still uploading and the browser asks first, since the upload stops with it. A browser that can't convert the file says so; export it as MP4 (H.264) and attach it again.
 
-When every selected platform takes the video, nothing more is shown. When one doesn't, a line under the video says why, one line per platform: X takes 2:20 unless the account has X Premium, Threads 5 minutes, Bluesky 10, LinkedIn 30. **Uncheck** on the line drops that platform's accounts, and the accounts button in the dock and the account itself carry a red dot until it is resolved. Publish and Schedule stop on the first platform that would refuse it; trim the video or uncheck that account. A Mastodon account is held to the limits its server reported when you connected it; an account connected before CogSend 1.20 uses Mastodon's defaults until you reconnect it in [Accounts](accounts.md).
+When every selected platform takes the video, nothing more is shown. When one doesn't, a line under the video says why, one line per platform: X takes 2:20 unless the account has X Premium, Threads 5 minutes, Bluesky 10, LinkedIn 30. **Uncheck** on the line drops that platform's accounts, and the accounts button in the dock and the account itself carry a red dot until it is resolved. Publish and Schedule stop on the first platform that would refuse it; trim the video or uncheck that account. A Mastodon account is held to the limits its server reports, which CogSend reads when you connect the account and again every day, so a server that raises its limits is followed within a day.
 
 **COVER**, among the buttons on the video, picks the frame shown before it plays: scrub to a moment and **Use this frame**, or **Upload image**. Mastodon and LinkedIn show it; X, Threads and Bluesky choose their own frame. Until you pick one, the frame one second in is the cover, and it is also what **Posts** shows. **ALT** describes the video, as for an image.
 
@@ -93,7 +95,7 @@ you fix it.
 
 ## Publish now, or schedule
 
-**Publish** hands the draft to every selected account and empties the composer at once, so you can start the next post while it goes out. The result arrives as a message wherever you are in the app: **Published to 3 destinations**, or which account failed and why, with a link to the post in **Posts**. A failure also puts a red dot on the menu at the top left, beside **Posts**, until you open it. By default Publish asks first, with a **Confirm Post** step; tick **Publish
+**Publish** hands the draft to every selected account and empties the composer at once, so you can start the next post while it goes out. The result arrives as a message wherever you are in the app, updated as each account answers ("Published to Mastodon · still sending to Threads") and ending with **Published to 3 destinations**, or which account failed and why, with a link to the post in **Posts**. A failure also puts a red dot on the menu at the top left, beside **Posts**, until you open it. By default Publish asks first, with a **Confirm Post** step; tick **Publish
 without asking next time** to skip it in this browser, and turn the question back
 on under **Settings → Preferences → Ask for confirmation before publishing**.
 **Cmd/Ctrl + Enter** publishes from the keyboard.

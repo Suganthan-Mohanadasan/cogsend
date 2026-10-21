@@ -7,6 +7,7 @@ import {
 	assertSafeStorageKey,
 	coverKey,
 	jpegResponse,
+	previewKey,
 	PRIVATE_MEDIA_CACHE,
 	serveMediaBytes,
 	storedThumbnail,
@@ -37,6 +38,12 @@ export const GET: RequestHandler = async ({ params, locals, request, url }) => {
 			const cover = await locals.media.get(coverKey(key));
 			if (!cover) return fail('Not found', 404);
 			return jpegResponse(cover, PRIVATE_MEDIA_CACHE);
+		}
+		// The composer's smaller copy, for showing an image. One that was never
+		// made (an older upload, an API client) falls through to the original.
+		if (url.searchParams.has('preview') && !(media.mime || '').startsWith('video/')) {
+			const preview = await locals.media.get(previewKey(key));
+			if (preview) return jpegResponse(preview, PRIVATE_MEDIA_CACHE);
 		}
 		// Posts grid. Only a deployment that bound Cloudflare Images gets a
 		// smaller file; everyone else, and any encode that fails, gets the

@@ -11,6 +11,7 @@ import { imageOverCap, mediaSizeProblem } from '#lib/domain/media-limits.js';
 import {
 	mayUnscheduleOthers,
 	outcomeOfRow,
+	summarizeProgress,
 	summarizePublish,
 	type DestinationOutcome
 } from '#lib/domain/publish-outcome.js';
@@ -139,6 +140,43 @@ describe('publish outcome', () => {
 			error: 'Publish failed'
 		});
 		expect(out('a', undefined).status).toBe('failed');
+	});
+
+	it('reports each account as it lands while others are still sending', () => {
+		const names = (id: string) =>
+			({ a: 'Bluesky · a', b: 'Threads · b', c: 'Mastodon · c' })[id] ?? id;
+		expect(summarizeProgress([], ['a'], names)).toBeNull();
+		// The last one in is the final summary's job.
+		expect(summarizeProgress([out('a', { status: 'published' })], [], names)).toBeNull();
+
+		const quick = summarizeProgress([out('a', { status: 'published' })], ['b', 'c'], names);
+		expect(quick).toMatchObject({
+			message: 'Published to Bluesky · a · still sending to Threads · b, Mastodon · c',
+			tone: 'success',
+			action: { label: 'View posts', href: '/posts' }
+		});
+
+		const mixed = summarizeProgress(
+			[
+				out('a', { status: 'published' }),
+				out('c', { status: 'scheduled', error: `Mastodon ${PROCESSING_MARK}` })
+			],
+			['b'],
+			names
+		);
+		expect(mixed?.message).toBe(
+			'Published to Bluesky · a · Mastodon · c processing the video · still sending to Threads · b'
+		);
+		expect(mixed?.tone).toBe('success');
+
+		const failed = summarizeProgress(
+			[out('b', { status: 'failed', error: 'Invalid token' })],
+			['a'],
+			names
+		);
+		expect(failed?.message).toMatch(/^Failed on Threads · b: .+ · still sending to Bluesky · a$/);
+		expect(failed?.tone).toBe('error');
+		expect(failed?.action).toEqual({ label: 'View', href: '/posts?tab=failed' });
 	});
 
 	it('reports a clean publish, and one already out', () => {

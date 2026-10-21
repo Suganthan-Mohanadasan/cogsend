@@ -27,6 +27,7 @@
 		coverUrl,
 		frameFor,
 		gridFor,
+		imageUrl,
 		isVideoMedia,
 		mediaUrl
 	} from '#lib/domain/media-layout.js';
@@ -133,7 +134,7 @@
 		{/if}
 	{:else}
 		<img
-			src={srcOf(m)}
+			src={m.previewUrl || imageUrl(m)}
 			alt={label(m, i)}
 			loading="lazy"
 			decoding="async"

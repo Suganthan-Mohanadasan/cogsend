@@ -73,7 +73,7 @@ curl -s -X POST "$APP_URL/api/drafts/DRAFT_ID/publish" \
 
 ## Media
 
-`POST /api/drafts/:id/media` takes a `multipart/form-data` body with one or more `files`, the card's `segmentIndex` (0 for the first) and an optional `altText`. Images go up to 16 MB, an MP4 to 95 MB.
+`POST /api/drafts/:id/media` takes a `multipart/form-data` body with one or more `files`, the card's `segmentIndex` (0 for the first) and an optional `altText`. Images go up to 16 MB, an MP4 to 95 MB. An optional `preview-<n>`, a JPEG of at most 1 MB, is shown in place of the n-th file in the app; the original is what gets published.
 
 A larger video goes up in parts, up to 300 MB:
 

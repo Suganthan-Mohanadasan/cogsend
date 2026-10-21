@@ -279,8 +279,9 @@ describe('deleting the account', () => {
 			codeFor
 		);
 		expect(res.status).toBe(200);
-		// Each file is deleted with its thumbnail cache key, still one call per batch.
-		expect(batchSizes).toEqual([400, 100]);
+		// Each image goes with its thumbnail cache key and its preview, still one
+		// call per batch and well inside R2's 1,000 keys a call.
+		expect(batchSizes).toEqual([600, 150]);
 		expect(await db.select().from(users).where(eq(users.id, row.id))).toHaveLength(0);
 		expect(await db.select().from(draftMedia).where(eq(draftMedia.draftId, draftId))).toHaveLength(
 			0

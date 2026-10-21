@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { shrinkSteps, shrinkToFit, type ImageCodec } from '#lib/components/shrink-image.js';
+import {
+	makePreview,
+	PREVIEW_EDGE,
+	shrinkSteps,
+	shrinkToFit,
+	type ImageCodec
+} from '#lib/components/shrink-image.js';
 
 function fakeCodec(sizeOf: (step: { width: number; type: string; quality?: number }) => number) {
 	const tried: string[] = [];
@@ -84,5 +90,35 @@ describe('shrinkToFit', () => {
 			encode: async () => null
 		};
 		expect(await shrinkToFit(f, 2_000, codec)).toBe(f);
+	});
+});
+
+describe('makePreview', () => {
+	it('makes a JPEG at most PREVIEW_EDGE on the long edge', async () => {
+		const { codec, tried, closed } = fakeCodec(() => 100_000);
+		const preview = await makePreview(file(1_500_000, 'image/png'), codec);
+		expect(preview?.type).toBe('image/jpeg');
+		expect(tried).toEqual([`image/jpeg@${PREVIEW_EDGE}:0.8`]);
+		expect(closed()).toBe(true);
+	});
+
+	it('leaves light, animated and unknown images to show as they are', async () => {
+		const { codec, tried } = fakeCodec(() => 1);
+		expect(await makePreview(file(200_000, 'image/jpeg'), codec)).toBeNull();
+		expect(await makePreview(file(2_000_000, 'image/gif'), codec)).toBeNull();
+		expect(await makePreview(file(2_000_000, 'image/heic'), codec)).toBeNull();
+		expect(tried).toEqual([]);
+	});
+
+	it('gives up when the copy would not be smaller or the browser cannot make one', async () => {
+		const bigger = fakeCodec(() => 3_000_000);
+		expect(await makePreview(file(1_500_000, 'image/jpeg'), bigger.codec)).toBeNull();
+		const broken: ImageCodec = {
+			decode: async () => {
+				throw new Error('cannot decode');
+			},
+			encode: async () => null
+		};
+		expect(await makePreview(file(1_500_000, 'image/jpeg'), broken)).toBeNull();
 	});
 });

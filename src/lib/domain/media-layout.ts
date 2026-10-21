@@ -9,7 +9,11 @@ export type MediaShape = {
 	mime?: string | null;
 	width?: number | null;
 	height?: number | null;
-	meta?: { cover?: { v?: number } | null; durationMs?: number | null } | null;
+	meta?: {
+		cover?: { v?: number } | null;
+		preview?: { v?: number } | null;
+		durationMs?: number | null;
+	} | null;
 };
 
 /** Until an item reports its size it is framed as 16:9, the common case for both. */
@@ -81,6 +85,12 @@ export function gridFor(count: number): { rows: number; cells: GridCell[] } {
 
 export function mediaUrl(m: { storageKey: string }): string {
 	return `/api/media/${encodeURIComponent(m.storageKey)}`;
+}
+
+/** What to show for an image: its smaller copy when the composer made one, else the original. */
+export function imageUrl(m: MediaShape): string {
+	const v = m.meta?.preview?.v;
+	return v ? `${mediaUrl(m)}?preview=${v}` : mediaUrl(m);
 }
 
 /** A video's chosen cover, versioned so a new one is not served from cache. */
