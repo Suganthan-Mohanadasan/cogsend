@@ -37,6 +37,7 @@
 		X_MAX_IMAGE_BYTES,
 		groupMediaBySegment,
 		imageOverCap,
+		instagramMediaProblems,
 		mediaSizeProblem,
 		remapSegmentIndexAfterRemoval
 	} from '#lib/domain/media-limits.js';
@@ -52,7 +53,7 @@
 	import MediaFit from './video/MediaFit.svelte';
 	import MediaPreview from './MediaPreview.svelte';
 	import VideoCover from './video/VideoCover.svelte';
-	import { makePreview, shrinkToFit } from '#lib/components/shrink-image.js';
+	import { makeJpegCopy, makePreview, shrinkToFit } from '#lib/components/shrink-image.js';
 	import { persistMediaLayout, type MediaMove } from '#lib/domain/media-sync.js';
 	import {
 		customizePlatformBody,
@@ -168,6 +169,8 @@
 			fps?: number | null;
 			faststart?: boolean | null;
 			cover?: { v: number; atMs?: number } | null;
+			/** A JPEG copy of a PNG or WebP is stored for Instagram. */
+			jpeg?: { v: number } | null;
 		} | null;
 	};
 
@@ -199,12 +202,15 @@
 		initialConnections = [],
 		initialSettings = null,
 		initialDraft = null,
-		displayName = null
+		displayName = null,
+		canMakeJpegCopies = false
 	}: {
 		initialConnections?: Connection[];
 		initialSettings?: ProfileSettings | null;
 		initialDraft?: EditorDraft | null;
 		displayName?: string | null;
+		/** The server can make a missing JPEG copy (the Images binding). */
+		canMakeJpegCopies?: boolean;
 	} = $props();
 
 	// The open draft is rendered with the page. A later id change still fetches.
@@ -544,6 +550,7 @@
 		const mastoText = effectivePlatformBody(baseBody, overrides, 'mastodon');
 		const linkedinText = effectivePlatformBody(baseBody, overrides, 'linkedin');
 		const threadsText = effectivePlatformBody(baseBody, overrides, 'threads');
+		const instagramText = effectivePlatformBody(baseBody, overrides, 'instagram');
 		const xText = effectivePlatformBody(baseBody, overrides, 'x');
 		const linkedinFlat = flattenThreadBody(linkedinText);
 		return {
@@ -559,6 +566,10 @@
 			threads: {
 				len: maxThreadSegmentLength(threadsText, countGraphemes),
 				max: PLATFORM_LIMITS.threads
+			},
+			instagram: {
+				len: countGraphemes(flattenThreadBody(instagramText)),
+				max: PLATFORM_LIMITS.instagram
 			},
 			x: {
 				len: maxThreadSegmentLength(xText, xWeightedLength),
@@ -597,6 +608,20 @@
 		return null;
 	});
 	const linkedinMediaOver = $derived(linkedinMediaProblem !== null);
+	// Instagram also flattens the thread, and is the one platform that refuses
+	// a post without a photo or video.
+	const instagramMediaProblem = $derived.by(() => {
+		if (!selectedPlatforms.has('instagram')) return null;
+		const problems = instagramMediaProblems(
+			media.map((m) => ({
+				mime: m.mime,
+				width: m.width,
+				height: m.height,
+				hasJpegCopy: canMakeJpegCopies || Boolean(m.meta?.jpeg)
+			}))
+		);
+		return problems[0] ?? null;
+	});
 	const overSelectedLimit = $derived(
 		isOverSelectedPlatformLimit({
 			selectedPlatforms,
@@ -608,6 +633,8 @@
 			linkedinMax: counters.linkedin.max,
 			threadsLen: counters.threads.len,
 			threadsMax: counters.threads.max,
+			instagramLen: counters.instagram.len,
+			instagramMax: counters.instagram.max,
 			xLen: counters.x.len,
 			xMax: counters.x.max
 		}) ||
@@ -1266,6 +1293,10 @@
 			showToast(linkedinMediaProblem ?? 'LinkedIn cannot take this media', 'warn');
 			return;
 		}
+		if (instagramMediaProblem && connectionIds.some((id) => platformOf(id) === 'instagram')) {
+			showToast(instagramMediaProblem, 'warn');
+			return;
+		}
 		const sizeProblem = mediaSizeProblem(
 			connectionIds.map(platformOf).filter((p) => p !== undefined),
 			media
@@ -1764,6 +1795,10 @@
 			showToast(linkedinMediaProblem ?? 'LinkedIn cannot take this media', 'warn');
 			return;
 		}
+		if (instagramMediaProblem) {
+			showToast(instagramMediaProblem, 'warn');
+			return;
+		}
 		const sizeProblem = mediaSizeProblem(selectedPlatforms, media);
 		if (sizeProblem) {
 			showToast(sizeProblem, 'warn');
@@ -1929,6 +1964,8 @@
 				form.append('files', f);
 				const preview = await makePreview(f);
 				if (preview) form.append(`preview-${n}`, preview, 'preview.jpg');
+				const jpeg = await makeJpegCopy(f);
+				if (jpeg) form.append(`jpeg-${n}`, jpeg, 'copy.jpg');
 			}
 			const res = await fetch(`/api/drafts/${id}/media`, { method: 'POST', body: form });
 			const data = await res.json();
@@ -2095,10 +2132,11 @@
 
 	/**
 	 * Every platform that would refuse what is attached to `list`, one row
-	 * each, for the line under the media. `withLinkedIn` adds LinkedIn's
-	 * thread-wide rule, shown once, under the first card that has media.
+	 * each, for the line under the media. `threadWide` adds the rules of the
+	 * platforms that flatten the thread (LinkedIn, Instagram), shown once,
+	 * under the first card that has media, or the first card when none has.
 	 */
-	function fitProblems(list: MediaItem[], withLinkedIn: boolean): PlatformFit[] {
+	function fitProblems(list: MediaItem[], threadWide: boolean): PlatformFit[] {
 		const rows = new Map<string, PlatformFit>();
 		for (const m of list) {
 			if (!isVideoItem(m)) continue;
@@ -2112,13 +2150,20 @@
 			if (over && !rows.has(platform))
 				rows.set(platform, { platform, level: 'error', message: over });
 		}
-		if (withLinkedIn && linkedinMediaProblem && !rows.has('linkedin')) {
+		if (threadWide && linkedinMediaProblem && !rows.has('linkedin')) {
 			rows.set('linkedin', { platform: 'linkedin', level: 'error', message: linkedinMediaProblem });
+		}
+		if (threadWide && instagramMediaProblem && !rows.has('instagram')) {
+			rows.set('instagram', {
+				platform: 'instagram',
+				level: 'error',
+				message: instagramMediaProblem
+			});
 		}
 		return [...rows.values()];
 	}
 
-	const firstMediaCard = $derived(Math.min(...mediaBySegment.keys()));
+	const firstMediaCard = $derived(media.length ? Math.min(...mediaBySegment.keys()) : 0);
 
 	function cardFit(index: number): PlatformFit[] {
 		const list = cardMedia(index);
