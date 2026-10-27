@@ -1,3 +1,5 @@
+import { requireScope } from '#lib/server/require.js';
+import { audit, requireApproval, assertDispatchAllowed } from '#lib/server/approval-gate.js';
 import {
 	and,
 	desc,
@@ -73,6 +75,8 @@ import { loadOwnedDraft } from '#lib/server/draft-record.js';
 
 export type OperationContext = Pick<App.Locals, 'db' | 'env' | 'media'> & {
 	budget?: SubrequestBudget;
+	apiKeyScopes?: string[] | null;
+	apiKeyId?: string;
 	waitUntil?: (promise: Promise<unknown>) => void;
 };
 function invalid(message: string, status = 400, details?: Record<string, unknown>): never {
@@ -160,6 +164,7 @@ export async function scheduleDraft(
 	draftId: string,
 	body: unknown
 ) {
+	requireScope(ctx, 'approve_schedule');
 	const draft = await first(
 		ctx.db
 			.select()
@@ -198,7 +203,12 @@ export async function scheduleDraft(
 			alreadyPublished: already,
 			inFlight: flight
 		});
+	for (const conn of conns) await requireApproval(ctx.db, ctx.env, userId, draftId, conn.id, runAt);
 	const ensured = await ensureTargets(ctx.db, draftId, conns, 'schedule', runAt, now);
+	await audit(ctx.db, 'schedule', ctx.apiKeyId ?? userId, draftId, null, {
+		connectionIds: ids,
+		scheduledFor: runAt.toISOString()
+	});
 	const blocked = ensured.filter((i) => i.alreadyPublished || i.inFlight);
 	if (blocked.length)
 		invalid(blocked.some((i) => i.inFlight) ? 'Already publishing' : 'Already published', 409, {
@@ -268,10 +278,12 @@ export async function cancelDelivery(ctx: OperationContext, userId: string, id: 
 }
 
 export async function retryDelivery(ctx: OperationContext, userId: string, id: string) {
+	requireScope(ctx, 'approve_schedule');
 	const target = await first(ctx.db.select().from(publishTargets).where(eq(publishTargets.id, id)));
 	if (!target) invalid('Not found', 404);
 	const draft = await first(ctx.db.select().from(drafts).where(eq(drafts.id, target.draftId)));
 	if (!draft || draft.userId !== userId) invalid('Not found', 404);
+	await audit(ctx.db, 'retry', ctx.apiKeyId ?? userId, target.draftId, id);
 	const now = new Date();
 	if (target.remotePostId)
 		return { status: 'published', remotePostId: target.remotePostId, skipped: true };
@@ -282,13 +294,22 @@ export async function retryDelivery(ctx: OperationContext, userId: string, id: s
 	);
 	if (!conn || conn.userId !== userId) invalid('Not found', 404);
 	if (conn.status !== 'active') invalid('Account needs reconnect', 409);
+	await assertDispatchAllowed(ctx.db, id);
+	await requireApproval(
+		ctx.db,
+		ctx.env,
+		userId,
+		target.draftId,
+		target.connectionId,
+		target.scheduledFor
+	);
 	const stale = new Date(now.getTime() - STALE_CLAIM_MS);
 	const reset = await ctx.db
 		.update(publishTargets)
 		.set({
 			// A manual retry is fresh intent: clear stale claims and the attempt budget.
 			status: 'pending',
-			scheduledFor: null,
+			scheduledFor: target.scheduledFor,
 			errorMessage: null,
 			jobId: null,
 			attemptCount: 0,
@@ -330,6 +351,7 @@ export async function rescheduleDelivery(
 	id: string,
 	body: unknown
 ) {
+	requireScope(ctx, 'approve_schedule');
 	const target = await first(ctx.db.select().from(publishTargets).where(eq(publishTargets.id, id)));
 	if (!target) invalid('Not found', 404);
 	const draft = await first(ctx.db.select().from(drafts).where(eq(drafts.id, target.draftId)));
@@ -349,6 +371,11 @@ export async function rescheduleDelivery(
 	);
 	if (!conn || conn.userId !== userId) invalid('Not found', 404);
 	if (conn.status !== 'active') invalid('Account needs reconnect', 409);
+	await assertDispatchAllowed(ctx.db, id);
+	await requireApproval(ctx.db, ctx.env, userId, target.draftId, target.connectionId, runAt);
+	await audit(ctx.db, 'schedule', ctx.apiKeyId ?? userId, target.draftId, id, {
+		scheduledFor: runAt.toISOString()
+	});
 	const stale = new Date(now.getTime() - STALE_CLAIM_MS);
 	const updated = await ctx.db
 		.update(publishTargets)
@@ -817,6 +844,7 @@ export async function publishDraft(
 	draftId: string,
 	requestBody: unknown
 ) {
+	requireScope(ctx, 'approve_schedule');
 	const deadline = Date.now() + INLINE_PUBLISH_MS;
 	const draft = await first(
 		ctx.db
@@ -849,6 +877,10 @@ export async function publishDraft(
 		.filter((item) => item.kind === 'inFlight')
 		.map((item) => item.connectionId);
 	if (inFlight.length) invalid('Already publishing', 409, { inFlight });
+	for (const conn of userConnections) {
+		if (classified.find((c) => c.connectionId === conn.id)?.kind !== 'published')
+			await requireApproval(ctx.db, ctx.env, userId, draftId, conn.id, null);
+	}
 	const ensured = await ensureTargets(ctx.db, draftId, userConnections, 'now', null, now);
 	const results = [];
 	let stopped: string | null = null;

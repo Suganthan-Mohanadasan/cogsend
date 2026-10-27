@@ -1,3 +1,4 @@
+import './fixtures/provider-policy-isolation';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { eq } from 'drizzle-orm';
@@ -16,6 +17,8 @@ const expectedTools = [
 	'list_connections',
 	'list_drafts',
 	'get_draft',
+	'preview_approval',
+	'approve_draft',
 	'create_draft',
 	'update_draft',
 	'duplicate_draft',
@@ -56,7 +59,7 @@ beforeEach(async () => {
 		totpEnabled: true,
 		mfaVerified: true
 	};
-	rawKey = (await rotateApiKey(db, user.id)).raw;
+	rawKey = (await rotateApiKey(db, user.id, ['draft', 'approve_schedule'])).raw;
 	transport = new StreamableHTTPClientTransport(new URL('https://cogsend.example/api/mcp'), {
 		requestInit: { headers: { Authorization: `Bearer ${rawKey}` } },
 		fetch: async (input, init) => {
@@ -158,6 +161,8 @@ const expectedOutputFields: Record<string, string[]> = {
 	list_queue: ['targets', 'hasMore'],
 	cancel_delivery: ['target'],
 	retry_delivery: ['status', 'remotePostId', 'error', 'skipped'],
+	preview_approval: ['payload', 'hash'],
+	approve_draft: ['approval'],
 	reschedule_delivery: ['ok', 'scheduledFor']
 };
 
@@ -185,7 +190,7 @@ describe('MCP protocol client through the deployed route handler', () => {
 			url: new URL(pingRequest.url),
 			locals: {
 				user,
-				apiKeyScopes: ['read', 'write'],
+				apiKeyScopes: ['draft', 'approve_schedule'],
 				db,
 				env: TEST_ENV,
 				media: createTestMedia()
@@ -256,11 +261,13 @@ describe('MCP protocol client through the deployed route handler', () => {
 			list_queue: read,
 			cancel_delivery: remove,
 			retry_delivery: publish,
+			preview_approval: read,
+			approve_draft: update,
 			reschedule_delivery: update
 		});
 	});
 
-	it('executes representative behavior for all 16 tools, with bounds, ownership, and state restrictions', async () => {
+	it('executes representative behavior for all original tools, with bounds, ownership, and state restrictions', async () => {
 		const connectionId = await seedConnection();
 		const created = structured(
 			await client.callTool({
@@ -508,7 +515,7 @@ describe('MCP protocol client through the deployed route handler', () => {
 				url: new URL(request.url),
 				locals: {
 					user,
-					apiKeyScopes: ['read', 'write'],
+					apiKeyScopes: ['draft', 'approve_schedule'],
 					db,
 					env: TEST_ENV,
 					media: createTestMedia()

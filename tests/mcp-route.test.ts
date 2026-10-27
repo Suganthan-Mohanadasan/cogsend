@@ -1,3 +1,4 @@
+import './fixtures/provider-policy-isolation';
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -15,6 +16,8 @@ const toolNames = [
 	'list_connections',
 	'list_drafts',
 	'get_draft',
+	'preview_approval',
+	'approve_draft',
 	'create_draft',
 	'update_draft',
 	'duplicate_draft',
@@ -113,7 +116,7 @@ function requestEvent(
 ) {
 	const locals = {
 		user,
-		apiKeyScopes: ['read', 'write'],
+		apiKeyScopes: ['draft', 'approve_schedule'],
 		db,
 		env: TEST_ENV,
 		media: createTestMedia(),
@@ -196,7 +199,7 @@ async function postMcp(
 }
 
 describe('MCP route', () => {
-	it('exposes exactly the curated 16-tool catalog and the required annotations', async () => {
+	it('exposes exactly the curated tool catalog and the required annotations', async () => {
 		const { response, payload } = await postMcp('tools/list');
 		expect(response.headers.get('content-type')).toContain('application/json');
 		expect(response.headers.get('content-type')).not.toContain('text/event-stream');
@@ -233,6 +236,14 @@ describe('MCP route', () => {
 			list_queue: { fields: ['limit'], required: [] },
 			cancel_delivery: { fields: ['targetId'], required: ['targetId'] },
 			retry_delivery: { fields: ['targetId'], required: ['targetId'] },
+			preview_approval: {
+				fields: ['draftId', 'connectionId', 'scheduledFor'],
+				required: ['draftId', 'connectionId']
+			},
+			approve_draft: {
+				fields: ['draftId', 'connectionId', 'hash', 'scheduledFor'],
+				required: ['draftId', 'connectionId', 'hash']
+			},
 			reschedule_delivery: { fields: ['targetId', 'runAt'], required: ['targetId', 'runAt'] }
 		};
 		for (const tool of tools) {
@@ -259,6 +270,8 @@ describe('MCP route', () => {
 			list_queue: readAnnotations,
 			cancel_delivery: deleteAnnotations,
 			retry_delivery: publishAnnotations,
+			preview_approval: readAnnotations,
+			approve_draft: updateAnnotations,
 			reschedule_delivery: updateAnnotations
 		};
 		for (const tool of tools) expect(tool.annotations).toEqual(expectedAnnotations[tool.name]);

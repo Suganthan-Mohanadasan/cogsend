@@ -1,8 +1,10 @@
+import { APPROVAL_SQL } from '#lib/server/db/approval-sql.js';
 import { fnv1a } from '#lib/domain/hash.js';
 import { rawBinding } from '../budget';
 
 /** Bootstrap DDL for first request. Squashed to latest: 0001 + 0002 + 0004-final + 0005 + 0007 + 0008 + 0009 + 0010 + 0012 + 0014 + 0015 + 0016 + 0017 (+ 0003 transient). Keep in lockstep with drizzle/*.sql; `tests/schema-bootstrap.test.ts` fails when an index a migration creates is missing here. */
-export const INIT_SQL = `
+export const INIT_SQL =
+	`
 CREATE TABLE IF NOT EXISTS \`users\` (
 	\`id\` text PRIMARY KEY NOT NULL,
 	\`email\` text NOT NULL,
@@ -203,14 +205,20 @@ CREATE TABLE IF NOT EXISTS \`api_keys\` (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS \`api_keys_hash_uq\` ON \`api_keys\` (\`key_hash\`);
 CREATE INDEX IF NOT EXISTS \`api_keys_user_idx\` ON \`api_keys\` (\`user_id\`);
-`;
+` + APPROVAL_SQL;
 
-async function execStatements(d1: D1Database, sql: string) {
+export function schemaStatements(sql: string): string[] {
+	const triggers = sql.match(/CREATE TRIGGER IF NOT EXISTS[\s\S]*?\bEND;/g) ?? [];
 	const statements = sql
+		.replace(/CREATE TRIGGER IF NOT EXISTS[\s\S]*?\bEND;/g, '')
 		.split(';')
 		.map((s) => s.trim())
 		.filter((s) => s.length > 0);
-	for (const statement of statements) {
+	return [...statements, ...triggers];
+}
+
+async function execStatements(d1: D1Database, sql: string) {
+	for (const statement of schemaStatements(sql)) {
 		await d1.prepare(statement).run();
 	}
 }
@@ -424,6 +432,7 @@ export async function ensureSchema(d1: D1Database) {
 		await addMissingColumns(d1, table, columns);
 	}
 	await execStatements(d1, LEGACY_TABLES_SQL);
+	await execStatements(d1, APPROVAL_SQL);
 	await ensureDraftConnUnique(d1);
 	for (const ddl of BACKFILL_INDEXES) {
 		await d1.prepare(ddl).run();

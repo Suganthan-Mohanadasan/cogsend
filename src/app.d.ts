@@ -11,6 +11,7 @@ declare global {
 
 	namespace App {
 		interface Locals {
+			apiKeyId?: string;
 			db: AppDb;
 			env: AppEnv;
 			media: MediaStore;

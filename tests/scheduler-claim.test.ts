@@ -1,3 +1,4 @@
+import './fixtures/provider-policy-isolation';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';

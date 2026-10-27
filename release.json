@@ -1,6 +1,6 @@
 {
 	"minFromVersion": "0.0.0",
-	"manualOnly": false,
-	"schemaChange": false,
-	"notes": null
+	"manualOnly": true,
+	"schemaChange": true,
+	"notes": "Approval gate: apply the reviewed migrations with publishing halted. Existing delivery attempts require reconciliation before promotion."
 }

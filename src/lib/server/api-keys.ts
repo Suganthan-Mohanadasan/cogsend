@@ -1,10 +1,5 @@
-import { and, desc, eq, isNull, ne } from 'drizzle-orm';
-import {
-	ALL_SCOPES,
-	normalizeApiScopes,
-	parseApiScopes,
-	type ApiScope
-} from '#lib/domain/api-scopes.js';
+import { and, desc, eq, isNull } from 'drizzle-orm';
+import { normalizeApiScopes, parseApiScopes, type ApiScope } from '#lib/domain/api-scopes.js';
 import { bytesToHex, randomHex, utf8Bytes } from '#lib/domain/bytes.js';
 import { first, newId, type AppDb } from './db/client';
 import { apiKeys } from './db/schema';
@@ -44,14 +39,11 @@ export async function getActiveApiKey(db: AppDb, userId: string): Promise<ApiKey
 	);
 }
 
-/** Mint a replacement key. The new row is inserted BEFORE old rows are
- *  revoked, so an insert failure keeps the previous key working instead of
- *  leaving the user keyless. Returns the raw key — shown once, never stored. */
 export async function rotateApiKey(
 	db: AppDb,
 	userId: string,
-	scopes: unknown = ALL_SCOPES
-): Promise<{ raw: string; prefix: string; createdAt: Date; scopes: ApiScope[] }> {
+	scopes: unknown = undefined
+): Promise<{ id: string; raw: string; prefix: string; createdAt: Date; scopes: ApiScope[] }> {
 	const raw = `${API_KEY_PREFIX}${randomHex(32)}`;
 	const now = new Date();
 	const id = newId();
@@ -66,11 +58,7 @@ export async function rotateApiKey(
 		lastUsedAt: null,
 		revokedAt: null
 	});
-	await db
-		.update(apiKeys)
-		.set({ revokedAt: now })
-		.where(and(eq(apiKeys.userId, userId), isNull(apiKeys.revokedAt), ne(apiKeys.id, id)));
-	return { raw, prefix: raw.slice(0, 12), createdAt: now, scopes: finalScopes };
+	return { id, raw, prefix: raw.slice(0, 12), createdAt: now, scopes: finalScopes };
 }
 
 export async function revokeApiKeys(db: AppDb, userId: string): Promise<number> {
@@ -113,4 +101,24 @@ export function touchApiKey(db: AppDb, keyId: string): Promise<void> {
 			// metadata only; ignore
 		}
 	})();
+}
+
+export function listApiKeys(db: AppDb, userId: string) {
+	return db
+		.select({
+			id: apiKeys.id,
+			prefix: apiKeys.prefix,
+			scopes: apiKeys.scopes,
+			createdAt: apiKeys.createdAt,
+			lastUsedAt: apiKeys.lastUsedAt
+		})
+		.from(apiKeys)
+		.where(and(eq(apiKeys.userId, userId), isNull(apiKeys.revokedAt)));
+}
+export async function revokeApiKey(db: AppDb, userId: string, id: string) {
+	return db
+		.update(apiKeys)
+		.set({ revokedAt: new Date() })
+		.where(and(eq(apiKeys.id, id), eq(apiKeys.userId, userId), isNull(apiKeys.revokedAt)))
+		.returning({ id: apiKeys.id });
 }

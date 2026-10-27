@@ -3,9 +3,9 @@ import { hasApiScope, normalizeApiScopes, parseApiScopes } from '#lib/domain/api
 import { requireScope } from '#lib/server/require.js';
 
 describe('parseApiScopes', () => {
-	it('grants full access to legacy keys', () => {
-		expect(parseApiScopes(null)).toEqual(['read', 'write']);
-		expect(parseApiScopes(undefined)).toEqual(['read', 'write']);
+	it('limits legacy keys to draft preparation', () => {
+		expect(parseApiScopes(null)).toEqual(['draft']);
+		expect(parseApiScopes(undefined)).toEqual(['draft']);
 	});
 	it('fails closed on malformed rows', () => {
 		// The app never writes these; only corruption can produce them, so a
@@ -29,17 +29,18 @@ describe('hasApiScope', () => {
 		expect(hasApiScope(['write'], 'write')).toBe(true);
 		expect(hasApiScope(['read'], 'write')).toBe(false);
 	});
-	it('passes when no scopes are attached (session / operator key)', () => {
-		expect(hasApiScope(null, 'write')).toBe(true);
-		expect(hasApiScope(undefined, 'read')).toBe(true);
+	it('does not infer scopes from missing input', () => {
+		expect(hasApiScope(null, 'write')).toBe(false);
+		expect(hasApiScope(undefined, 'read')).toBe(false);
 	});
 });
 
 describe('normalizeApiScopes', () => {
-	it('drops unknown entries and dedupes', () => {
-		expect(normalizeApiScopes(['read', 'read', 'root'])).toEqual(['read']);
-		expect(normalizeApiScopes([])).toEqual(['read', 'write']);
-		expect(normalizeApiScopes(undefined)).toEqual(['read', 'write']);
+	it('rejects unknown or empty scopes and defaults to draft', () => {
+		expect(() => normalizeApiScopes(['read', 'read', 'root'])).toThrow();
+		expect(normalizeApiScopes(['draft', 'draft'])).toEqual(['draft']);
+		expect(() => normalizeApiScopes([])).toThrow();
+		expect(normalizeApiScopes(undefined)).toEqual(['draft']);
 	});
 });
 

@@ -600,7 +600,7 @@
 			const res = await fetch('/api/key', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ scopes: keyScopes === 'read' ? ['read'] : ['read', 'write'] })
+				body: JSON.stringify({ scopes: keyScopes === 'read' ? ['read'] : ['draft'] })
 			});
 			const payload = await res.json();
 			if (!res.ok) throw new Error(payload.error || 'Could not create key');
@@ -1069,14 +1069,18 @@
 		>
 			<h2 class="mb-2 text-[17px] font-extrabold tracking-tight text-stone-900">API access</h2>
 			<p class="mb-6 max-w-md text-[13px] leading-relaxed font-medium text-stone-500">
-				Use this personal API key for scripts, Shortcuts, and cron jobs. Choose whether it can only
-				read or also change and publish drafts. For security, it cannot manage social accounts,
-				change credentials, or generate new API keys. See the
+				Manage approval keys, multiple keys and the publishing kill switch on the Approvals page.
+				Use this draft key for scripts and Shortcuts. Choose whether it can only read or also change
+				drafts. Publishing requires a separate approval key. For security, it cannot manage social
+				accounts, change credentials, or generate new API keys. See the
 				<a
 					href="/api"
 					class="font-bold text-stone-900 underline underline-offset-2 hover:text-stone-700"
 					>API reference</a
 				> for full details.
+			</p>
+			<p class="mb-4">
+				<a class="underline" href="/approvals">Publishing approvals and scoped keys</a>
 			</p>
 			<fieldset class="mb-5 space-y-2" data-testid="api-key-scopes">
 				<legend class="mb-2 text-[12px] font-bold text-stone-700">New key permissions</legend>
@@ -1087,7 +1091,7 @@
 				<label class="flex cursor-pointer items-start gap-2 text-[13px] text-stone-700">
 					<input type="radio" name="api-key-scopes" value="read-write" bind:group={keyScopes} />
 					<span
-						><strong>Read + write</strong> — manage drafts and publish; includes read. (Default)</span
+						><strong>Draft</strong> — create and edit drafts; cannot approve or publish. (Default)</span
 					>
 				</label>
 			</fieldset>
@@ -1097,7 +1101,7 @@
 				<div class="space-y-4" data-testid="api-key-reveal">
 					<div class="rounded-xl border border-amber-200/50 bg-amber-50/50 p-4">
 						<p class="text-[13px] font-bold text-amber-900">
-							{#if keyJustRotated}New key — the old one stopped working.{:else}New key generated.{/if}
+							{#if keyJustRotated}New independent key created.{:else}New key generated.{/if}
 						</p>
 						<p class="mt-1 text-[13px] font-medium text-amber-700">
 							Copy it now: it is never shown again.
@@ -1142,7 +1146,9 @@
 							Created {keyDate(keyActive.createdAt)} · Last used {keyDate(keyActive.lastUsedAt)}
 						</p>
 						<p class="mt-1 text-[11px] font-medium text-stone-500">
-							Scope: {(keyActive.scopes ?? ['read', 'write']).includes('write')
+							Scope: {(keyActive.scopes ?? ['draft']).some(
+								(scope) => scope === 'draft' || scope === 'write'
+							)
 								? 'Read + write'
 								: 'Read-only'}
 						</p>
@@ -1155,7 +1161,7 @@
 						disabled={keyBusy}
 						class="rounded-full bg-stone-100 px-6 py-2.5 text-[13px] font-bold text-stone-700 transition-all hover:bg-stone-200 disabled:opacity-50"
 					>
-						Generate replacement
+						Generate another key
 					</button>
 					<button
 						type="button"
@@ -1844,11 +1850,11 @@
 <ConfirmDialog
 	open={keyConfirm !== null}
 	idPrefix="api-key-dialog"
-	title={keyConfirm === 'revoke' ? 'Revoke API key?' : 'Generate API key?'}
+	title={keyConfirm === 'revoke' ? 'Revoke all API keys?' : 'Generate API key?'}
 	body={keyConfirm === 'revoke'
 		? 'Scripts and automations using the current key stop working immediately.'
 		: keyActive
-			? 'Generating a replacement revokes the previous key immediately. The new key is shown once.'
+			? 'Creating another key preserves existing keys. Revoke individual keys on the Approvals page. The new key is shown once.'
 			: 'The new key is shown once. Copy it before closing.'}
 	confirmLabel={keyConfirm === 'revoke' ? 'Revoke' : 'Generate'}
 	cancelLabel="Keep"

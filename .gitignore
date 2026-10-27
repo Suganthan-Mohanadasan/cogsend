@@ -45,3 +45,7 @@ test-results
 # Written for one parity check and removed right after; see
 # scripts/check-release-parity.mjs.
 wrangler.parity-check.jsonc
+
+# Isolated staging instance values never belong in the fork.
+wrangler.staging.jsonc
+wrangler.promotion.jsonc

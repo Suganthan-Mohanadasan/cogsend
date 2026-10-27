@@ -1,3 +1,4 @@
+import './fixtures/provider-policy-isolation';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { createClient } from '@libsql/client';
@@ -146,13 +147,13 @@ describe('publishCallEstimate', () => {
 		expect(large).toBeGreaterThan(small);
 	});
 
-	it('counts a video as work that parks, so its size does not decide', () => {
+	it('accounts for approval checks without making video size decide the initial estimate', () => {
 		const video = (size: number) => ({ mime: 'video/mp4', size, storageKey: 'v.mp4' });
 		for (const platform of ['x', 'linkedin', 'bluesky', 'mastodon', 'threads']) {
 			const small = publishCallEstimate(platform, { text: 'hi', media: [video(1_000_000)] });
 			const huge = publishCallEstimate(platform, { text: 'hi', media: [video(300_000_000)] });
 			expect(huge, platform).toBe(small);
-			expect(huge + PUBLISH_RESERVE_CALLS, platform).toBeLessThan(50);
+			expect(huge + PUBLISH_RESERVE_CALLS, platform).toBeLessThan(80);
 		}
 	});
 });

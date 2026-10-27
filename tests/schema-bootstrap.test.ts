@@ -5,6 +5,7 @@ import {
 	ensureSchema,
 	ensureSchemaOnce,
 	INIT_SQL,
+	schemaStatements,
 	SCHEMA_FINGERPRINT,
 	SCHEMA_MARKER_KEY
 } from '#lib/server/db/init-sql.js';
@@ -257,10 +258,9 @@ describe('ensureSchema', () => {
 	});
 
 	it('keeps the bootstrap DDL statement-splittable', async () => {
-		// execStatements splits on `;`, so a stray semicolon inside a literal
-		// would break one statement into fragments.
+		// Triggers contain internal semicolons and must reach D1 as one statement.
 		expect(INIT_SQL).not.toMatch(/;\s*;/);
-		const statements = INIT_SQL.split(';').filter((s) => s.trim().length > 0);
+		const statements = schemaStatements(INIT_SQL);
 		expect(statements.length).toBeGreaterThan(10);
 		for (const statement of statements) {
 			expect(statement.trim().toUpperCase()).toMatch(/^(CREATE|INSERT|DROP|ALTER)/);
