@@ -14,7 +14,7 @@ the accounts it goes to, the text, its images or video, and when: **Will publish
 your own timezone and how far away it is, **Due** once that time has passed, **Started** while it is being sent, or **Published**, or when a draft was
 last edited. A video shows its cover and loads only when you press play.
 
-A post being sent right now is marked **Sending** and offers nothing to press until it is done; the list refreshes on its own every few seconds while anything is sending, and every half minute while a platform is processing a video. A send that stops answering — Cloudflare cut it off — is given up on after 7 minutes: the card leaves **Sending** with **Reschedule** and **Cancel** again, and the next tick retries it.
+A post being sent right now is marked **Sending** and offers nothing to press until it finishes. If a send stops answering after dispatch begins, its permanent dispatch record prevents another send; a visible retry or reschedule control cannot override that record. Reconcile the provider outcome first.
 
 What a card offers depends on its state:
 
@@ -33,11 +33,9 @@ retries only the accounts that failed.
 
 A post that published to every account can't be edited, since changing it would no longer match what went out. Opening it shows it read-only, with **Duplicate to post again** to start a copy, which is what **Post again** does from its card. A post that failed on some accounts stays editable, so it can be fixed and retried.
 
-A scheduled post that fails with something retryable — a rate limit, a platform
-timeout — is not failed yet: it backs off and tries again on its own, up to five
-attempts, and only then lands in **Failed**. A post whose video a platform is still processing is marked **Processing** instead: it publishes on its own once the platform is done, without spending any of the five attempts ([Video](composer.md#video)). **Retry** and **Reschedule** start the five attempts afresh; publishing or scheduling the same post to the same account again does not. The dashboard shows a banner when
-something has failed, and [failure emails](scheduling.md#failure-alerts-optional)
-can tell you the next morning.
+Every delivery requires approval of the exact content, account and time in `/approvals`. Editing a scheduled post or changing its time invalidates approval; an existing Scheduled card does not prove that it is approved. A missing or stale approval blocks delivery with `needs_reapproval`.
+
+Retries before provider dispatch still require matching approval. Once dispatch begins, a timeout, partial thread or video-processing pause stays locked for reconciliation and is not automatically resent or resumed. Legacy attempted deliveries are quarantined as `legacy_reconciliation_required`; do not clear their dispatch records. See [Publishing behaviour](api.md#publishing-behaviour). The dashboard and optional [failure emails](scheduling.md#failure-alerts-optional) report failures.
 
 ## Insights
 

@@ -22,15 +22,15 @@ cannot reach anything except the tick (see [Scheduling](scheduling.md)).
 
 **Optional.**
 
-| Secret                                          | What it enables                                               |
-| ----------------------------------------------- | ------------------------------------------------------------- |
-| `API_TOKEN`                                     | a machine bearer for the API — prefer a personal key instead  |
-| `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` | LinkedIn ([OAuth apps](oauth-apps.md))                        |
-| `THREADS_APP_ID` / `THREADS_APP_SECRET`         | Threads                                                       |
-| `X_CLIENT_ID` / `X_CLIENT_SECRET`               | X                                                             |
-| `RESEND_API_KEY`, `NOTIFY_EMAIL`, `NOTIFY_FROM` | failure digests by email                                      |
-| `MEDIA_PUBLIC_BASE_URL`                         | serving Meta's crawler from a public media origin (see below) |
-| `SUBREQUEST_LIMIT`                              | publishing more per tick on a paid Workers plan (see below)   |
+| Secret                                          | What it enables                                                                            |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `API_TOKEN`                                     | draft-only API access and legacy internal scheduler authentication; cannot approve content |
+| `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` | LinkedIn ([OAuth apps](oauth-apps.md))                                                     |
+| `THREADS_APP_ID` / `THREADS_APP_SECRET`         | Threads                                                                                    |
+| `X_CLIENT_ID` / `X_CLIENT_SECRET`               | X                                                                                          |
+| `RESEND_API_KEY`, `NOTIFY_EMAIL`, `NOTIFY_FROM` | failure digests by email                                                                   |
+| `MEDIA_PUBLIC_BASE_URL`                         | serving Meta's crawler from a public media origin (see below)                              |
+| `SUBREQUEST_LIMIT`                              | publishing more per tick on a paid Workers plan (see below)                                |
 
 The OAuth client ids and secrets can also be entered in the accounts dialog instead, where they are stored in D1, encrypted with `APP_ENCRYPTION_KEY`; a Worker secret, when set, takes precedence over the dialog's value ([OAuth apps](oauth-apps.md)).
 
@@ -61,6 +61,16 @@ Add → **Secret**, then **Deploy** to apply it.
 
 The login is not one of these secrets. `npm run setup` writes the account into D1
 — see [The login](#the-login) below.
+
+## Publishing controls
+
+Open `/approvals` from Settings to manage scoped keys, review payloads, inspect the latest 100 audit events and halt publishing. Only a verified browser session can manage keys or change the database kill switch. Separate `draft` keys from `approve_schedule` keys; a drafting client must not also hold approval authority. See [API authentication](api.md#authentication).
+
+The database setting `app_settings.publishing_halted=true` stops publishing. Set `PUBLISHING_HALTED` to `1` in your gitignored deployment configuration's `vars` for an additional forced halt. `0`, `false` or `off` removes only the environment override; it cannot release a database halt. Keep both enabled during a migration or deployment validation. Database errors fail closed, and each outbound platform request checks the halt again. A request already sent cannot be recalled.
+
+`PUBLISHING_MODE=live` uses the real providers and is the default. `PUBLISHING_MODE=mock` is for an isolated test instance without social credentials; mock outcomes are not proof of real delivery. A production deployment being validated should remain in live mode with publishing halted and scheduler sources disabled, as described in [Scheduling](scheduling.md#approvals-and-halted-publishing).
+
+Database halt changes are audited atomically. Environment changes are audited when the app first observes them. `/api/publishing` reports the effective halt, mode and recent audit events; API keys can read it but cannot change the halt.
 
 ## Naming your instance
 

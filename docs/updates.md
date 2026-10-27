@@ -1,5 +1,15 @@
 # Updating
 
+## Updating this approval-gate fork
+
+Deploy this fork only from its reviewed source. Upstream in-app updates, signed release bundles and the upstream deploy repository replace the custom approval gate; do not use them for this fork. `release.json` marks this change as a manual schema-changing update. The remaining update methods on this page describe upstream installations.
+
+Before promotion, export the production D1 database, record its Time Travel bookmark and current Worker version, and verify the export by restoring it into isolated local D1 state. Preserve the existing encryption key, provider secrets and R2 recovery material. Pause production writers and every scheduler source, take a frozen export, and rehearse the pending migrations locally against that export before applying them remotely.
+
+Use a gitignored deployment configuration with the existing production bindings, `PUBLISHING_MODE=live`, `PUBLISHING_HALTED=1` and no cron triggers. Apply the reviewed migrations, set the database publishing halt, and deploy the reviewed build. Verify login, connections, media, scheduled/queued counts, halt status and audit records while both halt controls remain on. Existing scheduled posts need explicit approval; legacy attempted deliveries require reconciliation. Follow [Scheduling](scheduling.md#approvals-and-halted-publishing) only after a separate decision to resume.
+
+A rollback across this migration needs the prior Worker version and the verified D1 recovery point. Disable public writers and every scheduler source first: the old Worker does not enforce the new halt. Preserve any new audit and dispatch records before restoring D1, and leave the restored instance isolated until its publishing controls have been reviewed. A code-only rollback does not undo a database migration.
+
 Settings → Instance and `npm run doctor` both say when a newer release is out, and so does a line in the profile menu, with a small dot on your avatar until you have seen it. There are three ways to install it: from Settings, with nothing but a Cloudflare API token; through your repository's GitHub Action, if you installed with the Deploy button; or from a checkout, the way you may have installed it.
 
 ## From Settings
