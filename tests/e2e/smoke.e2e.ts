@@ -526,6 +526,19 @@ test('publish asks for confirmation listing destinations', async () => {
 	// Hold the publish request: confirming must hand the post off and free
 	// the composer without waiting for the platform.
 	await page.route('**/api/drafts/*/publish', async (route) => {
+		const url = new URL(route.request().url());
+		const draftId = url.pathname.split('/')[3];
+		const body = route.request().postDataJSON();
+		for (const connectionId of body.connectionIds) {
+			const preview = await page.request
+				.get(`/api/drafts/${draftId}/approval?connectionId=${connectionId}`)
+				.then((r) => r.json());
+			const approved = await page.request.post(`/api/drafts/${draftId}/approval`, {
+				headers: { Origin: url.origin },
+				data: { connectionId, hash: preview.hash }
+			});
+			expect(approved.ok()).toBe(true);
+		}
 		await new Promise((resolve) => setTimeout(resolve, 1500));
 		await route.continue();
 	});
@@ -547,6 +560,24 @@ test('publish asks for confirmation listing destinations', async () => {
 	await expect(page.getByText('confirm flow probe').first()).toBeVisible({ timeout: 15000 });
 	await expect(page.getByTestId('publish-failure-dot')).toHaveCount(0);
 	await expect(page.getByTestId('publish-toast')).toHaveCount(0);
+});
+
+test('approval screen binds the visible payload and clears review when the time changes', async () => {
+	const items = await page.request.get('/api/drafts').then((r) => r.json());
+	const draft = items.drafts.find((d: { baseBody: string }) => d.baseBody === 'confirm flow probe');
+	const accounts = await page.request.get('/api/connections').then((r) => r.json());
+	await page.goto('/approvals');
+	await expect(
+		page.getByRole('heading', { name: 'Publishing approvals', exact: true })
+	).toBeVisible();
+	await page.getByLabel('Draft', { exact: true }).selectOption(draft.id);
+	await page.getByLabel('Destination', { exact: true }).selectOption(accounts.connections[0].id);
+	await page.getByRole('button', { name: 'Review final payload' }).click();
+	await expect(page.getByText('SHA-256:', { exact: false })).toBeVisible();
+	await page.getByRole('button', { name: 'Approve this exact payload' }).click();
+	await expect(page.getByRole('status').filter({ hasText: 'Approved.' })).toBeVisible();
+	await page.getByLabel('Scheduled time', { exact: false }).fill('2026-12-01T12:00');
+	await expect(page.getByRole('button', { name: 'Approve this exact payload' })).toHaveCount(0);
 });
 
 test('publishing to two destinations reports each one', async () => {
@@ -746,11 +777,11 @@ test('api key works logged out, stays out of key management', async () => {
 	expect(readOnlyWrite.result.isError).toBe(true);
 	expect(readOnlyWrite.result.structuredContent).toMatchObject({ status: 403 });
 
-	// Replace the key with read+write. Replacement must revoke the first key immediately.
+	// Independent draft keys preserve the read-only client.
 	await page.locator('input[name="api-key-scopes"][value="read-write"]').check();
 	await clickUntilVisible(
 		page,
-		page.getByRole('button', { name: 'Generate replacement' }),
+		page.getByRole('button', { name: 'Generate another key' }),
 		page.getByTestId('confirm-dialog-ok')
 	);
 	await page.getByTestId('confirm-dialog-ok').click();
@@ -762,8 +793,10 @@ test('api key works logged out, stays out of key management', async () => {
 	expect(
 		(await fetch(`${origin}/api/drafts`, { headers: { Authorization: `Bearer ${currentKey}` } }))
 			.status
-	).toBe(401);
-	expect((await mcpCall(currentKey)).status).toBe(401);
+	).toBe(200);
+	expect((await mcpCall(currentKey).then((r) => r.json())).result.structuredContent.status).toBe(
+		403
+	);
 	currentKey = replacementKey;
 	keyed = { Authorization: `Bearer ${currentKey}` };
 	const writeAllowed = await mcpCall(currentKey).then((response) => response.json());

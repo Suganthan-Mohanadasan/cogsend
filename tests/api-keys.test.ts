@@ -55,7 +55,7 @@ describe('api keys', () => {
 		expect(await verifyApiKey(db, null)).toBeNull();
 	});
 
-	it('rotates, verifies, and revokes with single-active semantics', async () => {
+	it('creates independent keys and revokes all explicitly', async () => {
 		expect(await getActiveApiKey(db, userId)).toBeNull();
 
 		const first = await rotateApiKey(db, userId);
@@ -71,14 +71,14 @@ describe('api keys', () => {
 		expect(stored?.keyHash).toBe(await hashApiKey(first.raw));
 		expect(stored?.prefix).toBe(first.prefix);
 
-		// Rotation revokes the old key and mints a working replacement.
+		// Creating a key preserves independently scoped clients.
 		const second = await rotateApiKey(db, userId);
 		expect(second.raw).not.toBe(first.raw);
-		expect(await verifyApiKey(db, first.raw)).toBeNull();
+		expect(await verifyApiKey(db, first.raw)).toMatchObject({ userId });
 		expect(await verifyApiKey(db, second.raw)).toMatchObject({ userId });
 
 		// Revoke kills the replacement; double revoke reports zero.
-		expect(await revokeApiKeys(db, userId)).toBe(1);
+		expect(await revokeApiKeys(db, userId)).toBe(2);
 		expect(await verifyApiKey(db, second.raw)).toBeNull();
 		expect(await getActiveApiKey(db, userId)).toBeNull();
 		expect(await revokeApiKeys(db, userId)).toBe(0);
@@ -97,7 +97,7 @@ describe('api keys', () => {
 		// Session GET with no key reports null; DELETE with no key is 404.
 		const empty = (await keyGET({ locals: sessionLocals(db, userId) } as never)) as Response;
 		expect(empty.status).toBe(200);
-		expect(await empty.json()).toEqual({ active: null });
+		expect(await empty.json()).toEqual({ active: null, keys: [] });
 		const noKey = (await keyDELETE({ locals: sessionLocals(db, userId) } as never)) as Response;
 		expect(noKey.status).toBe(404);
 
@@ -136,12 +136,10 @@ describe('api keys', () => {
 			userId,
 			scopes: ['read']
 		});
-		// Unknown entries are dropped; empty falls back to full access.
-		const fallback = (await (await json(['root'])).json()) as { scopes: string[] };
-		expect(fallback.scopes).toEqual(['read', 'write']);
+		expect((await json(['root'])).status).toBe(400);
 	});
 
-	it('replaces the active key sequentially with the selected scopes', async () => {
+	it('preserves independently scoped keys', async () => {
 		const create = (scopes: string[]) =>
 			keyPOST({
 				request: new Request('http://localhost/api/key', {
@@ -154,13 +152,13 @@ describe('api keys', () => {
 		const firstResponse = await create(['read']);
 		const first = (await firstResponse.json()) as { key: string; scopes: string[] };
 		expect(first.scopes).toEqual(['read']);
-		const secondResponse = await create(['read', 'write']);
+		const secondResponse = await create(['draft']);
 		const second = (await secondResponse.json()) as { key: string; scopes: string[] };
-		expect(second.scopes).toEqual(['read', 'write']);
-		expect(await verifyApiKey(db, first.key)).toBeNull();
+		expect(second.scopes).toEqual(['draft']);
+		expect(await verifyApiKey(db, first.key)).toMatchObject({ userId });
 		expect(await verifyApiKey(db, second.key)).toMatchObject({
 			userId,
-			scopes: ['read', 'write']
+			scopes: ['draft']
 		});
 	});
 

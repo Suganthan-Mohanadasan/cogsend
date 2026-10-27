@@ -1,3 +1,4 @@
+import './fixtures/provider-policy-isolation';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { newId, type AppDb } from '#lib/server/db/client.js';

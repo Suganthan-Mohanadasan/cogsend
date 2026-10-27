@@ -1,3 +1,12 @@
+import { ApiOperationError } from '#lib/server/api/operation-error.js';
+import {
+	audit,
+	assertPublishingEnabled,
+	assertDispatchAllowed,
+	checkTargetApproval,
+	checkBeforePlatformCall,
+	reserveDispatch
+} from '#lib/server/approval-gate.js';
 import { and, desc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { isLocalAppUrl } from '#lib/domain/app-url.js';
 import { safeHttpUrl } from '#lib/domain/links.js';
@@ -22,6 +31,7 @@ import {
 	drafts,
 	draftVariants,
 	publishAttempts,
+	publishDispatches,
 	publishTargets
 } from './db/schema';
 import type { AppEnv } from './env';
@@ -287,7 +297,9 @@ export function publishCallEstimate(platform: string, content: NormalizedPost): 
 	// Claim, connection, attempt row, resume lookup, success, attempt summary
 	// and draft status, a checkpoint per segment, and one more for whichever of
 	// a credential write, a lease renewal or a connection-status fix happens.
-	const database = 8 + segments.length;
+	// Approval snapshots, the durable dispatch reservation and audit writes
+	// add work that the old provider-only estimate did not account for.
+	const database = 38 + segments.length;
 	// One read per image, except where the platform is handed URLs instead
 	// (PlatformProvider.mediaByUrl): then publish reads nothing from storage.
 	let storage = images.length;
@@ -462,6 +474,19 @@ export async function publishTarget(
 		}
 	}
 
+	let gate: Awaited<ReturnType<typeof checkTargetApproval>>;
+	try {
+		await assertPublishingEnabled(db, env);
+		gate = await checkTargetApproval(db, env, targetId);
+		await assertDispatchAllowed(db, targetId);
+	} catch (e) {
+		const message = e instanceof ApiOperationError ? e.message : 'Publishing gate unavailable';
+		await audit(db, 'blocked', 'publisher', target.draftId, targetId, { reason: message });
+		return { status: 'failed', error: message };
+	}
+
+	const credentialState = { value: gate.snapshot.credentialsEncrypted };
+
 	const claimedGeneration = target.attemptCount + 1;
 	const staleBefore = new Date(now.getTime() - STALE_CLAIM_MS);
 	const claimed = await db
@@ -584,7 +609,10 @@ export async function publishTarget(
 		);
 		const meta = parseJson<ConnectionMeta>(conn.metaJson, {});
 		const provider = providerFor(conn);
-		const built = prebuilt ?? (await buildNormalizedPost(db, target.draftId, conn.platform));
+		const built =
+			gate.snapshot.content ??
+			prebuilt ??
+			(await buildNormalizedPost(db, target.draftId, conn.platform));
 		const content = provider.mediaByUrl ? built : await hydrateMedia(built, store);
 
 		const issues = provider.validate(content, {
@@ -594,9 +622,15 @@ export async function publishTarget(
 		if (issues.length) throw new Error(issues.map((i) => i.message).join('; '));
 
 		const baseFetch = options.fetchImpl ?? providerFetch;
-		const fetchImpl = options.budget ? countingFetch(baseFetch, options.budget) : baseFetch;
+		const countedFetch = options.budget ? countingFetch(baseFetch, options.budget) : baseFetch;
+		const fetchImpl: FetchLike = async (input, init) => {
+			await checkBeforePlatformCall(db, env, targetId, gate.approval, credentialState);
+			if (env.PUBLISHING_MODE === 'mock')
+				throw new Error('Mock publishing forbids outbound platform calls');
+			return countedFetch(input, init);
+		};
 		let workingCreds = creds;
-		if (provider.refreshIfNeeded) {
+		if (provider.refreshIfNeeded && env.PUBLISHING_MODE !== 'mock') {
 			workingCreds = await refreshWithStoredRetry(
 				db,
 				env,
@@ -622,7 +656,7 @@ export async function publishTarget(
 		// (Threads: the user id GET /me reports). Persisting makes the
 		// correction permanent instead of re-deriving it on every retry, and
 		// proves the token works — so a stale `expired` flag clears too.
-		if (provider.alignCredentials) {
+		if (provider.alignCredentials && env.PUBLISHING_MODE !== 'mock') {
 			const aligned = await provider.alignCredentials(workingCreds, meta, fetchImpl);
 			if (aligned) {
 				workingCreds = aligned;
@@ -654,32 +688,64 @@ export async function publishTarget(
 		);
 		let result: PublishResult;
 		try {
-			result = await provider.publish(
-				content,
-				workingCreds,
-				{ maxCharacters: meta.maxCharacters, handle: conn.handle || undefined },
-				fetchImpl,
-				{
-					resume: resumeFrom ?? undefined,
-					allowLocalHosts: isLocalAppUrl(env.APP_URL),
-					mediaUrlFor: (storageKey: string) => publicMediaUrlFor(env, storageKey),
-					mediaReader: mediaReaderFor(store),
-					callsLeft: () => options.budget?.remaining ?? Infinity,
-					timeLeft: () =>
-						options.deadline === undefined ? Infinity : options.deadline - Date.now(),
-					checkpoint,
-					// Deliberately not attempt-scoped: the whole point is that a
-					// retry of the same target and segment carries the same key, so
-					// a provider that saw the first request recognises the second.
-					idempotencyKey: (segmentIndex: number) => `${targetId}:${segmentIndex}`,
-					recordKey: (segmentIndex: number) =>
-						targetRecordKey(targetId, target.createdAt.getTime(), segmentIndex)
-				}
-			);
+			await checkBeforePlatformCall(db, env, targetId, gate.approval, credentialState);
+			// Rehash after uploads/refresh preparation, before handing over any publishing authority.
+			const verifiedGate = await checkTargetApproval(db, env, targetId);
+			if (
+				verifiedGate.approval.payloadHash !== gate.approval.payloadHash ||
+				verifiedGate.approval.revision !== gate.approval.revision
+			)
+				throw new ApiOperationError('needs_reapproval: prepared payload changed', 409);
+			await reserveDispatch(db, targetId, gate.approval);
+			await audit(db, 'publish_attempt', 'publisher', target.draftId, targetId, {
+				hash: gate.approval.payloadHash,
+				mock: env.PUBLISHING_MODE === 'mock'
+			});
+			result =
+				env.PUBLISHING_MODE === 'mock'
+					? {
+							remotePostId: `mock:${targetId}`,
+							remoteUrl: `https://example.invalid/mock/${targetId}`
+						}
+					: await provider.publish(
+							content,
+							workingCreds,
+							{ maxCharacters: meta.maxCharacters, handle: conn.handle || undefined },
+							fetchImpl,
+							{
+								resume: resumeFrom ?? undefined,
+								allowLocalHosts: isLocalAppUrl(env.APP_URL),
+								mediaUrlFor: (storageKey: string) => publicMediaUrlFor(env, storageKey),
+								mediaReader: mediaReaderFor(store),
+								callsLeft: () => options.budget?.remaining ?? Infinity,
+								timeLeft: () =>
+									options.deadline === undefined ? Infinity : options.deadline - Date.now(),
+								checkpoint,
+								// Deliberately not attempt-scoped: the whole point is that a
+								// retry of the same target and segment carries the same key, so
+								// a provider that saw the first request recognises the second.
+								idempotencyKey: (segmentIndex: number) => `${targetId}:${segmentIndex}`,
+								recordKey: (segmentIndex: number) =>
+									targetRecordKey(targetId, target.createdAt.getTime(), segmentIndex)
+							}
+						);
 		} finally {
 			clearInterval(heartbeat);
 		}
 
+		await db
+			.update(publishDispatches)
+			.set({
+				state: 'success',
+				remotePostId: result.remotePostId ?? null,
+				remoteUrl: safeHttpUrl(result.remoteUrl)
+			})
+			.where(eq(publishDispatches.targetId, targetId));
+		await audit(db, 'success', 'publisher', target.draftId, targetId, {
+			remotePostId: result.remotePostId ?? null,
+			remoteUrl: safeHttpUrl(result.remoteUrl),
+			mock: env.PUBLISHING_MODE === 'mock'
+		});
 		const published = await db
 			.update(publishTargets)
 			.set({
@@ -731,6 +797,10 @@ export async function publishTarget(
 		return { status: 'published', remotePostId: result.remotePostId };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
+		await audit(db, 'failure', 'publisher', target.draftId, targetId, { reason: message });
+		const dispatched = await first(
+			db.select().from(publishDispatches).where(eq(publishDispatches.targetId, targetId))
+		);
 		if (isAuthFailure(err, message)) {
 			await db
 				.update(connections)
@@ -767,8 +837,13 @@ export async function publishTarget(
 			claimedGeneration,
 			{
 				scheduledFor: target.scheduledFor,
-				retryable: parked?.expired ? false : isFailureRetryable(err, message),
-				park: parked && !parked.expired ? parked : null,
+				retryable:
+					dispatched || (err as { status?: number })?.status === 409
+						? false
+						: parked?.expired
+							? false
+							: isFailureRetryable(err, message),
+				park: !dispatched && parked && !parked.expired ? parked : null,
 				resume: resumeState.from,
 				now,
 				partial,

@@ -62,7 +62,7 @@ When every selected platform takes the video, nothing more is shown. When one do
 
 **COVER**, among the buttons on the video, picks the frame shown before it plays: scrub to a moment and **Use this frame**, or **Upload image**. Mastodon and LinkedIn show it; X, Threads and Bluesky choose their own frame. Until you pick one, the frame one second in is the cover, and it is also what **Posts** shows. **ALT** describes the video, as for an image.
 
-Platforms process a video before it can be posted, which can take minutes. CogSend uploads and waits for up to 20 seconds of the publish, then hands the rest to the next [tick](scheduling.md): the result says the platform "is processing the video" and that it publishes on its own, and **Posts** marks it **Processing**. A large video to X or LinkedIn is sent over several ticks the same way, carrying on from the last part sent. So closing or reloading the tab right after **Publish** loses nothing. Waiting uses none of the five attempts. A video still not ready after 45 minutes fails, and **Retry** starts it again.
+Platforms process a video before it can be posted. In this fork, a processing pause after provider dispatch begins remains locked for reconciliation; it does not automatically resume on later ticks. The same restriction applies to a partial upload or thread. Do not use Retry to force another dispatch. See [Publishing behaviour](api.md#publishing-behaviour).
 
 ## Quote posts on X
 
@@ -95,21 +95,10 @@ you fix it.
 
 ## Publish now, or schedule
 
-**Publish** hands the draft to every selected account and empties the composer at once, so you can start the next post while it goes out. The result arrives as a message wherever you are in the app, updated as each account answers ("Published to Mastodon · still sending to Threads") and ending with **Published to 3 destinations**, or which account failed and why, with a link to the post in **Posts**. A failure also puts a red dot on the menu at the top left, beside **Posts**, until you open it. By default Publish asks first, with a **Confirm Post** step; tick **Publish
-without asking next time** to skip it in this browser, and turn the question back
-on under **Settings → Preferences → Ask for confirmation before publishing**.
-**Cmd/Ctrl + Enter** publishes from the keyboard.
+Save the final draft, then open `/approvals` from Settings. Select a draft and destination, leave the time blank for manual publishing or choose its exact scheduled time, and press **Review final payload**. Check the returned text, thread/options, media, destination and time, then press **Approve this exact payload**. Repeat for each destination.
 
-The calendar button next to it schedules instead: either **Publish in** an offset
-of minutes, hours or days (one hour by default), or a **Specific Date** and time in
-your own timezone. Opening a scheduled post again with **Edit Post** starts on the time it is already set for, so confirming without a change keeps it. A scheduled post waits in **Posts → Scheduled** until a
-[tick](scheduling.md) publishes it. Scheduling goes to exactly the accounts ticked: untick one and schedule again, and its earlier time is cancelled.
+Approval and delivery are separate. For a scheduled delivery, use **Schedule approved post** after approval. For manual publishing, return to the unchanged draft and use **Publish**. The composer's confirmation dialog is an additional check; disabling it does not bypass server-side approval. Publishing also requires the [kill switch](configuration.md#publishing-controls) to be released.
 
-Opening a scheduled post shows, above the text, when and where it goes out. Edits save as you type, and what is saved when the time comes is what gets posted. Ticking or unticking accounts doesn't change the schedule by itself: the post says which accounts differ, and **Update schedule** applies them. **Change time** opens the schedule at its current time, and **Unschedule** turns the post back into a draft. **Publish now** sends it straight away instead of at its time, and any account you unticked is unscheduled, so it doesn't post later either. Deleting it with the bin means it won't be published. A few minutes before the time, the post says so; while it is being sent, editing pauses until the result is in. A post that went out on some accounts, failed on others or is retrying says so in one line, with a link to the details in **Posts**.
+Editing text, variants or media invalidates approval, even if you revert the edit. Changing the destination or time also requires fresh approval. A scheduled post retains its queue entry after an edit but cannot go out with stale approval. Switching a scheduled post to **Publish now** requires approval with no scheduled time.
 
-Once a post is scheduled or handed off to publish, the composer empties for the next one and the message links to it in **Posts**. A post you opened from **Posts** takes you back there instead. Publishing again to an account that already has the post sends nothing, and the message says so.
-
-If some accounts fail, the message says which and why, and **Posts → Failed** has a **Retry** for each. A scheduled post that hits a
-retryable failure (a rate limit, a platform timeout) tries again on its own,
-backing off from one minute up to thirty — five attempts, then it stops in
-Failed. See [Posts and Insights](posts.md).
+The result shows delivery outcomes per account in **Posts**. A failed or interrupted dispatch cannot be automatically resent; review [Publishing behaviour](api.md#publishing-behaviour) before attempting recovery. Existing scheduled posts are not approved automatically when this fork is installed.

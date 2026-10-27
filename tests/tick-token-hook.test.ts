@@ -65,8 +65,9 @@ describe('internal api authorization', () => {
 	async function request(
 		path: string,
 		bearer?: string
-	): Promise<{ bypassed: boolean; status: number; body: string }> {
+	): Promise<{ bypassed: boolean; status: number; body: string; scopes?: string[] | null }> {
 		let bypassed = false;
+		let scopes: string[] | null | undefined;
 		const url = new URL(`https://cogsend.example.com${path}`);
 		useWorkerEnv({
 			DB: binding,
@@ -100,12 +101,13 @@ describe('internal api authorization', () => {
 			},
 			// The hook is what we are testing: reaching this means the request was
 			// authorized and handed to the route.
-			resolve: async () => {
+			resolve: async (event: { locals: { apiKeyScopes?: string[] | null } }) => {
+				scopes = event.locals.apiKeyScopes;
 				bypassed = true;
 				return new Response('routed', { status: 200 });
 			}
 		} as never);
-		return { bypassed, status: response.status, body: await response.text() };
+		return { bypassed, status: response.status, body: await response.text(), scopes };
 	}
 
 	it('lets the Settings token reach the tick', async () => {
@@ -130,5 +132,11 @@ describe('internal api authorization', () => {
 		expect((await request('/api/internal/tick')).status).toBe(401);
 		expect((await request('/api/internal/tick', 'tick_' + 'f'.repeat(64))).status).toBe(401);
 		expect((await request('/api/internal/tick', 'wrong-token')).status).toBe(401);
+	});
+	it('limits the global API_TOKEN to draft scope on ordinary API routes', async () => {
+		await client.execute(
+			"INSERT INTO users (id,email,password_hash,created_at,updated_at) VALUES ('owner','owner@example.invalid','unused',1,1)"
+		);
+		expect((await request('/api/drafts', API_TOKEN)).scopes).toEqual(['draft']);
 	});
 });

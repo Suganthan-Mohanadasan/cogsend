@@ -233,11 +233,17 @@ export const handle: Handle = async ({ event, resolve }) => {
 			event.locals.user = asMachineUser(row);
 			event.locals.authMethod = 'bearer';
 			event.locals.authCredential = 'api_token';
+			event.locals.apiKeyScopes = ['draft'];
 		}
-	} else if (!event.locals.user || path === '/api/mcp') {
+	} else if (
+		!event.locals.user ||
+		path === '/api/mcp' ||
+		isApiKeyFormat(bearer) ||
+		event.request.headers.has('x-api-key')
+	) {
 		// Personal API key: `Authorization: Bearer cog_…` or the `X-API-Key`
-		// header (never query strings — they leak into logs). Ordinary routes
-		// preserve session precedence; MCP resolves its bearer key independently.
+		// header (never query strings — they leak into logs). An explicit key
+		// keeps its scopes even if the caller also has a browser session.
 		// Format-gated before any hashing or D1 query; only active hashes verify.
 		const apiKeyHeader = event.request.headers.get('x-api-key')?.trim() || null;
 		const candidate =
@@ -263,6 +269,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 				event.locals.authMethod = 'bearer';
 				event.locals.authCredential = 'personal_api_key';
 				event.locals.apiKeyScopes = verified.scopes;
+				event.locals.apiKeyId = verified.keyId;
 				// last_used_at is best-effort metadata: it is not worth delaying
 				// the response for.
 				waitUntil(touchApiKey(db, verified.keyId));

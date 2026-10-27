@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { newId } from '#lib/server/db/client.js';
 import { createTestDb } from '#lib/server/db/test.js';
-import { rotateApiKey } from '#lib/server/api-keys.js';
+import { rotateApiKey, revokeApiKeys } from '#lib/server/api-keys.js';
 import { users } from '#lib/server/db/schema.js';
 import { authorizeMcpRequest } from '#lib/server/mcp-auth.js';
 
@@ -75,6 +75,7 @@ describe('MCP authentication', () => {
 
 	it('rejects revoked keys and ignores query credentials', async () => {
 		const oldKey = rawKey;
+		await revokeApiKeys(db, userId);
 		rawKey = (await rotateApiKey(db, userId)).raw;
 		expect(await call({ Authorization: `Bearer ${oldKey}` })).toEqual({ ok: false, status: 401 });
 		const request = new Request(`https://cogsend.example/api/mcp?token=${rawKey}`, {

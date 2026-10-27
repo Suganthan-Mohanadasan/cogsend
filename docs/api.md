@@ -1,14 +1,10 @@
 # API
 
-The browser UI uses the `cog_session` cookie after TOTP. Scripts, Shortcuts, cron
-and [MCP clients](#mcp-server) use a personal API key instead — no login, no cookies. Manage it in
-**Settings → API access** (generate, rotate, revoke); the raw key is shown once
-and only its hash is stored. Worked examples for the common calls live in-app at
-`/api`.
+The browser UI uses the `cog_session` cookie after TOTP. Scripts, Shortcuts and [MCP clients](#mcp-server) use scoped personal API keys. Manage independent keys in `/approvals`; creating one does not revoke the others. The raw key is shown once and only its hash is stored. The in-app `/api` reference describes request formats; the approval requirements below apply to every publishing route.
 
 ## Authentication
 
-Export your instance URL and a key from **Settings → API access**:
+Export your instance URL and the appropriate key:
 
 ```sh
 export APP_URL=https://cogsend.<account>.workers.dev
@@ -17,22 +13,31 @@ export COGSEND_API_KEY=cog_...
 curl -s "$APP_URL/api/connections" -H "Authorization: Bearer $COGSEND_API_KEY"
 ```
 
-`X-API-Key` works as an alternative header; never put the key in the URL. The key
-acts as you on drafts, variants, media, publish, schedule, queue, settings, and
-reads — but it can never connect, re-verify or disconnect accounts, or create,
-rotate, or revoke keys (those stay in the browser session). The global
-`API_TOKEN` Worker secret still works as a bearer for backwards compatibility, on
-exactly the same routes as a personal key — it cannot reach the session-only ones
-either — but prefer the personal key for scripts: it is revocable without
-touching the scheduler.
+`X-API-Key` works as an alternative header; never put a key in the URL. Use separate keys for drafting and approval:
 
-A key is either **Read-only** or **Read + write**, chosen when you generate it. Read-only can list and fetch connections, drafts and the queue and validate text; anything that creates, changes, deletes, schedules or publishes needs Read + write.
+| Scope              | Authority                                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `read`             | Read state and preview approval payloads; cannot change content or approve delivery.                            |
+| `draft`            | Read, create and edit drafts, variants and media; cannot approve, schedule, publish or retry.                   |
+| `approve_schedule` | Read and approve exact payloads, then schedule, publish or retry through the approval gate; cannot edit drafts. |
+
+No API key can manage keys, change the publishing halt, or connect, re-verify or disconnect accounts. Those actions require a verified browser session. Session-only `GET /api/key` lists keys; `POST /api/key` creates a key with `scopes`, and `DELETE /api/key?id=KEY_ID` revokes just that key. Omitting `id` revokes all keys.
+
+Legacy `write` keys have draft authority only. Missing legacy scopes default to `draft`; malformed scopes fail closed. The global `API_TOKEN` has draft-only access on ordinary API routes and is rejected by MCP. Its existing internal scheduler role can process already approved due deliveries, but cannot approve content or bypass publishing checks.
+
+## Approval workflow
+
+Approval is specific to one destination and the exact UTC scheduled time, or `null` for manual publishing. `GET /api/drafts/:id/approval?connectionId=CONN_ID&scheduledFor=ISO_TIME` returns the canonical payload and its SHA-256 hash. Omit `scheduledFor` for manual publishing. Review the returned platform, account identity, text/thread/options, media and time before submitting the hash.
+
+`POST /api/drafts/:id/approval` requires `connectionId`, the reviewed `hash` and the same `scheduledFor`. A stale or incorrect hash returns 409. The server records the authenticated user or API-key ID, review channel, revision, hashes and time. Approval does not itself publish or schedule anything.
+
+Draft, variant and media edits invalidate approval, including edits that are later reverted. Destination or time changes also require fresh approval. The publisher rehashes before dispatch and checks again before each outbound platform request. A mismatch blocks delivery with `needs_reapproval`. Use `/approvals` for the browser workflow and recent audit events.
 
 ## MCP server
 
-`<your instance>/api/mcp` is a Model Context Protocol server, so agents such as Claude Code and Codex can work with drafts and the publish queue. It is stateless Streamable HTTP over `POST`. It accepts only a personal key as `Authorization: Bearer`: no cookies, no `X-API-Key` and no `API_TOKEN`.
+`<your instance>/api/mcp` is a stateless Streamable HTTP Model Context Protocol server over `POST`. It accepts only a personal key as `Authorization: Bearer`: no cookies, `X-API-Key` or `API_TOKEN`.
 
-For Claude Code, add this to `.mcp.json` and set `COGSEND_API_KEY` in your environment:
+For Claude Code, add this to `.mcp.json` and give the drafting client a `draft` key through `COGSEND_API_KEY`:
 
 ```json
 {
@@ -46,30 +51,51 @@ For Claude Code, add this to `.mcp.json` and set `COGSEND_API_KEY` in your envir
 }
 ```
 
-**Settings → API access** shows this with your own URL, plus the Codex version.
+| Tools                                                                                                          | Key needed         |
+| -------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `list_connections`, `list_drafts`, `get_draft`, `list_queue`, `validate_post`, `preview_approval`              | Any readable scope |
+| `create_draft`, `update_draft`, `duplicate_draft`, `delete_draft`, `set_draft_variant`, `delete_draft_variant` | `draft`            |
+| `approve_draft`, `schedule_draft`, `reschedule_delivery`, `cancel_delivery`, `publish_draft`, `retry_delivery` | `approve_schedule` |
 
-| Tools                                                                                                                                                                                                         | Key needed   |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| `list_connections`, `list_drafts`, `get_draft`, `list_queue`, `validate_post`                                                                                                                                 | Read-only    |
-| `create_draft`, `update_draft`, `duplicate_draft`, `delete_draft`, `set_draft_variant`, `delete_draft_variant`, `schedule_draft`, `reschedule_delivery`, `cancel_delivery`, `publish_draft`, `retry_delivery` | Read + write |
-
-`publish_draft` and `retry_delivery` post to real accounts. Set your client to ask before it runs tools that write or publish; CogSend marks them, but only the client can stop and ask. Media, settings, insights and account management are not exposed. If Cloudflare Access protects the instance, see [Cloudflare Access](access.md#the-paths-it-has-to-let-through).
+Keep the approval key with the reviewer, separate from the drafting client. Publishing tools can reach real accounts only with a matching approval and publishing enabled. Client confirmation settings are additional protection; the server enforces approval independently. Media, settings, insights and account management are not exposed through MCP. For protected instances, see [Cloudflare Access](access.md#the-paths-it-has-to-let-through).
 
 ## Examples
 
-Create a draft, then publish it to one account:
+Create a draft with a draft key:
 
 ```sh
 curl -s -X POST "$APP_URL/api/drafts" \
-  -H "Authorization: Bearer $COGSEND_API_KEY" \
+  -H "Authorization: Bearer $COGSEND_DRAFT_KEY" \
   -H "Content-Type: application/json" \
   -d '{"title":"Hello","baseBody":"from a script"}'
+```
 
+In a separate reviewer context, fetch and inspect the manual-publishing payload:
+
+```sh
+curl -s "$APP_URL/api/drafts/DRAFT_ID/approval?connectionId=CONN_ID" \
+  -H "Authorization: Bearer $COGSEND_APPROVAL_KEY"
+```
+
+Only after reviewing that exact payload, submit its hash:
+
+```sh
+curl -s -X POST "$APP_URL/api/drafts/DRAFT_ID/approval" \
+  -H "Authorization: Bearer $COGSEND_APPROVAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"connectionId":"CONN_ID","hash":"REVIEWED_SHA256_HASH","scheduledFor":null}'
+```
+
+Publishing is a separate, deliberate action and requires both halt controls to be released:
+
+```sh
 curl -s -X POST "$APP_URL/api/drafts/DRAFT_ID/publish" \
-  -H "Authorization: Bearer $COGSEND_API_KEY" \
+  -H "Authorization: Bearer $COGSEND_APPROVAL_KEY" \
   -H "Content-Type: application/json" \
   -d '{"connectionIds":["CONN_ID"]}'
 ```
+
+For scheduling, review and approve the exact `scheduledFor` timestamp first, then pass the identical timestamp to the scheduling endpoint. Changing from scheduled to manual publishing requires approval with `scheduledFor: null`.
 
 ## Media
 
@@ -92,12 +118,12 @@ A video's `meta` holds what the server read from it (`durationMs`, `videoCodec`,
 
 ## Publishing behaviour
 
-- Publishing the same draft and account twice reuses the row. Already-published accounts come back `skipped: true`.
-- A publish that is still running on that account answers **409** with `inFlight` (the connection ids) — wait, then try again.
-- A retried segment carries the same platform-side id as its first attempt, so a thread that failed half-way does not double-post what already went out (Mastodon remembers the id for an hour, Bluesky refuses to overwrite the record).
-- X, LinkedIn and Threads take no such id. When one of them gets the request that creates a post but no answer comes back, the target fails with an error saying the post "may have been published" and is never retried automatically: check the platform first, and only then retry.
-- Sending several connection ids in one request publishes them in order. The first always runs; each further one runs only if it fits in what is left of the request's Cloudflare call budget (50 on Workers Free, see `SUBREQUEST_LIMIT` in [Configuration](configuration.md#secrets)). The ones that don't fit come back with `status: "pending"` and `deferred: true`. They are already due and go out on the next scheduler tick, so don't send them again. For the fastest results, send one connection id per request. If a request still runs out, it answers `200` with `stopped: true`, `stoppedError`, and the results it did get — the accounts after the last entry were not completed and are still due (a target the failure interrupted is left retryable, never `publishing`), so send those ids again. A `500` means nothing was recorded; check the draft before retrying.
-- Do not call `/api/targets/:id/retry` unless the row is `failed` (or a stuck `publishing` older than 7 minutes).
-- Schedule returns **409** if that account is already published or still publishing. Check `error`, `alreadyPublished`, and `inFlight` instead of treating HTTP 200 as "it was scheduled".
-- Schedule adds the accounts it is sent and leaves the draft's other accounts as they are. Send `"cancelOthers": true` to make the list the whole set: the draft's other accounts that are still waiting (`scheduled` or `pending`, not yet being sent) are cancelled, and the response lists their connection ids in `cancelled`.
-- Once every account of a draft is published (cancelled ones aside), changing its text, variants or media answers **409** with `Already published — duplicate it to post again`. `POST /api/drafts/:id/duplicate` copies it into a new draft. A draft that failed on some accounts stays editable.
+- Both the database kill switch and the environment override must permit publishing. See [Publishing controls](configuration.md#publishing-controls).
+- Every manual, scheduled, bulk, retry and MCP delivery needs a matching approval. Existing scheduled posts receive no automatic approval during migration.
+- An atomic reservation blocks the same logical content and account within 24 hours, even with another draft ID or time. A permanent dispatch record prevents a target from entering the provider twice. Repeating a successful delivery returns its recorded outcome.
+- Once provider dispatch starts, a timeout, lost response, Worker crash, partial thread or video-processing pause remains locked for reconciliation. The fork does not automatically resend or resume it, even if retrying might be safe. This is at-most-once dispatch, not a claim of distributed exactly-once delivery.
+- A retry before dispatch still requires matching approval. Changing its time requires a new approval. Do not clear dispatch records to force a retry; there is no automatic reconciliation unlock in this phase.
+- Migration `0019` quarantines targets with prior attempts or remote IDs as `legacy_reconciliation_required`. Reconcile uncertain outcomes before considering replacement content.
+- Schedule returns 409 for an already published or in-flight destination. It adds the specified accounts; `cancelOthers: true` cancels other waiting destinations. Read the response before treating an action as successful.
+- A draft published to every account is read-only. Duplicating it creates a new draft, which still needs approval and remains subject to the duplicate window.
+- `publish_audit` records content changes, approvals, scheduling, attempts, successes with platform IDs/URLs, failures, retries, blocked sends and halt changes. Audit and dispatch records survive deletion of draft or target rows. `/approvals` and authenticated `GET /api/publishing` show the latest 100 audit events.

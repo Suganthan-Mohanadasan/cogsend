@@ -1,13 +1,21 @@
 # Scheduling
 
-Scheduled posts live in D1 and are published by a _tick_: either the Worker's own
-cron trigger, which needs no setup, or anything that can POST to the tick
-endpoint.
+Scheduled posts live in D1 and are considered for publishing by a _tick_: either the Worker's own cron trigger or an authenticated caller of the tick endpoint. Every delivery requires approval of its exact payload, destination and scheduled time, and publishing must be enabled.
+
+## Approvals and halted publishing
+
+At `/approvals`, select a draft, destination and exact time, then choose **Review final payload** and **Approve this exact payload**. **Schedule approved post** is a separate action. Repeat for each destination. Changing the draft, variant, media, destination or time requires fresh approval; editing and reverting the content still invalidates the old approval. Existing scheduled posts are not approved automatically during an upgrade.
+
+Keep both `PUBLISHING_HALTED=1` and `app_settings.publishing_halted=true` enabled while validating a deployment. Disable cron triggers, external tick pingers and queue consumers as well, so validation does not process or change waiting deliveries. The old, ungated Worker does not understand either halt setting: pause its writers and scheduler sources before taking the frozen backup and migrating.
+
+After a separate decision to resume, review the exact payloads and times, approve each destination, and restore the intended scheduler source while both halt controls remain on. Set the environment override to `0` and deploy the reviewed configuration, verify the database halt still reports true, then deliberately release the database halt in `/approvals`. Any approved overdue delivery may become eligible immediately. Never release a halt as a way to test it.
+
+A missing or stale approval blocks delivery with `needs_reapproval`. A dispatch that has already begun remains locked after a crash, timeout, partial thread or video-processing pause; it cannot be automatically retried. Migration quarantines legacy attempted deliveries as `legacy_reconciliation_required`. Reconcile their provider outcome before considering replacement content; do not clear the dispatch ledger. See [Publishing behaviour](api.md#publishing-behaviour).
 
 ## How a tick works
 
 - The cron trigger ships enabled in `wrangler.jsonc` (`"triggers"`) and runs every minute.
-- A tick always publishes the oldest due post, then starts each further one only if its estimated calls still fit in the request's Cloudflare budget. That budget covers every D1 statement, R2 read and call to a platform, and is 50 on the Workers Free plan. Anything that doesn't fit stays due for the next tick, so on Free a backlog drains a post or two a minute. This stops a request from running out half-way through a post the platform already accepted, which would publish it twice. On a paid plan, set `SUBREQUEST_LIMIT` (see [Configuration](configuration.md#secrets)) and a tick publishes everything due at once.
+- A tick considers the oldest due post first and starts further deliveries only while its estimated calls fit the request's Cloudflare budget. Each delivery still passes the approval, halt, duplicate and dispatch checks. Anything that does not fit stays due for a later tick. `SUBREQUEST_LIMIT` in [Configuration](configuration.md#secrets) sets that budget for the instance's plan.
 - Ticks are idempotent: a duplicated or delayed caller is harmless.
 - A tick that runs out of the plan's CPU budget also leaves the rest due for the next minute.
 

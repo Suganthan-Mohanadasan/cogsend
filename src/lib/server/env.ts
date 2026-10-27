@@ -21,6 +21,8 @@ const envSchema = z.object({
 	// Derived from APP_ENCRYPTION_KEY when unset. Set it when something outside
 	// the Worker has to hold it, such as an external tick pinger.
 	SCHEDULER_SECRET: z.string().min(32).optional(),
+	PUBLISHING_HALTED: z.string().optional(),
+	PUBLISHING_MODE: z.enum(['live', 'mock']).optional(),
 	API_TOKEN: z.string().min(16).optional(),
 	// Local-dev convenience: skip the 2FA enrollment/verify dance. Honored only
 	// when the resolved URL is localhost (see readAppEnv) so it can never leak
@@ -88,6 +90,19 @@ export function readAppEnv(
 	// `wrangler dev` serves a production build on a developer's machine; an
 	// unset or unparseable value is not local either, which is what keeps
 	// "deploy, then open it" safe.
+	if (
+		parsed.data.PUBLISHING_MODE === 'mock' &&
+		[
+			'LINKEDIN_CLIENT_ID',
+			'LINKEDIN_CLIENT_SECRET',
+			'X_CLIENT_ID',
+			'X_CLIENT_SECRET',
+			'THREADS_APP_ID',
+			'THREADS_APP_SECRET'
+		].some((key) => source[key])
+	) {
+		throw new Error('Mock publishing requires an environment without social credentials');
+	}
 	const localInstance = isLocalAppUrl(parsed.data.APP_URL);
 	if (!localInstance) {
 		for (const key of ['APP_ENCRYPTION_KEY', 'AUTH_SECRET'] as const) {
@@ -145,6 +160,8 @@ export async function envFromPlatform(
 		APP_ENCRYPTION_KEY: asString(platformEnv?.APP_ENCRYPTION_KEY) ?? fallback.APP_ENCRYPTION_KEY,
 		AUTH_SECRET: asString(platformEnv?.AUTH_SECRET) ?? fallback.AUTH_SECRET,
 		SCHEDULER_SECRET: asString(platformEnv?.SCHEDULER_SECRET) ?? fallback.SCHEDULER_SECRET,
+		PUBLISHING_HALTED: asString(platformEnv?.PUBLISHING_HALTED) ?? fallback.PUBLISHING_HALTED,
+		PUBLISHING_MODE: asString(platformEnv?.PUBLISHING_MODE) ?? fallback.PUBLISHING_MODE,
 		API_TOKEN: asString(platformEnv?.API_TOKEN) ?? fallback.API_TOKEN,
 		LINKEDIN_CLIENT_ID: asString(platformEnv?.LINKEDIN_CLIENT_ID) ?? fallback.LINKEDIN_CLIENT_ID,
 		LINKEDIN_CLIENT_SECRET:

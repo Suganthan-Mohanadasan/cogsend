@@ -1,4 +1,11 @@
-import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import {
+	index,
+	integer,
+	primaryKey,
+	sqliteTable,
+	text,
+	uniqueIndex
+} from 'drizzle-orm/sqlite-core';
 
 export const users = sqliteTable(
 	'users',
@@ -268,3 +275,61 @@ export const appSettings = sqliteTable('app_settings', {
 	value: text('value').notNull(),
 	updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull()
 });
+
+export const draftRevisions = sqliteTable('draft_revisions', {
+	draftId: text('draft_id').primaryKey(),
+	revision: integer('revision').notNull().default(0)
+});
+export const postApprovals = sqliteTable(
+	'post_approvals',
+	{
+		id: text('id').primaryKey(),
+		draftId: text('draft_id').notNull(),
+		connectionId: text('connection_id').notNull(),
+		userId: text('user_id').notNull(),
+		actor: text('actor').notNull(),
+		channel: text('channel').notNull(),
+		payloadHash: text('payload_hash').notNull(),
+		contentHash: text('content_hash').notNull(),
+		accountHash: text('account_hash').notNull(),
+		scheduledFor: integer('scheduled_for', { mode: 'timestamp_ms' }),
+		revision: integer('revision').notNull(),
+		state: text('state').notNull().default('approved'),
+		approvedAt: integer('approved_at', { mode: 'timestamp_ms' }).notNull()
+	},
+	(t) => [index('post_approvals_lookup_idx').on(t.draftId, t.connectionId, t.state)]
+);
+export const publishAudit = sqliteTable(
+	'publish_audit',
+	{
+		id: text('id').primaryKey(),
+		event: text('event').notNull(),
+		actor: text('actor').notNull(),
+		draftId: text('draft_id'),
+		targetId: text('target_id'),
+		detail: text('detail').notNull().default('{}'),
+		createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull()
+	},
+	(t) => [index('publish_audit_created_idx').on(t.createdAt)]
+);
+export const publishDispatches = sqliteTable('publish_dispatches', {
+	targetId: text('target_id').primaryKey(),
+	approvalId: text('approval_id').notNull(),
+	accountHash: text('account_hash').notNull(),
+	contentHash: text('content_hash').notNull(),
+	state: text('state').notNull().default('uncertain'),
+	startedAt: integer('started_at', { mode: 'timestamp_ms' }).notNull(),
+	remotePostId: text('remote_post_id'),
+	remoteUrl: text('remote_url')
+});
+
+export const publishDedup = sqliteTable(
+	'publish_dedup',
+	{
+		accountHash: text('account_hash').notNull(),
+		contentHash: text('content_hash').notNull(),
+		targetId: text('target_id').notNull(),
+		reservedAt: integer('reserved_at', { mode: 'timestamp_ms' }).notNull()
+	},
+	(t) => [primaryKey({ columns: [t.accountHash, t.contentHash] })]
+);

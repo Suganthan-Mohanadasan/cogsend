@@ -1,5 +1,7 @@
 # Deploying CogSend
 
+This fork includes a custom approval gate. The upstream Deploy to Cloudflare button and release artifacts described below do not include these controls. Deploy the fork from reviewed source and follow [Updating this approval-gate fork](updates.md#updating-this-approval-gate-fork), including the backup, migration rehearsal and publishing halt, when promoting an existing instance.
+
 Two ways to deploy. The **Deploy to Cloudflare** button is the recommended one: nothing to install, and updates later come through GitHub with no token. Your terminal with `npm run setup` is for changing the code, or for deploying without a GitHub or GitLab account. Both end the same way, with a Worker, a D1 database, an R2 bucket and your account ([Updating](updates.md)).
 
 Everything here assumes a Cloudflare account with Workers, D1 and R2 available;

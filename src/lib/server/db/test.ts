@@ -8,7 +8,7 @@ import { hashPassword } from '../crypto';
 import { memoryMediaStore } from '../media';
 import { users } from './schema';
 import * as schema from './schema';
-import type { AppDb } from './client';
+import { createD1Db, type AppDb } from './client';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -63,7 +63,7 @@ export interface TestDb {
 	reset: () => void;
 }
 
-export async function createTestDb(): Promise<TestDb> {
+export async function createTestDb(driver: 'libsql' | 'd1' = 'libsql'): Promise<TestDb> {
 	const client = createClient({ url: ':memory:' });
 	const dir = join(here, '../../../../drizzle');
 	const files = readdirSync(dir)
@@ -99,7 +99,36 @@ export async function createTestDb(): Promise<TestDb> {
 		lastBatchSql = (stmts as Array<{ sql?: string }>).map((s) => s?.sql ?? '');
 		return batchOrig(stmts as never);
 	}) as typeof batchOrig;
-	const db = drizzle(client, { schema }) as unknown as AppDb;
+	const d1Result = (result: Awaited<ReturnType<typeof client.execute>>) => ({
+		success: true,
+		results: result.rows,
+		meta: { changes: result.rowsAffected }
+	});
+	const prepare = (query: string, args: unknown[] = []): unknown => ({
+		query,
+		args,
+		bind: (...values: unknown[]) => prepare(query, values),
+		run: async () => d1Result(await client.execute({ sql: query, args: args as never })),
+		all: async () => d1Result(await client.execute({ sql: query, args: args as never })),
+		first: async () => (await client.execute({ sql: query, args: args as never })).rows[0] ?? null,
+		raw: async () =>
+			(await client.execute({ sql: query, args: args as never })).rows.map((row) =>
+				Object.values(row)
+			)
+	});
+	const binding = {
+		prepare,
+		exec: (query: string) => client.executeMultiple(query),
+		batch: async (statements: { query: string; args: unknown[] }[]) =>
+			(
+				await client.batch(
+					statements.map((statement) => ({ sql: statement.query, args: statement.args as never }))
+				)
+			).map(d1Result)
+	} as unknown as D1Database;
+	const db = (driver === 'd1'
+		? createD1Db(binding)
+		: drizzle(client, { schema })) as unknown as AppDb;
 	return {
 		db,
 		close: () => client.close(),

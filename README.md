@@ -6,7 +6,7 @@
 
 <p align="center">
   Self-hosted social scheduler for Mastodon, Bluesky, LinkedIn, Threads and X.<br />
-  Write a draft, customize it per platform, then publish it now or schedule it.
+  Write a draft, customise it per platform, approve the exact payload, then publish or schedule it.
 </p>
 
 <p align="center">
@@ -44,19 +44,24 @@ Hosted schedulers usually charge per channel and keep your posts and tokens on t
 - **Thread editor**: one card per post, images with alt text, and a tab per platform for tailored versions
 - **Video**: one per post on every platform, converted in your browser when a platform needs it, with a cover you pick
 - **Auto-split**: paste a long draft and it becomes a thread that fits every platform you picked
-- **Publish or schedule**: see results per account, then cancel, reschedule or retry from Posts
-- **Automatic retries**: temporary failures retry on their own, up to five attempts
+- **Approval before delivery**: review the exact content, destination and time at `/approvals`; edits require fresh approval
+- **Publish or schedule**: approved deliveries show results per account; retries after dispatch require reconciliation
+- **Publishing halt and audit**: a database kill switch and an environment override stop outbound calls, with recorded approvals and delivery outcomes
 - **Insights**: published against failed over 7, 30 or 90 days, and why posts failed
 - **Link previews**: cards for URLs in a post
 - **Secure by default**: encrypted credentials and 2FA on the admin account
-- **AI agents (MCP)**: connect Claude Code, Codex or any MCP client to draft, schedule and publish with your API key
-- **API access**: a personal key for scripts and Shortcuts, read-only or read-write
+- **AI agents (MCP)**: give drafting clients a draft key and keep approval authority separate
+- **API access**: independent, revocable `draft`, `approve_schedule` and `read` keys for scripts and Shortcuts
+
+This fork favours at-most-once dispatch: after a provider request begins, a timeout, partial thread or video-processing pause stays locked for reconciliation instead of being automatically resent. Existing attempted deliveries are quarantined during migration. See [Publishing behaviour](docs/api.md#publishing-behaviour).
 
 ## What it costs
 
 A single-admin instance normally stays within Cloudflare's free plans, though R2 needs a payment method on file. The Workers free plan allows five cron triggers per account, shared with every Worker you run; if none are left, an external pinger drives the schedule instead ([Scheduling](docs/scheduling.md#pick-one-tick)). On the free plan a backlog of due posts drains a post or two a minute, and a paid Workers plan publishes everything due at once.
 
 ## Install
+
+This checkout includes a custom approval gate. The upstream Deploy to Cloudflare button and release bundles below do not include it. To retain these controls, install and update from a reviewed checkout of your fork; see [Updating this approval-gate fork](docs/updates.md#updating-this-approval-gate-fork).
 
 ### One click (recommended)
 
@@ -84,6 +89,8 @@ cd cogsend && npm install && npm run setup
 Next, [connect your accounts](docs/accounts.md). Mastodon and Bluesky work straight away; LinkedIn, Threads and X need an [OAuth app](docs/oauth-apps.md) first, which the accounts dialog walks you through (or hands to a browser agent), or you can connect them through [Zernio](docs/zernio.md).
 
 ## Updating
+
+For this fork, follow [Updating this approval-gate fork](docs/updates.md#updating-this-approval-gate-fork). Upstream in-app updates, signed release bundles and the upstream deploy repository replace the custom approval gate. The following update paths describe upstream installations.
 
 Settings → Instance and a dot on your avatar say when a newer release is out.
 

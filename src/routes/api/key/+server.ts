@@ -1,6 +1,12 @@
 import type { RequestHandler } from './$types';
 import { parseApiScopes } from '#lib/domain/api-scopes.js';
-import { getActiveApiKey, revokeApiKeys, rotateApiKey } from '#lib/server/api-keys.js';
+import {
+	getActiveApiKey,
+	listApiKeys,
+	revokeApiKey,
+	revokeApiKeys,
+	rotateApiKey
+} from '#lib/server/api-keys.js';
 import { fail, handleError, ok } from '#lib/server/http.js';
 import { requireSession } from '#lib/server/require.js';
 
@@ -30,7 +36,13 @@ export const GET: RequestHandler = async ({ locals }) => {
 	try {
 		const user = requireSession(locals.user, locals.authMethod);
 		const active = await getActiveApiKey(locals.db, user.id);
-		return ok({ active: metadataOf(active) });
+		return ok({
+			active: metadataOf(active),
+			keys: (await listApiKeys(locals.db, user.id)).map((k) => ({
+				...k,
+				scopes: parseApiScopes(k.scopes)
+			}))
+		});
 	} catch (err) {
 		return handleError(err);
 	}
@@ -39,11 +51,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 export const POST: RequestHandler = async ({ request, locals }) => {
 	try {
 		const user = requireSession(locals.user, locals.authMethod);
-		// No body means "the default key" (all scopes), which is what the browser
-		// sends when it does not pick a scope. A body that *is* there has to
-		// parse: `normalizeApiScopes` reads a missing list as all scopes, so a
-		// truncated request meant to mint a read-only key used to return 201 with
-		// a write key.
+		// Malformed requests must not silently mint a key with broader permissions.
 		const text = (await request?.text().catch(() => '')) ?? '';
 		let body: unknown = {};
 		if (text.trim()) {
@@ -60,21 +68,23 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			return fail('scopes must be an array', 400);
 		}
 		const requestedScopes = (body as { scopes?: unknown }).scopes;
-		const { raw, prefix, createdAt, scopes } = await rotateApiKey(
+		const { id, raw, prefix, createdAt, scopes } = await rotateApiKey(
 			locals.db,
 			user.id,
 			requestedScopes
 		);
 		// The raw key is returned exactly once; only its hash is stored.
-		return ok({ key: raw, prefix, createdAt, scopes, rotated: true }, 201);
+		return ok({ id, key: raw, prefix, createdAt, scopes, rotated: false }, 201);
 	} catch (err) {
 		return handleError(err);
 	}
 };
 
-export const DELETE: RequestHandler = async ({ locals }) => {
+export const DELETE: RequestHandler = async ({ locals, url }) => {
 	try {
 		const user = requireSession(locals.user, locals.authMethod);
+		const id = url?.searchParams.get('id');
+		if (id) return ok({ ok: true, revoked: (await revokeApiKey(locals.db, user.id, id)).length });
 		const revoked = await revokeApiKeys(locals.db, user.id);
 		if (revoked === 0) return fail('No active API key', 404);
 		return ok({ ok: true, revoked });

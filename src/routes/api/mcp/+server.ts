@@ -1,3 +1,4 @@
+import { approvalSnapshot, approvePost } from '#lib/server/approval-gate.js';
 import { createMcpHandler, isJsonContentType, McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { RequestEvent, RequestHandler } from '@sveltejs/kit';
@@ -285,7 +286,7 @@ const mcpOutputSchemas = {
 } as const;
 
 type ToolSpec = {
-	scope: 'read' | 'write';
+	scope: 'read' | 'write' | 'approve_schedule';
 	annotation: (typeof annotations)[keyof typeof annotations];
 	description: string;
 	outputSchema: z.ZodType;
@@ -442,6 +443,66 @@ function createServer(event: RequestEvent) {
 		z.object({ draftId: id }).strict(),
 		(input, ctx, uid) => getDraft(ctx, uid, input.draftId)
 	);
+
+	register(
+		server,
+		'preview_approval',
+		{
+			scope: 'read',
+			annotation: annotations.read,
+			description: 'Review the exact final payload and hash for one account and time.',
+			outputSchema: z.object({ payload: z.unknown(), hash: z.string() })
+		},
+		z
+			.object({
+				draftId: id,
+				connectionId: id,
+				scheduledFor: z.iso.datetime().nullable().optional()
+			})
+			.strict(),
+		async (input, ctx, uid) => {
+			const snapshot = await approvalSnapshot(
+				ctx.db,
+				ctx.env,
+				uid,
+				input.draftId,
+				input.connectionId,
+				input.scheduledFor ? new Date(input.scheduledFor) : null
+			);
+			return { payload: snapshot.payload, hash: snapshot.hash };
+		}
+	);
+	register(
+		server,
+		'approve_draft',
+		{
+			scope: 'approve_schedule',
+			annotation: write,
+			description:
+				'Record explicit chat approval of a reviewed SHA-256 hash, account and scheduled time.',
+			outputSchema: z.object({ approval: z.unknown() })
+		},
+		z
+			.object({
+				draftId: id,
+				connectionId: id,
+				hash: z.string().regex(/^[a-f0-9]{64}$/),
+				scheduledFor: z.iso.datetime().nullable().optional()
+			})
+			.strict(),
+		(input, ctx, uid) =>
+			approvePost(
+				ctx.db,
+				ctx.env,
+				uid,
+				ctx.apiKeyId ?? uid,
+				'chat',
+				input.draftId,
+				input.connectionId,
+				input.scheduledFor ? new Date(input.scheduledFor) : null,
+				input.hash
+			)
+	);
 	register(
 		server,
 		'create_draft',
@@ -546,7 +607,7 @@ function createServer(event: RequestEvent) {
 		server,
 		'publish_draft',
 		{
-			scope: 'write',
+			scope: 'approve_schedule',
 			annotation: annotations.publish,
 			description: 'Publish a draft to selected connected accounts.',
 			outputSchema: mcpOutputSchemas.publish_draft
@@ -559,7 +620,7 @@ function createServer(event: RequestEvent) {
 		server,
 		'schedule_draft',
 		{
-			scope: 'write',
+			scope: 'approve_schedule',
 			annotation: write,
 			description: 'Schedule a draft for selected connected accounts.',
 			outputSchema: mcpOutputSchemas.schedule_draft
@@ -583,7 +644,7 @@ function createServer(event: RequestEvent) {
 		server,
 		'cancel_delivery',
 		{
-			scope: 'write',
+			scope: 'approve_schedule',
 			annotation: annotations.delete,
 			description: 'Cancel a pending delivery.',
 			outputSchema: mcpOutputSchemas.cancel_delivery
@@ -595,7 +656,7 @@ function createServer(event: RequestEvent) {
 		server,
 		'retry_delivery',
 		{
-			scope: 'write',
+			scope: 'approve_schedule',
 			annotation: annotations.publish,
 			description: 'Retry a delivery now.',
 			outputSchema: mcpOutputSchemas.retry_delivery
@@ -607,7 +668,7 @@ function createServer(event: RequestEvent) {
 		server,
 		'reschedule_delivery',
 		{
-			scope: 'write',
+			scope: 'approve_schedule',
 			annotation: write,
 			description: 'Change a delivery scheduled time.',
 			outputSchema: mcpOutputSchemas.reschedule_delivery

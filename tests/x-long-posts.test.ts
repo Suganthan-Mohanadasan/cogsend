@@ -1,3 +1,4 @@
+import './fixtures/provider-policy-isolation';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { decryptJson, encryptJson, encryptSecret } from '#lib/server/crypto.js';
